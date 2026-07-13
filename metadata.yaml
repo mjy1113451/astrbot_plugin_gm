@@ -1,6 +1,6 @@
 name: astrbot_plugin_group_admin
 desc: "AstrBot 群管插件 - 支持包括禁言、踢人、设头衔、设精华消息、设置群昵称等"
-version: v0.01
+version: v0.02
 author: mjy1113451
 repo: "https://github.com/mjy1113451/astrbot_plugin_gm"
 tags:

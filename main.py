@@ -1,7 +1,6 @@
-import asyncio
-from astrbot.api import star, logger
+from astrbot.api import star
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import At, Plain, Reply
+from astrbot.api.message_components import At, Reply
 from typing import Optional
 
 class GroupAdminPlugin(star.Star):
@@ -91,6 +90,7 @@ class GroupAdminPlugin(star.Star):
     async def mute_command(self, event: AstrMessageEvent, args: list[str]):
         """禁言指定群成员"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -130,6 +130,7 @@ class GroupAdminPlugin(star.Star):
     async def unmute_command(self, event: AstrMessageEvent, args: list[str]):
         """解除禁言"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -159,6 +160,7 @@ class GroupAdminPlugin(star.Star):
     async def kick_command(self, event: AstrMessageEvent, args: list[str]):
         """踢出群成员"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -189,6 +191,7 @@ class GroupAdminPlugin(star.Star):
     async def set_title_command(self, event: AstrMessageEvent, args: list[str]):
         """设置群成员专属头衔"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -210,19 +213,20 @@ class GroupAdminPlugin(star.Star):
             return
             
         target_qq = at_segment.qq
-        title = args[0]
-        
+        title = " ".join(args)
+
         try:
             await self._set_special_title(event.message_obj.group_id, target_qq, title)
             yield event.plain_result(f"已设置 @ qq={target_qq} 的头衔为: {title}")
         except Exception as e:
             yield event.plain_result(f"设置头衔失败: {str(e)}")
-            
+
     @filter.command("取消头衔")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def remove_title_command(self, event: AstrMessageEvent, args: list[str]):
         """取消群成员专属头衔"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -253,6 +257,7 @@ class GroupAdminPlugin(star.Star):
     async def set_admin_command(self, event: AstrMessageEvent, args: list[str]):
         """设置群管理员"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -282,6 +287,7 @@ class GroupAdminPlugin(star.Star):
     async def remove_admin_command(self, event: AstrMessageEvent, args: list[str]):
         """取消群管理员"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -311,6 +317,7 @@ class GroupAdminPlugin(star.Star):
     async def set_essence_command(self, event: AstrMessageEvent, args: list[str]):
         """将消息设为精华消息"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -340,6 +347,7 @@ class GroupAdminPlugin(star.Star):
     async def set_group_card_command(self, event: AstrMessageEvent, args: list[str]):
         """设置群成员的群昵称"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
@@ -361,14 +369,14 @@ class GroupAdminPlugin(star.Star):
             return
             
         target_qq = at_segment.qq
-        new_card = args[0]
-        
+        new_card = " ".join(args)
+
         try:
             await self._set_group_card(event.message_obj.group_id, target_qq, new_card)
             yield event.plain_result(f"已设置 @ qq={target_qq} 的群昵称为: {new_card}")
         except Exception as e:
             yield event.plain_result(f"设置群昵称失败: {str(e)}")
-    
+
     @filter.command("改昵称")
     async def set_my_group_card_command(self, event: AstrMessageEvent, args: list[str]):
         """设置自己的群昵称"""
@@ -380,20 +388,21 @@ class GroupAdminPlugin(star.Star):
             yield event.plain_result("用法: /改昵称 新昵称")
             return
             
-        new_card = args[0]
+        new_card = " ".join(args)
         sender_qq = event.message_obj.sender.user_id
-        
+
         try:
             await self._set_group_card(event.message_obj.group_id, sender_qq, new_card)
             yield event.plain_result(f"已设置你的群昵称为: {new_card}")
         except Exception as e:
             yield event.plain_result(f"设置群昵称失败: {str(e)}")
-    
+
     @filter.command("撤回")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def recall_command(self, event: AstrMessageEvent, args: list[str]):
         """撤回引用的消息"""
         if not self._is_plugin_admin(event):
+            yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
             
         if not event.message_obj.group_id:
