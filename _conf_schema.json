@@ -1,0 +1,20 @@
+{
+    "show_recall_notice": {
+        "description": "撤回消息后发送提示",
+        "type": "bool",
+        "hint": "开启后，Bot 执行撤回操作后会在群里发送一条\"已撤回该消息\"的提示。",
+        "default": true
+    },
+    "reject_re_add": {
+        "description": "踢人后拒绝再次加群",
+        "type": "bool",
+        "hint": "开启后，使用 /踢 指令踢出群成员时，会自动拒绝该用户再次加群的请求。",
+        "default": false
+    },
+    "plugin_admins": {
+        "description": "插件管理员QQ号列表",
+        "type": "list",
+        "hint": "这里的QQ号可以使用本插件的各项管理指令。可以使用 /设管 @某人 动态添加。",
+        "default": []
+    }
+}

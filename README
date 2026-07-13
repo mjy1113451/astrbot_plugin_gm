@@ -1,0 +1,49 @@
+# AstrBot 群管插件
+
+AstrBot QQ 机器人群管插件，提供完整的群组管理功能。
+
+## 功能一览
+
+| 命令 | 权限 | 说明 |
+|------|------|------|
+| `/禁言 @某人 [分钟数]` | 管理员 | 禁言目标，默认10分钟。例：`/禁言 @张三 1440`（禁言1天） |
+| `/解禁 @某人` | 管理员 | 解除目标禁言状态 |
+| `/踢 @某人` | 管理员 | 将目标踢出群聊 |
+| `/头衔 @某人 名称` | 管理员 | 设置目标专属头衔 |
+| `/设精华`（引用消息） | 管理员 | 将引用消息设为精华 |
+| `/设群昵称 @某人 新昵称` | 管理员 | 修改目标群昵称 |
+| `/改昵称 新昵称` | 所有人 | 修改自己的群昵称 |
+| `/撤回`（引用消息） | 管理员 | 撤回引用消息 |
+| `/禁我 [分钟数]` | 所有人 | 自定义时长禁言自己，默认10分钟。例：`/禁我 60` |
+
+> 所有管理命令仅限群聊中使用。
+
+## 安装方式
+
+**方式一：插件市场（推荐）**
+在 AstrBot WebUI 插件市场搜索 `astrbot_plugin_group_admin` 安装。
+
+**方式二：手动安装**
+```bash
+git clone https://github.com/mjy1113451/astrbot_plugin_gm.git
+# 将内容放入 AstrBot 插件目录后重启
+```
+
+## 技术细节
+
+- **依赖**: AstrBot >= 4.20.0，Python >= 3.10
+- **调用 API**: OneBot QQ 平台 API（`set_group_ban` / `set_group_kick` / `set_group_special_title` / `set_essence_message` / `set_group_card` / `delete_msg`）
+- **权限控制**: 管理命令通过 `@filter.permission_type(filter.PermissionType.ADMIN)` 限定仅管理员可用
+
+## 项目结构
+
+```
+astrbot_plugin_gm/
+├── main.py         # 插件主逻辑（命令处理 + OneBot API 调用）
+├── metadata.yaml   # 插件元信息
+└── README.md
+```
+
+## License
+
+MIT
