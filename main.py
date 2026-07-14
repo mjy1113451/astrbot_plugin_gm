@@ -456,33 +456,45 @@ class GroupAdminPlugin(star.Star):
             yield event.plain_result(f"禁言失败: {str(e)}")
     
     # 以下是内部方法
+    async def _get_platform(self):
+        """获取 QQ 平台实例"""
+        for platform in self.context.platform_manager.platform_insts:
+            if platform.platform_name == "qq":
+                return platform
+        raise RuntimeError("未找到 QQ 平台实例，请检查 OneBot 连接状态")
+
+    async def _call_qq_api(self, api: str, **params):
+        """调用 QQ 平台 API"""
+        platform = await self._get_platform()
+        return await platform.call_api(api, **params)
+
     async def _mute_user(self, group_id: str, user_id: str, duration: int):
         params = {"group_id": group_id, "user_id": user_id, "duration": duration}
-        await self.context.platform.call_api(platform="qq", api="set_group_ban", **params)
-    
+        await self._call_qq_api("set_group_ban", **params)
+
     async def _unmute_user(self, group_id: str, user_id: str):
         await self._mute_user(group_id, user_id, 0)
-    
+
     async def _kick_user(self, group_id: str, user_id: str, reject_add: bool):
         params = {"group_id": group_id, "user_id": user_id, "reject_add_request": reject_add}
-        await self.context.platform.call_api(platform="qq", api="set_group_kick", **params)
-    
+        await self._call_qq_api("set_group_kick", **params)
+
     async def _set_special_title(self, group_id: str, user_id: str, title: str):
         params = {"group_id": group_id, "user_id": user_id, "special_title": title, "duration": -1}
-        await self.context.platform.call_api(platform="qq", api="set_group_special_title", **params)
-        
+        await self._call_qq_api("set_group_special_title", **params)
+
     async def _set_group_admin(self, group_id: str, user_id: str, enable: bool):
         params = {"group_id": group_id, "user_id": user_id, "enable": enable}
-        await self.context.platform.call_api(platform="qq", api="set_group_admin", **params)
-    
+        await self._call_qq_api("set_group_admin", **params)
+
     async def _set_essence_message(self, group_id: str, message_id: str):
         params = {"group_id": group_id, "message_id": message_id}
-        await self.context.platform.call_api(platform="qq", api="set_essence_message", **params)
-    
+        await self._call_qq_api("set_essence_message", **params)
+
     async def _set_group_card(self, group_id: str, user_id: str, card: str):
         params = {"group_id": group_id, "user_id": user_id, "card": card}
-        await self.context.platform.call_api(platform="qq", api="set_group_card", **params)
-    
+        await self._call_qq_api("set_group_card", **params)
+
     async def _recall_message(self, group_id: str, message_id: str):
         params = {"message_id": message_id}
-        await self.context.platform.call_api(platform="qq", api="delete_msg", **params)
+        await self._call_qq_api("delete_msg", **params)
