@@ -1,16 +1,16 @@
-from astrbot.api import star
+from astrbot.api import star, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import At, Reply
 from typing import Optional
 
 class GroupAdminPlugin(star.Star):
     """AstrBot 群管插件 - 提供完整的群组管理功能"""
-    
-    def __init__(self, context: star.Context) -> None:
+
+    def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.context = context
+        self.config = config
         # 读取配置文件
-        config = context.config
         self.show_recall_notice = config.get("show_recall_notice", True)
         self.reject_re_add = config.get("reject_re_add", False)
         # 读取插件管理员列表，过滤并转为字符串类型以防配置错误
@@ -50,7 +50,8 @@ class GroupAdminPlugin(star.Star):
         
         self.plugin_admins.append(target_qq)
         # 同步回写到 AstrBot 配置中，使其持久化
-        self.context.config["plugin_admins"] = self.plugin_admins
+        self.config["plugin_admins"] = self.plugin_admins
+        self.config.save_config()
         yield event.plain_result(f"已将 @ qq={target_qq} 设为插件管理员。")
 
     @filter.command("取管")
@@ -82,7 +83,8 @@ class GroupAdminPlugin(star.Star):
         
         self.plugin_admins.remove(target_qq)
         # 同步回写到 AstrBot 配置中，使其持久化
-        self.context.config["plugin_admins"] = self.plugin_admins
+        self.config["plugin_admins"] = self.plugin_admins
+        self.config.save_config()
         yield event.plain_result(f"已移除 @ qq={target_qq} 的插件管理员身份。")
 
     @filter.command("禁言")
