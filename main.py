@@ -459,7 +459,7 @@ class GroupAdminPlugin(star.Star):
     async def _get_platform(self):
         """获取 QQ 平台实例"""
         for platform in self.context.platform_manager.platform_insts:
-            if platform.platform_name == "qq":
+            if platform.meta().name == "aiocqhttp":
                 return platform
         raise RuntimeError("未找到 QQ 平台实例，请检查 OneBot 连接状态")
 
