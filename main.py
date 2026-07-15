@@ -466,7 +466,7 @@ class GroupAdminPlugin(star.Star):
     async def _call_qq_api(self, api: str, **params):
         """调用 QQ 平台 API"""
         platform = await self._get_platform()
-        return await platform.call_api(api, **params)
+        return await platform.call_action(api, **params)
 
     async def _mute_user(self, group_id: str, user_id: str, duration: int):
         params = {"group_id": group_id, "user_id": user_id, "duration": duration}
