@@ -466,7 +466,33 @@ class GroupAdminPlugin(star.Star):
     async def _call_qq_api(self, api: str, **params):
         """调用 QQ 平台 API"""
         platform = await self._get_platform()
-        return await platform.call_action(api, **params)
+
+        # 尝试多种方式调用 API，兼容不同版本的 AstrBot
+        methods_to_try = [
+            # AiocqhttpAdapter 可能直接有 call_action
+            lambda: platform.call_action(api, **params),
+            # 或者通过 client 属性
+            lambda: platform.client.call_action(api, **params),
+            # 或者通过 _client 属性
+            lambda: platform._client.call_action(api, **params),
+            # 或者通过 bot 属性
+            lambda: platform.bot.call_action(api, **params),
+            # 或者 adapter 直接支持 call_api
+            lambda: platform.call_api(api, **params),
+        ]
+
+        last_error = None
+        for method in methods_to_try:
+            try:
+                return await method()
+            except (AttributeError, TypeError) as e:
+                last_error = e
+                continue
+
+        raise RuntimeError(
+            f"无法调用 QQ API '{api}'，已尝试 call_action/client.call_action 等方式均失败。"
+            f"平台类型: {type(platform).__name__}, 最后错误: {last_error}"
+        )
 
     async def _mute_user(self, group_id: str, user_id: str, duration: int):
         params = {"group_id": group_id, "user_id": user_id, "duration": duration}
