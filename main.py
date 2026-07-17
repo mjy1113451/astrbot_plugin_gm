@@ -202,22 +202,24 @@ class GroupAdminPlugin(star.Star):
             yield event.plain_result("此命令仅在群聊中可用")
             return
 
+        # 从消息段中解析: 找 @ 段，收集其后的文本段作为头衔
         at_segment = None
+        title_parts = []
+        found_at = False
+
         for segment in event.message_obj.message:
             if isinstance(segment, At):
                 at_segment = segment
-                break
+                found_at = True
+                continue
+            if found_at and hasattr(segment, 'text'):
+                title_parts.append(str(segment.text))
 
         if not at_segment:
             yield event.plain_result("请使用 @ 提及要设置头衔的成员")
             return
 
-        # 过滤掉可能混入 args 里的 @ 提及文本或 CQ 码
-        filtered_args = [
-            a for a in args
-            if not a.startswith("@") and "[CQ:at," not in a and "[CQ:at " not in a
-        ]
-        title = " ".join(filtered_args)
+        title = "".join(title_parts).strip()
 
         if not title:
             yield event.plain_result("请输入头衔名称。用法: /头衔 @某人 头衔名称")
@@ -359,27 +361,35 @@ class GroupAdminPlugin(star.Star):
         if not self._is_plugin_admin(event):
             yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
-            
+
         if not event.message_obj.group_id:
             yield event.plain_result("此命令仅在群聊中可用")
             return
-            
-        if len(args) < 1:
-            yield event.plain_result("用法: /设群昵称 @某人 新昵称")
-            return
-            
+
+        # 从消息段中解析: 找 @ 段，收集其后的文本段作为昵称
         at_segment = None
+        card_parts = []
+        found_at = False
+
         for segment in event.message_obj.message:
             if isinstance(segment, At):
                 at_segment = segment
-                break
-                
+                found_at = True
+                continue
+            if found_at and hasattr(segment, 'text'):
+                card_parts.append(str(segment.text))
+
         if not at_segment:
             yield event.plain_result("请使用 @ 提及要设置群昵称的成员")
             return
-            
+
+        new_card = "".join(card_parts).strip()
+
+        if not new_card:
+            yield event.plain_result("请输入群昵称。用法: /设群昵称 @某人 新昵称")
+            return
+
         target_qq = at_segment.qq
-        new_card = " ".join(args)
 
         try:
             await self._set_group_card(event.message_obj.group_id, target_qq, new_card)
@@ -426,8 +436,8 @@ class GroupAdminPlugin(star.Star):
                 if count <= 0:
                     yield event.plain_result("数量必须大于 0")
                     return
-                if count > 50:
-                    yield event.plain_result("单次最多撤回 50 条消息")
+                if count > 999:
+                    yield event.plain_result("单次最多撤回 999 条消息")
                     return
 
                 current_msg_id = self._get_message_id(event)
