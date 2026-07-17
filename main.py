@@ -1,3 +1,5 @@
+import asyncio
+
 from astrbot.api import star, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import At, Reply
@@ -195,27 +197,33 @@ class GroupAdminPlugin(star.Star):
         if not self._is_plugin_admin(event):
             yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
-            
+
         if not event.message_obj.group_id:
             yield event.plain_result("此命令仅在群聊中可用")
             return
-            
-        if len(args) < 1:
-            yield event.plain_result("用法: /头衔 @某人 头衔名称")
-            return
-            
+
         at_segment = None
         for segment in event.message_obj.message:
             if isinstance(segment, At):
                 at_segment = segment
                 break
-                
+
         if not at_segment:
             yield event.plain_result("请使用 @ 提及要设置头衔的成员")
             return
-            
+
+        # 过滤掉可能混入 args 里的 @ 提及文本或 CQ 码
+        filtered_args = [
+            a for a in args
+            if not a.startswith("@") and "[CQ:at," not in a and "[CQ:at " not in a
+        ]
+        title = " ".join(filtered_args)
+
+        if not title:
+            yield event.plain_result("请输入头衔名称。用法: /头衔 @某人 头衔名称")
+            return
+
         target_qq = at_segment.qq
-        title = " ".join(args)
 
         try:
             await self._set_special_title(event.message_obj.group_id, target_qq, title)
@@ -402,30 +410,68 @@ class GroupAdminPlugin(star.Star):
     @filter.command("撤回")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def recall_command(self, event: AstrMessageEvent, args: list[str]):
-        """撤回引用的消息"""
+        """撤回消息 - 支持引用撤回或按数量 /撤回 N"""
         if not self._is_plugin_admin(event):
             yield event.plain_result("你没有权限使用此命令，需要先被设为插件管理员。使用 /设管 @某人 添加插件管理员。")
             return
-            
+
         if not event.message_obj.group_id:
             yield event.plain_result("此命令仅在群聊中可用")
             return
-            
+
+        # 模式1: 按数量撤回 /撤回 N
+        if args:
+            try:
+                count = int(args[0])
+                if count <= 0:
+                    yield event.plain_result("数量必须大于 0")
+                    return
+                if count > 50:
+                    yield event.plain_result("单次最多撤回 50 条消息")
+                    return
+
+                current_msg_id = self._get_message_id(event)
+                if current_msg_id is None:
+                    yield event.plain_result("无法获取当前消息 ID，请改用引用撤回")
+                    return
+
+                recalled = 0
+                failed = 0
+                # 从当前消息开始往上撤回 count 条（包含命令消息本身）
+                for i in range(count):
+                    target_id = current_msg_id - i
+                    try:
+                        await self._recall_message(event.message_obj.group_id, target_id)
+                        recalled += 1
+                    except Exception:
+                        failed += 1
+                    # 小延迟避免触发频率限制
+                    if i < count - 1:
+                        await asyncio.sleep(0.3)
+
+                if self.show_recall_notice:
+                    yield event.plain_result(
+                        f"撤回完成: 成功 {recalled} 条, 失败 {failed} 条"
+                    )
+                return
+            except ValueError:
+                pass  # 非纯数字，继续走引用撤回模式
+
+        # 模式2: 引用撤回 /撤回 (回复某条消息)
         reply_segment = None
         for segment in event.message_obj.message:
             if isinstance(segment, Reply):
                 reply_segment = segment
                 break
-                
+
         if not reply_segment:
-            yield event.plain_result("请引用一条要撤回的消息")
+            yield event.plain_result("请引用一条要撤回的消息，或发送 /撤回 数字 来撤回最近的消息")
             return
-            
+
         message_id = reply_segment.id
-        
+
         try:
             await self._recall_message(event.message_obj.group_id, message_id)
-            # 应用配置：是否发送撤回提示
             if self.show_recall_notice:
                 yield event.plain_result(f"已撤回该消息")
         except Exception as e:
@@ -455,6 +501,18 @@ class GroupAdminPlugin(star.Star):
         except Exception as e:
             yield event.plain_result(f"禁言失败: {str(e)}")
     
+    def _get_message_id(self, event: AstrMessageEvent):
+        """获取当前消息的 message_id"""
+        msg_obj = event.message_obj
+        for attr in ("message_id", "id", "msg_id"):
+            val = getattr(msg_obj, attr, None)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     # 以下是内部方法
     async def _get_platform(self):
         """获取 QQ 平台实例"""
@@ -506,7 +564,7 @@ class GroupAdminPlugin(star.Star):
         await self._call_qq_api("set_group_kick", **params)
 
     async def _set_special_title(self, group_id: str, user_id: str, title: str):
-        params = {"group_id": group_id, "user_id": user_id, "special_title": title, "duration": -1}
+        params = {"group_id": int(group_id), "user_id": int(user_id), "special_title": title, "duration": -1}
         await self._call_qq_api("set_group_special_title", **params)
 
     async def _set_group_admin(self, group_id: str, user_id: str, enable: bool):
