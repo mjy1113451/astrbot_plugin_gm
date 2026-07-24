@@ -56,7 +56,7 @@ class GroupAdminPlugin(star.Star):
         # 同步回写到 AstrBot 配置中，使其持久化
         self.config["plugin_admins"] = self.plugin_admins
         self.config.save_config()
-        yield event.plain_result(f"已将 @ qq={target_qq} 设为插件管理员。")
+        yield event.plain_result(f"已将qq号为{target_qq}的用户设为插件管理员。")
 
     @filter.command("取管")
     async def remove_plugin_admin_command(self, event: AstrMessageEvent, args: List[str]):
@@ -231,7 +231,7 @@ class GroupAdminPlugin(star.Star):
 
         try:
             await self._set_special_title(event.message_obj.group_id, target_qq, title)
-            yield event.plain_result(f"已设置 @ qq={target_qq} 的头衔为: {title}")
+            yield event.plain_result(f"已设置 qq号为{target_qq}的用户的头衔为: {title}")
         except Exception as e:
             yield event.plain_result(f"设置头衔失败: {str(e)}")
 
