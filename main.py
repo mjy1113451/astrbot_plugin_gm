@@ -87,6 +87,10 @@ class GroupAdminPlugin(Star):
         self.message_history: dict = {}
         self.max_history = max(1, int(self.config.get("max_message_history", 50) or 50))
 
+        # #184：WebUI 上传违禁图片文件的 MD5 缓存
+        # {相对路径: md5}；未命中缓存的路径在运行时懒计算并回填。
+        self._banned_file_md5_cache: dict = {}
+
     # ===================== 通用 IO =====================
 
     def load_json(self, path: Path, default):
@@ -182,6 +186,9 @@ class GroupAdminPlugin(Star):
             "notify_on_violation": True,
             # #162：用户自定义违禁图片（按 MD5 比对），支持按群覆盖
             "banned_images": [],
+            # #184：WebUI 上传违禁图片文件（file 类型，AstrBot >= v4.13.0），
+            # 值为相对路径列表（files/banned_image_files/<filename>），运行时计算 MD5 参与比对
+            "banned_image_files": [],
             # ====== 撤回消息历史（对齐 astrbot_plugin_batchrecall，修复 #122） ======
             "max_message_history": 50,
             # ====== 踢人自动撤回该成员近期消息（#145，对齐 zcj-ui/astrbot_plugin_group_guardian） ======
@@ -667,6 +674,7 @@ class GroupAdminPlugin(Star):
         "发群公告", "排名", "清除数据", "举报", "status",
         "添加群待办", "取消群待办", "给我头衔", "加群申请待处理", "群信息", "群名称", "群标签", "群相册",
         "添加违禁图片", "删除违禁图片", "查看违禁图片",
+        "添加加群审核通过关键词", "删除加群审核通过关键词", "查看加群审核通过关键词",
     )
 
     def _is_plugin_command(self, text: str) -> bool:
@@ -1259,7 +1267,50 @@ class GroupAdminPlugin(Star):
         md5 = hashlib.md5(image_data).hexdigest()
         global_banned = set(self.config.get("banned_images", []) or [])
         group_banned = set(self.get_group_setting(group_id, "banned_images", []) or [])
-        return md5 in (global_banned | group_banned)
+        banned_md5s = global_banned | group_banned
+        # #184：把 WebUI 上传的图片文件（file 类型）计算 MD5 一并纳入比对
+        banned_md5s |= self._get_banned_file_md5s()
+        return md5 in banned_md5s
+
+    def _banned_image_file_paths(self) -> list:
+        """返回 WebUI 上传的违禁图片文件的绝对路径（data/plugin_data/<plugin>/files/...）。"""
+        rel_paths = self.config.get("banned_image_files", []) or []
+        # 插件数据根：self.data_dir = <plugin_data>/<plugin>/group_admin，其 parent 即 <plugin_data>/<plugin>
+        try:
+            data_root = Path(self.data_dir).resolve().parent
+        except Exception:
+            data_root = None
+        result = []
+        for rel in rel_paths:
+            rel_str = str(rel).replace("\\", "/").lstrip("/")
+            if not rel_str or ".." in rel_str.split("/"):
+                continue
+            if data_root is None:
+                continue
+            p = (data_root / rel_str).resolve()
+            try:
+                p.relative_to(data_root)
+            except ValueError:
+                continue
+            if p.is_file():
+                result.append(p)
+        return result
+
+    def _get_banned_file_md5s(self) -> set:
+        """计算 WebUI 上传违禁图片的 MD5（懒计算 + 缓存，失败跳过）。"""
+        md5s = set()
+        for p in self._banned_image_file_paths():
+            rel_str = p.as_posix()
+            if rel_str in self._banned_file_md5_cache:
+                md5s.add(self._banned_file_md5_cache[rel_str])
+                continue
+            try:
+                digest = hashlib.md5(p.read_bytes()).hexdigest()
+                self._banned_file_md5_cache[rel_str] = digest
+                md5s.add(digest)
+            except Exception as e:
+                logger.error(f"计算违禁图片文件 MD5 失败 {p}: {e}")
+        return md5s
 
     async def _compute_image_md5(self, image_url: str):
         """下载图片并计算 MD5，供 /添加违禁图片 使用。
@@ -1688,6 +1739,66 @@ class GroupAdminPlugin(Star):
         self.config["profanity_use_ai"] = not cur
         mode = "AI检测" if not cur else "关键词检测"
         yield event.plain_result(f"[成功] 已切换为 {mode} 模式")
+
+    # ===================== 加群审核通过关键词（#186，按群维度） =====================
+
+    @filter.command("添加加群审核通过关键词", "添加加群审核自动通过关键词（按群生效）")
+    async def add_join_approve_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
+        if not await self._moderation_require_admin_msg(event):
+            return
+        raw = self._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        group_id = str(raw.get("group_id"))
+        keyword = (keyword or "").strip()
+        if not keyword:
+            yield event.plain_result("[错误] 请提供关键词")
+            return
+        kws = self._get_group_override_list(group_id, "join_approve_keywords")
+        if keyword in kws:
+            yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
+            return
+        kws.append(keyword)
+        self.save_config()
+        yield event.plain_result(f"[成功] 已添加加群审核通过关键词 '{keyword}'（本群当前 {len(kws)} 个）")
+
+    @filter.command("删除加群审核通过关键词", "删除加群审核自动通过关键词（按群生效）")
+    async def remove_join_approve_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
+        if not await self._moderation_require_admin_msg(event):
+            return
+        raw = self._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        group_id = str(raw.get("group_id"))
+        keyword = (keyword or "").strip()
+        if not keyword:
+            yield event.plain_result("[错误] 请提供关键词")
+            return
+        kws = self._get_group_override_list(group_id, "join_approve_keywords")
+        if keyword not in kws:
+            yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
+            return
+        kws.remove(keyword)
+        self.save_config()
+        yield event.plain_result(f"[成功] 已删除加群审核通过关键词 '{keyword}'（本群当前 {len(kws)} 个）")
+
+    @filter.command("查看加群审核通过关键词", "查看加群审核自动通过关键词列表（本群）")
+    async def list_join_approve_keywords_cmd(self, event: AstrMessageEvent):
+        if not await self._moderation_require_admin_msg(event):
+            return
+        raw = self._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        group_id = str(raw.get("group_id"))
+        kws = self.get_group_setting(group_id, "join_approve_keywords", [])
+        if not kws:
+            yield event.plain_result("本群当前没有设置加群审核通过关键词")
+            return
+        listing = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(kws)])
+        yield event.plain_result(f"本群加群审核通过关键词（{len(kws)} 个）：\n{listing}")
 
     @filter.command("添加白名单用户", "添加白名单用户（不受违规检测限制）")
     async def add_whitelist_user_cmd(self, event: AstrMessageEvent, user_id: str = ""):
@@ -2166,10 +2277,11 @@ class GroupAdminPlugin(Star):
             msg += f"\n已撤回被踢成员近期消息 {recalled_total} 条"
         yield event.plain_result(msg)
 
+    # #181: /清用户历史 已并入 /撤回 @用户 N（#110）；此处保留为向后兼容别名
     @filter.command("清用户历史", "撤回某用户在本群的最近 N 条消息（/清用户历史 @某人 [N]）")
     async def clear_user_history_cmd(self, event: AstrMessageEvent, target: str = ""):
         """手动撤回某用户在群内的最近 N 条消息（#145，对齐 zcj-ui/astrbot_plugin_group_guardian）。
-        不踢人，仅撤回。"""
+        不踢人，仅撤回。已并入 /撤回 @用户 N（#181），保留旧命令作为兼容别名。"""
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
@@ -3044,6 +3156,12 @@ class GroupAdminPlugin(Star):
             lines.append(f"\n全局违禁图（{len(global_banned)} 张）：")
             for m in global_banned:
                 lines.append(f"  - {m}")
+        # #184：展示 WebUI 上传的违禁图片文件
+        uploaded = self.config.get("banned_image_files", []) or []
+        if uploaded:
+            lines.append(f"\nWebUI 上传违禁图（{len(uploaded)} 张，自动计算 MD5）：")
+            for rel in uploaded:
+                lines.append(f"  - {rel}")
         if not lines:
             yield event.plain_result("本群与全局均无违禁图片")
             return
@@ -3281,7 +3399,7 @@ class GroupAdminPlugin(Star):
                 )
                 return
 
-            # 命中关键词：同意 + 通知管理员
+            # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
             if enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
                 await self._handle_group_request(event, flag, True, "命中关键词自动同意")
                 yield event.plain_result(f"已同意 {user_id} 的加群申请（命中关键词）")
@@ -3291,17 +3409,33 @@ class GroupAdminPlugin(Star):
                     f"原因: 命中关键词",
                     group_id=group_id,
                 )
+                # #186：命中加群审核通过关键词后，在该群发送通知
+                await self._send_group_text(
+                    event, group_id,
+                    f"该用户触碰到加群审核通过词语，已自动同意！",
+                )
                 return
 
             # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
             if self.get_group_setting(group_id, "join_request_notify_in_group", False):
                 nickname = await self._get_user_nickname(event, user_id)
+                # #189：补充 QQ 等级（get_stranger_info 的 level 字段，协议端不支持时显示未知）
+                level = ""
+                try:
+                    handler = getattr(self.context, "get_stranger_info", None)
+                    if callable(handler):
+                        info = await handler(user_id=int(user_id))
+                        info_data = info.get("data", info) if isinstance(info, dict) else {}
+                        level = str(info_data.get("level") or "未知")
+                except Exception:
+                    level = "未知"
                 notify_text = (
-                    f"【有新人加群申请】\n"
-                    f"qq昵称：{nickname}\n"
-                    f"新人qq号：{user_id}\n"
-                    f"加群验证消息：{comment or '（无）'}\n"
-                    f"注：引用消息回复同意或拒绝"
+                    f"【新人加群】通知\n"
+                    f"用户qq昵称：{nickname}\n"
+                    f"用户qq号：{user_id}\n"
+                    f"qq等级：{level or '未知'}\n"
+                    f"加群验证消息：{comment or '无'}\n"
+                    f"回复 /同意 或 /拒绝（引用本消息）"
                 )
                 # 暂存 flag 等待引用回复
                 sent_id = await self._send_group_text(event, group_id, notify_text)

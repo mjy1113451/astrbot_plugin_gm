@@ -96,22 +96,10 @@
         "hint": "关闭后所有自动审核（违禁词拒绝/关键词同意）都不生效。管理员手动审核（引用回复同意/拒绝）不受影响。推荐按群覆盖：/设置群配置 join_audit_enabled true/false。",
         "default": true
     },
-    "title_admins": {
-        "description": "可设置/取消群头衔的专项管理员 QQ 列表（全局默认，_conf_schema 全局配置）",
-        "type": "list",
-        "hint": "在名单中的 QQ 可执行 /头衔 与 /取消头衔，不受群管理身份限制。全局默认，按群覆盖优先级更高：/设置群配置 title_admins [\"12345\"]。",
-        "default": []
-    },
     "group_admin_admins": {
         "description": "可设置/取消群管理的专项管理员 QQ 列表（全局默认，_conf_schema 全局配置）",
         "type": "list",
         "hint": "在名单中的 QQ 可执行 /设管理 与 /取消管理，不受群管理身份限制。全局默认，按群覆盖优先级更高：/设置群配置 group_admin_admins [\"12345\"]。",
-        "default": []
-    },
-    "kick_admins": {
-        "description": "可踢人的专项管理员 QQ 列表（全局默认，_conf_schema 全局配置）",
-        "type": "list",
-        "hint": "在名单中的 QQ 可执行 /踢，不受群管理身份限制。全局默认，按群覆盖优先级更高：/设置群配置 kick_admins [\"12345\"]。",
         "default": []
     },
     "group_overrides": {
@@ -296,6 +284,13 @@
         "type": "list",
         "items": {"type": "string"},
         "hint": "推荐按群覆盖。命中后撤回并按 ban_duration 禁言。在群内引用图片回复 /添加违禁图片 即可添加。",
+        "default": []
+    },
+    "banned_image_files": {
+        "description": "违禁图片（上传图片文件，自动计算 MD5 参与比对）",
+        "type": "file",
+        "file_types": ["png", "jpg", "jpeg", "gif", "webp", "bmp"],
+        "hint": "在 WebUI 直接上传违禁图片文件，插件启动时自动计算 MD5 并入违禁列表（#184）。与上方 MD5 列表、群内 /添加违禁图片 同时生效。",
         "default": []
     },
     "admin_bypass": {
