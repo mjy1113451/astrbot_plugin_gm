@@ -48,13 +48,6 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-## GroupManager（仅设计参考，代码禁止复用）
-
-- 项目主页：https://github.com/BB0813/astrbot_pulgin_group_manager
-- 许可证：**AGPL-3.0**
-- **⚠️ 重要声明：GroupManager 采用 AGPL-3.0 许可证。本插件未复用其任何代码 —— 包括正则片段、关键词匹配逻辑、任何源码片段 —— 仅参考了其公开文档中描述的功能设计（加群申请自动审核：违禁词拒绝 / 关键词同意 / 群内人工审核流程）。本插件中的加群审核功能为完全独立实现。**
-- 若未来任何版本复用其代码，复用部分及其衍生必须继续以 AGPL-3.0 释出；当前版本不涉及任何复用。
-
 ## astrbot_plugin_group_guardian（仅功能对齐，未复用代码）
 
 - 项目主页：https://github.com/zcj-ui/astrbot_plugin_group_guardian
