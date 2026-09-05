@@ -2100,7 +2100,7 @@ class GroupAdminPlugin(Star):
         ok = await self._mute_member(event, group_id, qq, minutes * 60)
         if ok:
             await self._record_mute_and_maybe_kick(event, group_id, qq, sender_id)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result(f"禁言成功（{minutes}分钟）" if ok else "禁言失败")
 
     @filter.command("解禁", "解除禁言")
@@ -2123,7 +2123,7 @@ class GroupAdminPlugin(Star):
         if not qq:
             return
         ok = await self._unmute_member(event, group_id, qq)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result("解禁成功" if ok else "解禁失败")
 
     @filter.command("踢", "踢出群成员（支持批量+@）")
@@ -2211,6 +2211,9 @@ class GroupAdminPlugin(Star):
         reply_id = self._get_reply_id(event)
         target_qq = self._extract_at_qq(raw)
         self_msg_id = str(raw.get("message_id", "")) if raw.get("message_id") else ""
+        # 撤回成功提示：show_recall_notice 控制（全局或按群覆盖），关闭时成功静默；失败仍提示。
+        recall_notice = bool(self.get_group_setting(
+            group_id, "show_recall_notice", self.config.get("show_recall_notice", True)))
 
         # 参数文本：从 raw 文本段提取（@ 单独成段，避免 QQ 号混入数字）
         tail = self._extract_command_tail(self._extract_text(raw), ("撤回",))
@@ -2220,10 +2223,10 @@ class GroupAdminPlugin(Star):
         # 1) 引用消息优先（保持原有语义）
         if reply_id:
             ok = await self._recall_message(event, reply_id)
-            # show_recall_notice 只控制群内公告；plain_result 永远返回命令结果
-            if ok and self.get_group_setting(group_id, "show_recall_notice", True):
-                await self._send(event, self._build_text("已撤回该消息"))
-            yield event.plain_result("撤回成功" if ok else "撤回失败")
+            if ok and recall_notice:
+                yield event.plain_result("撤回成功")
+            elif not ok:
+                yield event.plain_result("撤回失败")
             return
 
         # 2) @用户 + N：撤回该用户最近 N 条（#110 #117）
@@ -2250,9 +2253,8 @@ class GroupAdminPlugin(Star):
                 elif "已撤回" in err:
                     self._remove_message_from_history(group_id, m[0])
             if recalled:
-                if self.get_group_setting(group_id, "show_recall_notice", True):
-                    await self._send(event, self._build_text(f"已撤回用户 {target_qq} 的 {recalled} 条消息"))
-                yield event.plain_result(f"撤回成功（{recalled} 条）")
+                if recall_notice:
+                    yield event.plain_result(f"撤回成功（{recalled} 条，用户 {target_qq}）")
             else:
                 yield event.plain_result("撤回失败，未找到该用户的可撤回消息")
             return
@@ -2286,9 +2288,8 @@ class GroupAdminPlugin(Star):
                 elif "已撤回" in err:
                     self._remove_message_from_history(group_id, m[0])
             if recalled:
-                if self.get_group_setting(group_id, "show_recall_notice", True):
-                    await self._send(event, self._build_text(f"已撤回 {recalled} 条消息"))
-                yield event.plain_result(f"撤回成功（{recalled} 条）")
+                if recall_notice:
+                    yield event.plain_result(f"撤回成功（{recalled} 条）")
             else:
                 yield event.plain_result("撤回失败，未找到可撤回消息")
             return
@@ -2413,7 +2414,7 @@ class GroupAdminPlugin(Star):
             return
         ok = await self._execute_action(event, "set_group_whole_ban",
                                         group_id=group_id, enable=True)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result("已开启全群禁言" if ok else "开启失败")
 
     # #79: 解除宵禁 - 解除全体禁言
@@ -2430,7 +2431,7 @@ class GroupAdminPlugin(Star):
             return
         ok = await self._execute_action(event, "set_group_whole_ban",
                                         group_id=group_id, enable=False)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result("已解除全群禁言" if ok else "解除失败")
 
     # #75: 禁我 [分钟] - 任意成员禁言自己
@@ -2444,7 +2445,7 @@ class GroupAdminPlugin(Star):
         group_id = str(raw.get("group_id"))
         minutes = max(1, min(int(minutes), 43200))  # 限制 1 分钟 ~ 30 天
         ok = await self._mute_member(event, group_id, sender_id, minutes * 60)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result(f"已禁言自己 {minutes} 分钟" if ok else "禁言失败")
 
     # #76: 群昵称 新昵称 - 插件管理员修改任意成员昵称
@@ -2517,7 +2518,7 @@ class GroupAdminPlugin(Star):
         ok = await self._mute_member(event, group_id, qq, duration)
         if ok:
             await self._record_mute_and_maybe_kick(event, group_id, qq, sender_id)
-        if self._should_notify_mute(ok):
+        if self._should_notify_mute(group_id, ok):
             yield event.plain_result("已鞭尸" if ok else "鞭尸失败")
 
     @filter.command("排名", "查看本群发言排名")
@@ -3364,9 +3365,9 @@ class GroupAdminPlugin(Star):
                 parts.append(seg.get("data", {}).get("text", ""))
         return "".join(parts)
 
-    def _should_notify_mute(self, ok: bool) -> bool:
+    def _should_notify_mute(self, group_id: str, ok: bool) -> bool:
         """判断禁言/解禁/宵禁/禁我 是否需要回复。
-        配置 mute_notice=False 时只回复失败，成功静默。"""
+        配置 mute_notice=False 时只回复失败，成功静默。支持按群覆盖 (group_overrides)。"""
         if not ok:
             return True  # 失败总是提示
-        return bool(self.config.get("mute_notice", True))
+        return bool(self.get_group_setting(group_id, "mute_notice", self.config.get("mute_notice", True)))
