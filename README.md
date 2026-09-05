@@ -92,7 +92,7 @@
 
 > 白名单用户（`whitelist_users`）不受检测限制；管理员默认豁免（`admin_bypass`）；检测到违规后可选择群内通知（`notify_on_violation`）。
 
-### 加群申请自动审核（参考 [GroupManager](https://github.com/mjy1113451/group_manager)）
+### 加群申请自动审核
 
 加群申请验证流程（受总开关 `join_audit_enabled` 控制，关闭后仅保留管理员手动审核）：
 
