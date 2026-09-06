@@ -150,9 +150,8 @@ pip install astrbot_plugin_group_admin
 | `mute_notice` | bool | `true` | 禁言 / 解禁后回复结果 |
 | `reject_re_add` | bool | `false` | 踢人后自动拒绝该用户再次加群 |
 | `auto_recall_keywords` | list | `[]` | Bot 发言自动撤回关键词列表（推荐按群覆盖） |
-| `auto_recall_enabled_groups` | list | `[]` | 启用自动撤回的群 ID 列表（`*` / `all` 表示全部；只配置了 `auto_recall_keywords` 而未配置本项时，默认对全部群生效） |
-| `enabled_groups` | list | `[]` | 启用违规检测的群号列表（`*` / `all` 表示全部；推荐按群覆盖） |
-| `group_overrides` | dict | `{}` | 按群独立配置覆盖：`{群号: {key: value}}` |
+| `auto_recall_enabled_groups` | list | `[]` | 启用自动撤回的群 ID 列表（**留空 = 全群启用**，#192；`*` / `all` 表示全部，或填指定群号） |
+| `enabled_groups` | list | `[]` | 启用违规检测的群号列表（**留空 = 全群启用**，#192；`*` / `all` 表示全部，或填指定群号；推荐按群覆盖） |
 | `max_message_history` | int | `50` | 每群内存缓存的撤回消息历史条数（用于 /撤回 N 与 /撤回自身 N） |
 | `join_reject_reason` | string | `"不满足加群条件"` | 加群申请自动拒绝时展示的默认理由（管理员可通过「拒绝 理由」自定义） |
 | `join_audit_enabled` | bool | `true` | 加群申请自动审核总开关（关闭后违禁词/关键词自动审核都跳过；管理员手动审核不受影响） |
@@ -180,30 +179,18 @@ pip install astrbot_plugin_group_admin
 
 ### 按群覆盖示例
 
-通过群内指令按群独立配置（推荐）：
+通过群内指令按群独立配置（推荐）。**管理指令（禁言时长/关键词/白名单等）直接在对应群内执行即可按群生效，无需 `/设置群配置`（#192）**：
 
 ```
-/设置群配置 enabled_groups true
-/设置群配置 auto_recall_keywords ["测试", "敏感词"]
-/设置群配置 rank_top_n 20
-```
-
-或在配置文件中直接编辑 `group_overrides`：
-
-```json
-{
-  "group_overrides": {
-    "123456789": {
-      "enabled_groups": true,
-      "rank_top_n": 20,
-      "auto_recall_keywords": ["测试", "敏感词"]
-    }
-  }
-}
+/设置图片禁言时长 300          # 本群图片违规禁言 300 秒
+/添加骂人关键词 笨蛋           # 本群骂人关键词
+/添加白名单用户 123456         # 本群白名单
+/设置群配置 rank_top_n 20      # 其它配置仍可用 /设置群配置 按群覆盖
 ```
 
 按群覆盖的可配置 key 包括：基础配置（`show_recall_notice`、`auto_recall_keywords`、`auto_recall_enabled_groups`、`rank_top_n`、`report_notify_admins`、`join_approve_keywords`、`join_notify_admins`、`join_request_notify_in_group`、`enabled_groups`）+ 违规检测全部子项（`spam_*`、`profanity_*`、`ad_*`、`link_*`、`group_promotion_*`、`ban_duration`、`whitelist_users`、`admin_bypass`、`notify_on_violation`)+ 权限细分（`title_admins`、`group_admin_admins`、`kick_admins`、`mute_kick_threshold`）+ 撤回历史（`max_message_history`）+ 踢人清历史（`kick_recall_enabled`、`kick_recall_count`）+ 语音违规检测开关（`voice_check_enabled`）。
 > 语音转文字相关配置（`voice_check_provider_id`、`voice_asr_endpoint`、`voice_asr_api_key`、`voice_asr_model`、`voice_check_timeout`）为**全局配置**，不支持按群覆盖。
+> `group_overrides` 内部存储项不再展示在 WebUI 配置页（#192 owner），按群覆盖功能不受影响，仍由 `/设置群配置` 与各管理指令维护。
 
 ### 图片 AI 审核配置
 
@@ -273,7 +260,7 @@ pip install astrbot_plugin_group_admin
 
 | 能力 | 配置 / 命令 | 说明 |
 |------|------|------|
-| 违禁词自动拒绝 | `violation_enabled_groups` + `violation_keywords` | 命中违禁词自动拒绝（#129） |
+| 违禁词自动拒绝 | `enabled_groups` + `violation_keywords` | 命中违禁词自动拒绝（#129）；`enabled_groups` 留空 = 全群启用（#192） |
 | 关键词自动同意 | `join_approve_keywords` | 验证消息命中关键词自动同意 |
 | 群内提醒管理员 | `join_request_notify_in_group = true` | 申请消息发送到群内，引用回复同意/拒绝（#57） |
 | 自定义拒绝理由 | `join_reject_reason` / 引用回复「拒绝 理由」 | 默认"不满足加群条件"，可按群覆盖 |
