@@ -2168,7 +2168,7 @@ class GroupAdminPlugin(Star):
         yield event.plain_result(f"已将 {target_qq} 的群昵称设为 {card}" if ok else "设置群昵称失败")
 
     # #18: 改群昵称 - 设置自己的群昵称
-    @filter.command("改群昵称", "设置自己的群昵称")
+    @filter.command("改群昵称", "设置自己的群昵称", alias={"改昵称"})
     async def set_self_card_cmd(self, event: AstrMessageEvent, card: str = ""):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -2561,7 +2561,7 @@ class GroupAdminPlugin(Star):
             yield event.plain_result(f"已禁言自己 {minutes} 分钟" if ok else "禁言失败")
 
     # #76: 群昵称 新昵称 - 插件管理员修改任意成员昵称
-    @filter.command("群昵称", "设置指定成员群昵称（仅插件管理员）")
+    @filter.command("群昵称", "设置指定成员群昵称（仅插件管理员）", alias={"设群昵称"})
     async def set_member_card_cmd(self, event: AstrMessageEvent, target: str = "", card: str = ""):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -2981,7 +2981,7 @@ class GroupAdminPlugin(Star):
         )
 
 # #166: /群名称 — 修改本群名（群管/群主）
-    @filter.command("群名称", "修改本群名称（/群名称 新群名）")
+    @filter.command("群名称", "修改本群名称（/群名称 新群名）", alias={"改群名", "修改群名"})
     async def set_group_name_cmd(self, event: AstrMessageEvent):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
