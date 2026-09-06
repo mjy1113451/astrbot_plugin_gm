@@ -91,6 +91,23 @@ class GroupAdminPlugin(Star):
         # {相对路径: md5}；未命中缓存的路径在运行时懒计算并回填。
         self._banned_file_md5_cache: dict = {}
 
+        # #192 review：留空=全群启用 语义变更的启动告警（仅首次部署提示，避免刷屏）
+        _ar_eg = self.config.get("enabled_groups", []) or []
+        _ar_ag = self.config.get("auto_recall_enabled_groups", []) or []
+        _legacy = self.config.get("violation_enabled_groups", []) or []
+        if not _ar_eg and not _legacy:
+            logger.warning(
+                "[群管插件] enabled_groups 为空：按 #192 新语义，违规检测（含刷屏/图片AI等）"
+                "将在【全部群】启用。如需限定范围，请配置 enabled_groups 列表或在群内"
+                " /设置群配置 enabled_groups false 关闭指定群。"
+            )
+        if not _ar_ag:
+            logger.warning(
+                "[群管插件] auto_recall_enabled_groups 为空：按 #192 新语义，Bot 发言"
+                "自动撤回将在【全部群】生效（命中 auto_recall_keywords 时）。"
+                "如需限定范围，请配置该列表。"
+            )
+
     # ===================== 通用 IO =====================
 
     def load_json(self, path: Path, default):

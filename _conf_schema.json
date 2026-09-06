@@ -31,6 +31,29 @@
         "hint": "留空 = 全部群启用自动撤回（#192）。非空时：包含 * 或 all 表示全部，或填写指定群号；推荐用 /设置群配置 auto_recall_enabled_groups true 按群开启。",
         "default": []
     },
+    "violation_action": {
+        "description": "[已废弃] 违规处置动作（兼容旧配置，新流程已接管）",
+        "type": "string",
+        "invisible": true,
+        "hint": "已废弃（#192）：新违规检测一律撤回+按各自禁言时长禁言。字段仅为兼容旧配置保留，新代码不再读取。",
+        "options": ["none", "mute", "recall"],
+        "default": "none"
+    },
+    "violation_mute_minutes": {
+        "description": "[已废弃] 违规禁言时长（分钟，兼容旧配置）",
+        "type": "int",
+        "invisible": true,
+        "hint": "已废弃（#192）。新流程下图片/刷屏/骂人/广告/链接/群号推广各自有独立禁言时长（见 *_ban_duration）。",
+        "default": 10
+    },
+    "violation_enabled_groups": {
+        "description": "[已废弃] 启用违规检测的群ID列表（兼容旧配置）",
+        "type": "list",
+        "invisible": true,
+        "items": {"type": "string"},
+        "hint": "已废弃（#192）。迁移兼容：enabled_groups 留空时运行时仍回退读取本字段，非空则仅列表内群启用，随后可手动迁移到 enabled_groups。",
+        "default": []
+    },
     "report_notify_admins": {
         "description": "接收举报通知的插件管理员QQ号列表（推荐按群覆盖）",
         "type": "list",
@@ -81,6 +104,14 @@
         "type": "list",
         "hint": "在名单中的 QQ 可执行 /设管理 与 /取消管理，不受群管理身份限制。全局默认，按群覆盖优先级更高：/设置群配置 group_admin_admins [\"12345\"]。",
         "default": []
+    },
+    "group_overrides": {
+        "description": "[内部存储] 按群独立配置覆盖：{群号: {key: value}}（WebUI 不展示，由群内指令维护）",
+        "type": "dict",
+        "invisible": true,
+        "items": {},
+        "hint": "内部存储（#192 owner：WebUI 不展示）。由群内 /设置群配置 与各管理指令（禁言时长/关键词/白名单等）自动维护，按群覆盖功能不受影响。",
+        "default": {}
     },
     "api_type": {
         "description": "图片/AI 审核 API 类型",

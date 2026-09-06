@@ -144,6 +144,8 @@ pip install astrbot_plugin_group_admin
 
 插件提供以下可配置项（在 AstrBot 配置文件中设置，或在群内用 `/设置群配置` 按群覆盖）：
 
+> ⚠️ **默认行为变更（#192，务必阅读）**：`enabled_groups` 与 `auto_recall_enabled_groups` **留空 = 全部群启用**（违规检测含刷屏/图片AI等将在所有群生效；Bot 发言命中关键词即自动撤回）。升级前若依赖旧版「留空=不启用」语义，请显式配置这两个列表限定范围，或在不需要的群内 `/设置群配置 enabled_groups false`。启动日志有对应告警提示。
+
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `show_recall_notice` | bool | `true` | 撤回操作后在群里发送提示 |
