@@ -1095,22 +1095,27 @@ class GroupAdminPlugin(Star):
         1. group_overrides[gid]["enabled_groups"] 为 bool 时，按 bool 决定
         2. top-level enabled_groups 列表：留空 = 全群启用（#192 owner）；
            非空时包含 * / all 表示全部，包含群号表示启用
+        3. 迁移兼容：enabled_groups 与旧 violation_enabled_groups 均为空时才
+           全群启用；旧字段非空则按旧列表判定，老用户配置行为不漂移
         """
         overrides = self.config.get("group_overrides", {}).get(str(group_id), {})
         v = overrides.get("enabled_groups")
         if isinstance(v, bool):
             return v
         enabled = self.config.get("enabled_groups", []) or []
-        # #192 owner：留空 = 全群启用
-        if not enabled:
-            return True
-        for x in enabled:
-            sx = str(x).lower()
-            if sx in ("*", "all"):
-                return True
-            if str(x) == str(group_id):
-                return True
-        return False
+        if enabled:
+            for x in enabled:
+                sx = str(x).lower()
+                if sx in ("*", "all"):
+                    return True
+                if str(x) == str(group_id):
+                    return True
+            return False
+        # #192 迁移兼容：新列表为空时回退旧字段，旧字段也非空才「留空=全群启用」
+        legacy = self.config.get("violation_enabled_groups", []) or []
+        if legacy:
+            return str(group_id) in [str(x) for x in legacy]
+        return True
 
     def _is_user_whitelisted(self, group_id: str, user_id: str) -> bool:
         whitelist = self.get_group_setting(group_id, "whitelist_users", []) or []
@@ -3464,9 +3469,13 @@ class GroupAdminPlugin(Star):
             enabled_groups = self.get_group_setting(group_id, "enabled_groups", [])
             violation_keywords = self.get_group_setting(group_id, "violation_keywords", [])
             join_approve_keywords = self.get_group_setting(group_id, "join_approve_keywords", [])
-            # #192 owner：留空 = 全群启用；非空时 * / all 或精确匹配群号
+            # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups
             if not enabled_groups:
-                enabled = True
+                legacy_groups = self.config.get("violation_enabled_groups", []) or []
+                if legacy_groups:
+                    enabled = group_id in [str(x) for x in legacy_groups]
+                else:
+                    enabled = True
             else:
                 sx_list = [str(x).lower() for x in enabled_groups]
                 enabled = ("*" in sx_list or "all" in sx_list
