@@ -28,27 +28,30 @@
         "description": "启用自动撤回的群ID列表（推荐按群覆盖）",
         "type": "list",
         "items": {"type": "string"},
-        "hint": "留空则默认不启用自动撤回；推荐用 /设置群配置 auto_recall_enabled_groups true 按群开启。",
+        "hint": "留空 = 全部群启用自动撤回（#192）。非空时：包含 * 或 all 表示全部，或填写指定群号；推荐用 /设置群配置 auto_recall_enabled_groups true 按群开启。",
         "default": []
     },
     "violation_action": {
-        "description": "违规处置动作（兼容旧配置，新流程已接管）",
+        "description": "[已废弃] 违规处置动作（兼容旧配置，新流程已接管）",
         "type": "string",
-        "hint": "none/mute/recall。新的群违规检测（图片/刷屏/骂人/广告/链接/群号推广）一律：撤回+按各自禁言时长禁言。本字段保留为兼容项。",
+        "invisible": true,
+        "hint": "已废弃（#192）：新违规检测一律撤回+按各自禁言时长禁言。字段仅为兼容旧配置保留，新代码不再读取。",
         "options": ["none", "mute", "recall"],
         "default": "none"
     },
     "violation_mute_minutes": {
-        "description": "违规禁言时长（分钟，兼容旧配置）",
+        "description": "[已废弃] 违规禁言时长（分钟，兼容旧配置）",
         "type": "int",
-        "hint": "兼容旧 violation_action=mute 配置。新流程下图片/刷屏/骂人/广告/链接/群号推广各自有独立禁言时长（见 *_ban_duration）。",
+        "invisible": true,
+        "hint": "已废弃（#192）。新流程下图片/刷屏/骂人/广告/链接/群号推广各自有独立禁言时长（见 *_ban_duration）。",
         "default": 10
     },
     "violation_enabled_groups": {
-        "description": "启用违规检测的群ID列表（兼容旧配置）",
+        "description": "[已废弃] 启用违规检测的群ID列表（兼容旧配置）",
         "type": "list",
+        "invisible": true,
         "items": {"type": "string"},
-        "hint": "兼容旧配置。新配置建议使用 enabled_groups 列表，或在群内 /设置群配置 enabled_groups true / false。",
+        "hint": "已废弃（#192）。迁移兼容：enabled_groups 留空时运行时仍回退读取本字段，非空则仅列表内群启用，随后可手动迁移到 enabled_groups。",
         "default": []
     },
     "report_notify_admins": {
@@ -103,10 +106,11 @@
         "default": []
     },
     "group_overrides": {
-        "description": "按群独立配置覆盖：{群号: {key: value}}",
+        "description": "[内部存储] 按群独立配置覆盖：{群号: {key: value}}（WebUI 不展示，由群内指令维护）",
         "type": "dict",
+        "invisible": true,
         "items": {},
-        "hint": "按群覆盖配置。可用 key 包括：show_recall_notice、auto_recall_keywords、auto_recall_enabled_groups、rank_top_n、report_notify_admins、join_approve_keywords、join_notify_admins、join_request_notify_in_group、title_admins、group_admin_admins、kick_admins、mute_kick_threshold、enabled_groups（true/false）、spam_*、profanity_*、ad_*、link_*、group_promotion_*、ban_duration、whitelist_users、admin_bypass、notify_on_violation、max_message_history、kick_recall_enabled、kick_recall_count、voice_check_enabled、banned_images（违禁图 MD5 列表，由 /添加违禁图片 维护）。语音转文字相关配置（voice_check_provider_id、voice_asr_endpoint/api_key/model、voice_check_timeout）为全局配置，不支持按群覆盖。save_config 直接序列化整个 config dict，group_overrides 下所有 key 均完整持久化。也可在群内用 /设置群配置 key value 动态设置。",
+        "hint": "内部存储（#192 owner：WebUI 不展示）。由群内 /设置群配置 与各管理指令（禁言时长/关键词/白名单等）自动维护，按群覆盖功能不受影响。",
         "default": {}
     },
     "api_type": {
@@ -162,7 +166,7 @@
         "description": "启用违规检测的群号列表（推荐按群覆盖）",
         "type": "list",
         "items": {"type": "string"},
-        "hint": "* 或 all 表示全部启用；为空则不启用；推荐按群覆盖：在群内 /设置群配置 enabled_groups true / false。",
+        "hint": "留空 = 全部群启用（#192）。非空时：包含 * 或 all 表示全部，或填写指定群号；按群覆盖：在群内 /设置群配置 enabled_groups true / false。",
         "default": []
     },
     "spam_check_enabled": {
