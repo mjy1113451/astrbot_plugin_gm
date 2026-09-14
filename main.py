@@ -15,6 +15,7 @@ import json
 import os
 import re  # 用于群相册命令前缀解析、编号提取等
 import time
+import threading
 import asyncio
 import base64
 import hashlib
@@ -25,6 +26,9 @@ try:
     import aiohttp
 except ImportError:
     aiohttp = None
+
+# 配置写入串行化锁（review#192 race-condition）：多条同步写路径共用，防止交错写坏文件
+_CFG_LOCK = threading.RLock()
 
 
 def _parse_qq_list(text: str) -> list:
@@ -91,6 +95,23 @@ class GroupAdminPlugin(Star):
         # {相对路径: md5}；未命中缓存的路径在运行时懒计算并回填。
         self._banned_file_md5_cache: dict = {}
 
+        # #192 review：留空=全群启用 语义变更的启动告警（仅首次部署提示，避免刷屏）
+        _ar_eg = self.config.get("enabled_groups", []) or []
+        _ar_ag = self.config.get("auto_recall_enabled_groups", []) or []
+        _legacy = self.config.get("violation_enabled_groups", []) or []
+        if not _ar_eg and not _legacy:
+            logger.warning(
+                "[IMPORTANT][群管插件] enabled_groups 为空：按 #192 新语义，违规检测"
+                "（含刷屏/图片AI等）将在【全部群】启用。如需限定范围，请配置 "
+                "enabled_groups 列表，或通过 group_overrides 将指定群 enabled_groups 设为 false。"
+            )
+        if not _ar_ag:
+            logger.warning(
+                "[IMPORTANT][群管插件] auto_recall_enabled_groups 为空：按 #192 新语义，"
+                "Bot 发言自动撤回将在【全部群】生效（命中 auto_recall_keywords 时）。"
+                "如需限定范围，请配置该列表。"
+            )
+
     # ===================== 通用 IO =====================
 
     def load_json(self, path: Path, default):
@@ -122,11 +143,8 @@ class GroupAdminPlugin(Star):
             # 关键词自动撤回（#46）
             "auto_recall_keywords": [],
             "auto_recall_enabled_groups": [],
-            # 违规检测（#19）
+            # 违规检测（#19）—— 兼容旧配置三项已删除（#192 owner）
             "violation_keywords": [],
-            "violation_action": "none",
-            "violation_mute_minutes": 10,
-            "violation_enabled_groups": [],
             # 举报（#21）
             "report_notify_admins": [],
             # 群公告与排名（#16, #29）
@@ -223,7 +241,8 @@ class GroupAdminPlugin(Star):
         return default_config
 
     def save_config(self):
-        self.save_json(self.config_path, self.config)
+        with _CFG_LOCK:
+            self.save_json(self.config_path, self.config)
 
     def save_stats(self):
         self.save_json(self.stats_path, self.stats)
@@ -276,20 +295,20 @@ class GroupAdminPlugin(Star):
         return value
 
     def _set_group_override(self, group_id: str, key: str, value) -> None:
+        """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。"""
         overrides = self.config.setdefault("group_overrides", {})
         overrides.setdefault(str(group_id), {})[key] = value
         self.save_config()
 
-    def _get_group_id_or_none(self, event) -> str | None:
+    def _get_group_id_or_none(self, event) -> str:
+        """从事件取群号；非群聊返回空串。review#192：raw 访问异常统一兜底为空串。"""
         try:
-            raw = event.message_obj.raw_message
-            if isinstance(raw, dict):
-                gid = raw.get("group_id")
-                if gid:
-                    return str(gid)
+            raw = self._get_raw_message(event)
+            if not raw or not raw.get("group_id"):
+                return ""
+            return str(raw.get("group_id"))
         except Exception:
-            pass
-        return None
+            return ""
 
     def _add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         admins = self._get_group_override_list(group_id, key)
@@ -696,10 +715,10 @@ class GroupAdminPlugin(Star):
         "添加链接白名单", "删除链接白名单", "查看链接白名单",
         "添加黑名单", "删除黑名单", "查看黑名单",
         "设管理", "取消管理", "头衔",
-        "别人昵称", "改群昵称", "群昵称", "禁言", "禁言列表", "解禁", "踢", "清用户历史", "鞭尸",
+        "别人昵称", "改群昵称", "群昵称", "群友昵称", "自己昵称", "设群友昵称", "禁言", "禁言列表", "解禁", "踢", "清用户历史", "鞭尸",
         "设精", "取消设精", "改群头像", "宵禁", "解除宵禁", "禁我",
         "发群公告", "排名", "清除数据", "举报", "status",
-        "添加群待办", "取消群待办", "给我头衔", "加群申请待处理", "群信息", "群名称", "群标签", "群相册",
+        "添加群待办", "取消群待办", "给我头衔", "加群申请待处理", "群信息", "群名称", "群名", "群标签", "群相册",
         "添加违禁图片", "删除违禁图片", "查看违禁图片",
         "添加加群审核通过关键词", "删除加群审核通过关键词", "查看加群审核通过关键词",
     )
@@ -1110,24 +1129,29 @@ class GroupAdminPlugin(Star):
         """群是否启用违规检测。
         优先级
         1. group_overrides[gid]["enabled_groups"] 为 bool 时，按 bool 决定
-        2. top-level enabled_groups 列表：包含 * / all 表示全部；包含群号表示启用
-        3. 兼容旧 violation_enabled_groups 列表
+        2. top-level enabled_groups 列表：留空 = 全群启用（#192 owner）；
+           非空时包含 * / all 表示全部，包含群号表示启用
+        3. 迁移兼容：enabled_groups 与旧 violation_enabled_groups 均为空时才
+           全群启用；旧字段非空则按旧列表判定，老用户配置行为不漂移
         """
         overrides = self.config.get("group_overrides", {}).get(str(group_id), {})
         v = overrides.get("enabled_groups")
         if isinstance(v, bool):
             return v
         enabled = self.config.get("enabled_groups", []) or []
-        if not enabled:
+        if enabled:
+            for x in enabled:
+                sx = str(x).lower()
+                if sx in ("*", "all"):
+                    return True
+                if str(x) == str(group_id):
+                    return True
             return False
-        for x in enabled:
-            sx = str(x).lower()
-            if sx in ("*", "all"):
-                return True
-            if str(x) == str(group_id):
-                return True
+        # #192 迁移兼容：新列表为空时回退旧字段，旧字段也非空才「留空=全群启用」
         legacy = self.config.get("violation_enabled_groups", []) or []
-        return str(group_id) in [str(x) for x in legacy]
+        if legacy:
+            return str(group_id) in [str(x) for x in legacy]
+        return True
 
     def _is_user_whitelisted(self, group_id: str, user_id: str) -> bool:
         whitelist = self.get_group_setting(group_id, "whitelist_users", []) or []
@@ -1739,87 +1763,115 @@ class GroupAdminPlugin(Star):
         )
         yield event.plain_result(text)
 
-    @filter.command("设置图片禁言时长", "设置图片违规禁言时长（秒）")
+    @filter.command("设置图片禁言时长", "设置图片违规禁言时长（秒，按群生效）")
     async def set_image_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 图片违规禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群图片违规禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置刷屏禁言时长", "设置刷屏禁言时长（秒）")
+    @filter.command("设置刷屏禁言时长", "设置刷屏禁言时长（秒，按群生效）")
     async def set_spam_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["spam_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 刷屏禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "spam_ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群刷屏禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置骂人禁言时长", "设置骂人禁言时长（秒）")
+    @filter.command("设置骂人禁言时长", "设置骂人禁言时长（秒，按群生效）")
     async def set_profanity_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["profanity_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 骂人禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "profanity_ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群骂人禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("添加骂人关键词", "添加骂人关键词（关键词检测模式）")
+    @filter.command("添加骂人关键词", "添加骂人关键词（关键词检测模式，按群生效）")
     async def add_profanity_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
         if not await self._moderation_require_admin_msg(event):
+            return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
             return
         keyword = (keyword or "").strip()
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self.config.setdefault("profanity_keywords", [])
+        kws = self._get_group_override_list(group_id, "profanity_keywords")
         if keyword in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
         kws.append(keyword)
-        self.config["profanity_keywords"] = kws
-        yield event.plain_result(f"[成功] 已添加骂人关键词 '{keyword}'（当前 {len(kws)} 个）")
+        self.save_config()
+        yield event.plain_result(f"[成功] 已添加本群骂人关键词 '{keyword}'（当前 {len(kws)} 个）")
 
-    @filter.command("删除骂人关键词", "删除骂人关键词")
+    @filter.command("删除骂人关键词", "删除骂人关键词（按群生效）")
     async def remove_profanity_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
         if not await self._moderation_require_admin_msg(event):
+            return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
             return
         keyword = (keyword or "").strip()
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self.config.get("profanity_keywords", [])
+        kws = self._get_group_override_list(group_id, "profanity_keywords")
         if keyword not in kws:
-            yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在")
+            yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
         kws.remove(keyword)
-        self.config["profanity_keywords"] = kws
-        yield event.plain_result(f"[成功] 已删除骂人关键词 '{keyword}'（当前 {len(kws)} 个）")
+        self.save_config()
+        yield event.plain_result(f"[成功] 已删除本群骂人关键词 '{keyword}'（当前 {len(kws)} 个）")
 
-    @filter.command("查看骂人关键词", "查看骂人关键词列表")
+    @filter.command("查看骂人关键词", "查看骂人关键词列表（本群）")
     async def list_profanity_keywords_cmd(self, event: AstrMessageEvent):
         if not await self._moderation_require_admin_msg(event):
             return
-        kws = self.config.get("profanity_keywords", [])
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        kws = self.get_group_setting(group_id, "profanity_keywords", [])
         if not kws:
-            yield event.plain_result("当前没有设置骂人关键词")
+            yield event.plain_result("本群当前没有设置骂人关键词")
             return
         listing = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(kws)])
-        yield event.plain_result(f"骂人关键词列表（{len(kws)} 个）：\n{listing}")
+        yield event.plain_result(f"本群骂人关键词（{len(kws)} 个）：\n{listing}")
 
-    @filter.command("切换骂人检测模式", "切换 AI 检测 / 关键词检测")
+    @filter.command("切换骂人检测模式", "切换 AI 检测 / 关键词检测（按群生效）")
     async def toggle_profanity_mode_cmd(self, event: AstrMessageEvent):
         if not await self._moderation_require_admin_msg(event):
             return
-        cur = bool(self.config.get("profanity_use_ai", True))
-        self.config["profanity_use_ai"] = not cur
-        mode = "AI检测" if not cur else "关键词检测"
-        yield event.plain_result(f"[成功] 已切换为 {mode} 模式")
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        cur = bool(self.get_group_setting(group_id, "profanity_use_ai", True))
+        self._set_group_override(group_id, "profanity_use_ai", not cur)
+        mode = "关键词检测" if cur else "AI检测"
+        yield event.plain_result(f"[成功] 本群已切换为 {mode} 模式")
 
     # ===================== 加群审核通过关键词（#186，按群维度） =====================
 
@@ -1881,48 +1933,67 @@ class GroupAdminPlugin(Star):
         listing = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(kws)])
         yield event.plain_result(f"本群加群审核通过关键词（{len(kws)} 个）：\n{listing}")
 
-    @filter.command("添加白名单用户", "添加白名单用户（不受违规检测限制）")
+    @filter.command("添加白名单用户", "添加白名单用户（不受违规检测限制，按群生效）")
     async def add_whitelist_user_cmd(self, event: AstrMessageEvent, user_id: str = ""):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         user_id = str(user_id).strip()
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self.config.setdefault("whitelist_users", [])
+        wl = self._get_group_override_list(group_id, "whitelist_users")
         if user_id in [str(x) for x in wl]:
-            yield event.plain_result(f"[错误] 用户 {user_id} 已在白名单中")
+            yield event.plain_result(f"[错误] 用户 {user_id} 已在本群白名单中")
             return
         wl.append(user_id)
-        self.config["whitelist_users"] = wl
-        yield event.plain_result(f"[成功] 已添加 {user_id} 到白名单（当前 {len(wl)} 人）")
+        self.save_config()
+        yield event.plain_result(f"[成功] 已添加 {user_id} 到本群白名单（当前 {len(wl)} 人）")
 
-    @filter.command("删除白名单用户", "从白名单移除用户")
+    @filter.command("删除白名单用户", "从白名单移除用户（按群生效）")
     async def remove_whitelist_user_cmd(self, event: AstrMessageEvent, user_id: str = ""):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         user_id = str(user_id).strip()
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self.config.get("whitelist_users", [])
-        new_wl = [u for u in wl if str(u) != user_id]
-        if len(new_wl) == len(wl):
-            yield event.plain_result(f"[错误] 用户 {user_id} 不在白名单中")
+        wl = self._get_group_override_list(group_id, "whitelist_users")
+        if user_id not in [str(x) for x in wl]:
+            yield event.plain_result(f"[错误] 用户 {user_id} 不在本群白名单中")
             return
-        self.config["whitelist_users"] = new_wl
-        yield event.plain_result(f"[成功] 已从白名单移除 {user_id}（当前 {len(new_wl)} 人）")
+        wl.remove(user_id)
+        self.save_config()
+        yield event.plain_result(f"[成功] 已从本群白名单移除 {user_id}（当前 {len(wl)} 人）")
 
-    @filter.command("查看白名单", "查看白名单用户列表")
+    @filter.command("查看白名单", "查看白名单用户列表（本群+全局）")
     async def list_whitelist_cmd(self, event: AstrMessageEvent):
         if not await self._moderation_require_admin_msg(event):
             return
-        wl = self.config.get("whitelist_users", [])
-        if not wl:
-            yield event.plain_result("当前白名单为空")
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
             return
-        listing = "\n".join([f"{i+1}. {u}" for i, u in enumerate(wl)])
-        yield event.plain_result(f"白名单用户（{len(wl)} 人）：\n{listing}")
+        group_wl = self.get_group_setting(group_id, "whitelist_users", [])
+        global_wl = self.config.get("whitelist_users", [])
+        lines = []
+        if group_wl:
+            lines.append(f"本群白名单（{len(group_wl)} 人）：")
+            lines.extend([f"  {i+1}. {u}" for i, u in enumerate(group_wl)])
+        if isinstance(global_wl, list) and global_wl:
+            lines.append(f"全局白名单（{len(global_wl)} 人）：")
+            lines.extend([f"  {i+1}. {u}" for i, u in enumerate(global_wl)])
+        if not lines:
+            yield event.plain_result("本群与全局白名单均为空")
+            return
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("查看违规统计", "查看违规统计（默认全群；带 QQ 号查个人）")
     async def view_violation_stats_cmd(self, event: AstrMessageEvent, user_id: str = ""):
@@ -1955,79 +2026,103 @@ class GroupAdminPlugin(Star):
                 f"违规统计概览:\n违规用户数: {total_users} 人\n总违规次数: {total_violations} 次"
             )
 
-    @filter.command("设置广告禁言时长", "设置广告禁言时长（秒）")
+    @filter.command("设置广告禁言时长", "设置广告禁言时长（秒，按群生效）")
     async def set_ad_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["ad_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 广告禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "ad_ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群广告禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置链接禁言时长", "设置链接禁言时长（秒）")
+    @filter.command("设置链接禁言时长", "设置链接禁言时长（秒，按群生效）")
     async def set_link_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["link_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 链接禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "link_ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群链接禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("设置群号推广禁言时长", "设置群号推广禁言时长（秒）")
+    @filter.command("设置群号推广禁言时长", "设置群号推广禁言时长（秒，按群生效）")
     async def set_group_promotion_ban_duration_cmd(self, event: AstrMessageEvent, seconds: int = 0):
         if not await self._moderation_require_admin_msg(event):
             return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
         if seconds <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0秒")
             return
-        self.config["group_promotion_ban_duration"] = seconds
-        yield event.plain_result(f"[成功] 群号推广禁言时长已设置为 {seconds} 秒")
+        self._set_group_override(group_id, "group_promotion_ban_duration", seconds)
+        yield event.plain_result(f"[成功] 本群群号推广禁言时长已设置为 {seconds} 秒")
 
-    @filter.command("添加广告关键词", "添加广告关键词")
+    @filter.command("添加广告关键词", "添加广告关键词（按群生效）")
     async def add_ad_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
         if not await self._moderation_require_admin_msg(event):
+            return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
             return
         keyword = (keyword or "").strip()
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self.config.setdefault("ad_keywords", [])
+        kws = self._get_group_override_list(group_id, "ad_keywords")
         if keyword in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
         kws.append(keyword)
-        self.config["ad_keywords"] = kws
-        yield event.plain_result(f"[成功] 已添加广告关键词 '{keyword}'（当前 {len(kws)} 个）")
+        self.save_config()
+        yield event.plain_result(f"[成功] 已添加本群广告关键词 '{keyword}'（当前 {len(kws)} 个）")
 
-    @filter.command("删除广告关键词", "删除广告关键词")
+    @filter.command("删除广告关键词", "删除广告关键词（按群生效）")
     async def remove_ad_keyword_cmd(self, event: AstrMessageEvent, keyword: str = ""):
         if not await self._moderation_require_admin_msg(event):
+            return
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
             return
         keyword = (keyword or "").strip()
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self.config.get("ad_keywords", [])
+        kws = self._get_group_override_list(group_id, "ad_keywords")
         if keyword not in kws:
-            yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在")
+            yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
         kws.remove(keyword)
-        self.config["ad_keywords"] = kws
-        yield event.plain_result(f"[成功] 已删除广告关键词 '{keyword}'（当前 {len(kws)} 个）")
+        self.save_config()
+        yield event.plain_result(f"[成功] 已删除本群广告关键词 '{keyword}'（当前 {len(kws)} 个）")
 
-    @filter.command("查看广告关键词", "查看广告关键词列表")
+    @filter.command("查看广告关键词", "查看广告关键词列表（本群）")
     async def list_ad_keywords_cmd(self, event: AstrMessageEvent):
         if not await self._moderation_require_admin_msg(event):
             return
-        kws = self.config.get("ad_keywords", [])
+        group_id = self._get_group_id_or_none(event)
+        if not group_id:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        kws = self.get_group_setting(group_id, "ad_keywords", [])
         if not kws:
-            yield event.plain_result("当前没有设置广告关键词")
+            yield event.plain_result("本群当前没有设置广告关键词")
             return
         head = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(kws[:20])])
         more = f"\n…还有 {len(kws) - 20} 个" if len(kws) > 20 else ""
-        yield event.plain_result(f"广告关键词（{len(kws)} 个）：\n{head}{more}")
+        yield event.plain_result(f"本群广告关键词（{len(kws)} 个）：\n{head}{more}")
 
     # ===================== 链接白名单（#195，按群） =====================
 
@@ -2337,8 +2432,8 @@ class GroupAdminPlugin(Star):
         ok = await self._set_group_title(event, group_id, target_qq, title)
         yield event.plain_result("设置头衔成功" if ok else "设置头衔失败")
 
-    # #18: 别人昵称 - 设置他人的群昵称
-    @filter.command("别人昵称", "设置他人群昵称（需要 @某人 + 新昵称）")
+    # #18: 群友昵称 - 设置他人群昵称（owner 09-14：合并为单条命令；普通群管理员即可，不必插件管理员）
+    @filter.command("群友昵称", "设置他人群昵称（@某人 或 QQ号 + 新昵称；群管/群主/插件管理员）", alias={"别人昵称", "群昵称", "设群昵称", "设群友昵称"})
     async def set_other_card_cmd(self, event: AstrMessageEvent):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -2349,25 +2444,34 @@ class GroupAdminPlugin(Star):
         if not self.has_group_admin_rights(sender_id, group_id, raw):
             yield event.plain_result("只有插件管理员或群管理员可执行此操作")
             return
-        target_qq = self._extract_at_qq(raw)
-        if not target_qq:
-            yield event.plain_result("请通过 @某人 来指定对象")
-            return
         # 从原始消息提取所有 text 段拼接为 card（避免被 @ 组件挤掉）
         card = self._extract_text(raw).strip()
-        # 去掉开头的 /别人昵称 命令名（如果存在）
-        for prefix in ("/别人昵称", "别人昵称"):
+        # 去掉开头的命令名（如果存在）
+        for prefix in ("/群友昵称", "群友昵称", "/别人昵称", "别人昵称",
+                       "/设群友昵称", "设群友昵称", "/群昵称", "群昵称",
+                       "/设群昵称", "设群昵称"):
             if card.startswith(prefix):
                 card = card[len(prefix):].lstrip()
                 break
+        target_qq = self._extract_at_qq(raw)
+        if not target_qq:
+            # 支持直接给 QQ 号：首 token 为 QQ 则剥离，其余作为新昵称
+            toks = card.split(None, 1)
+            qq = self._parse_qq(toks[0]) if toks else None
+            if qq:
+                target_qq = qq
+                card = toks[1].strip() if len(toks) > 1 else ""
+        if not target_qq:
+            yield event.plain_result("请通过 @某人 或 QQ 号指定对象")
+            return
         if not card:
             yield event.plain_result("请提供新昵称内容")
             return
         ok = await self._set_group_card(event, group_id, target_qq, card)
         yield event.plain_result(f"已将 {target_qq} 的群昵称设为 {card}" if ok else "设置群昵称失败")
 
-    # #18: 改群昵称 - 设置自己的群昵称
-    @filter.command("改群昵称", "设置自己的群昵称")
+    # #18: 改自己群昵称（owner 09-14：改自己昵称用「自己昵称」）
+    @filter.command("自己昵称", "设置自己的群昵称", alias={"改群昵称", "改昵称"})
     async def set_self_card_cmd(self, event: AstrMessageEvent, card: str = ""):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -2758,27 +2862,6 @@ class GroupAdminPlugin(Star):
         ok = await self._mute_member(event, group_id, sender_id, minutes * 60)
         if self._should_notify_mute(group_id, ok):
             yield event.plain_result(f"已禁言自己 {minutes} 分钟" if ok else "禁言失败")
-
-    # #76: 群昵称 新昵称 - 插件管理员修改任意成员昵称
-    @filter.command("群昵称", "设置指定成员群昵称（仅插件管理员）")
-    async def set_member_card_cmd(self, event: AstrMessageEvent, target: str = "", card: str = ""):
-        raw = self._get_raw_message(event)
-        if not raw or not raw.get("group_id"):
-            yield event.plain_result("此指令只能在群聊中使用")
-            return
-        group_id = str(raw.get("group_id"))
-        if not self._is_authorized(raw, str(raw.get("user_id"))):
-            yield event.plain_result("只有插件管理员可执行此操作")
-            return
-        qq = self._extract_at_qq(raw) or self._parse_qq(target)
-        if not qq:
-            yield event.plain_result("请通过 @某人 或提供QQ号")
-            return
-        if not card:
-            yield event.plain_result("请提供新昵称内容")
-            return
-        ok = await self._set_group_card(event, group_id, qq, card)
-        yield event.plain_result(f"已将 {qq} 群昵称设为 {card}" if ok else "设置群昵称失败")
 
     # #16: 群公告
     @filter.command("发群公告", "发送群公告")
@@ -3180,7 +3263,7 @@ class GroupAdminPlugin(Star):
         )
 
 # #166: /群名称 — 修改本群名（群管/群主）
-    @filter.command("群名称", "修改本群名称（/群名称 新群名）")
+    @filter.command("群名", "修改本群名称（/群名 新群名）", alias={"群名称", "改群名", "修改群名"})
     async def set_group_name_cmd(self, event: AstrMessageEvent):
         raw = self._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -3192,12 +3275,12 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         text = self._extract_text(raw).strip()
-        for prefix in ("/群名称", "群名称"):
+        for prefix in ("/群名称", "/群名", "群名称", "群名"):
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip()
                 break
         if not text:
-            yield event.plain_result("请提供新群名，例如 /群名称 我的群")
+            yield event.plain_result("请提供新群名，例如 /群名 我的群")
             return
         if len(text) > 60:
             yield event.plain_result("群名过长（最多60字符）")
@@ -3758,10 +3841,20 @@ class GroupAdminPlugin(Star):
             audit_enabled = bool(self.get_group_setting(group_id, "join_audit_enabled", True))
             if not audit_enabled:
                 return
-            enabled_groups = self.get_group_setting(group_id, "violation_enabled_groups", [])
+            enabled_groups = self.get_group_setting(group_id, "enabled_groups", [])
             violation_keywords = self.get_group_setting(group_id, "violation_keywords", [])
             join_approve_keywords = self.get_group_setting(group_id, "join_approve_keywords", [])
-            enabled = enabled_groups and group_id in [str(x) for x in enabled_groups]
+            # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups
+            if not enabled_groups:
+                legacy_groups = self.config.get("violation_enabled_groups", []) or []
+                if legacy_groups:
+                    enabled = group_id in [str(x) for x in legacy_groups]
+                else:
+                    enabled = True
+            else:
+                sx_list = [str(x).lower() for x in enabled_groups]
+                enabled = ("*" in sx_list or "all" in sx_list
+                           or group_id in [str(x) for x in enabled_groups])
 
             # #194：黑名单用户直接拒绝（无需检查关键词/门禁）
             bl_list = self.get_group_setting(group_id, "blacklisted_users", [])
@@ -3865,10 +3958,10 @@ class GroupAdminPlugin(Star):
 
         enabled = self.get_group_setting(group_id, "auto_recall_enabled_groups", [])
         keywords = self.get_group_setting(group_id, "auto_recall_keywords", [])
-        # #170：兼容只配 keywords 未配 enabled_groups 的场景，配了关键词则默认全群启用
-        if not enabled and keywords:
-            enabled = ["*"]
+        # #192 owner：留空 = 全群启用；非空时 * / all 全启用，或精确匹配群号
         if not enabled:
+            enabled = ["*"]
+        if not keywords:
             return
         if "*" not in [str(x) for x in enabled] and "all" not in [str(x) for x in enabled]:
             if group_id not in [str(x) for x in enabled]:
