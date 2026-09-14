@@ -1207,6 +1207,8 @@ class GroupAdminPlugin(Star):
         if self._is_user_whitelisted(group_id, user_id):
             return False
         if self._moderation_admin_bypass(group_id, raw):
+            # #199：管理员/群主豁免为默认行为；记录 debug 便于排查"未撤回"工单
+            logger.debug(f"[违规检测] 群 {group_id} 用户 {user_id} 命中管理员豁免，跳过检测")
             return False
         msg_text = self._extract_text(raw) if isinstance(raw, dict) else ""
         # 1) 刷屏（不依赖文本）
@@ -1530,6 +1532,15 @@ class GroupAdminPlugin(Star):
             return False
         if not msg_text:
             return False
+        # #207：违禁词为硬清单，优先匹配且不受 AI 模式影响；
+        # 同时兼容旧全局配置 violation_keywords（WebUI 历史入口）
+        keywords = list(self.get_group_setting(group_id, "profanity_keywords", []) or [])
+        keywords += [k for k in (self.config.get("violation_keywords", []) or []) if k not in keywords]
+        text_lower = msg_text.lower()
+        for kw in keywords:
+            if str(kw).lower() and str(kw).lower() in text_lower:
+                logger.warning(f"[群违规检测] 命中违禁词 用户 {user_id}: {kw}")
+                return True
         use_ai = bool(self.get_group_setting(group_id, "profanity_use_ai", True))
         if use_ai and aiohttp is not None:
             api_endpoint = self.config.get("api_endpoint", "")
@@ -1539,12 +1550,6 @@ class GroupAdminPlugin(Star):
                 if is_profanity:
                     logger.warning(f"[群违规检测] 骂人 用户 {user_id} {reason}")
                     return True
-                return False  # AI 模式下不再走关键词
-        keywords = self.get_group_setting(group_id, "profanity_keywords", []) or []
-        text_lower = msg_text.lower()
-        for kw in keywords:
-            if str(kw).lower() and str(kw).lower() in text_lower:
-                return True
         return False
 
     async def _check_profanity_with_ai(self, api_endpoint: str, api_key: str, msg_text: str):
@@ -2030,6 +2035,27 @@ class GroupAdminPlugin(Star):
         yield event.plain_result(f"广告关键词（{len(kws)} 个）：\n{head}{more}")
 
     # ===================== 链接白名单（#195，按群） =====================
+
+    @filter.command("开关链接检测", "开启/关闭本群链接检测撤回（/开关链接检测 on|off）")
+    async def toggle_link_check_cmd(self, event: AstrMessageEvent, value: str = ""):
+        if not await self._moderation_require_admin_msg(event):
+            return
+        gid = self._get_group_id_or_none(event)
+        if not gid:
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        v = (value or "").strip().lower()
+        if v in ("on", "true", "开启"):
+            enabled = True
+        elif v in ("off", "false", "关闭"):
+            enabled = False
+        else:
+            enabled = not bool(self.get_group_setting(gid, "link_check_enabled", False))
+        self._set_group_override(gid, "link_check_enabled", enabled)
+        yield event.plain_result(
+            f"[成功] 本群链接检测已{'开启' if enabled else '关闭'}"
+            "（#199：管理员/群主默认豁免，如需对其生效请设本群 admin_bypass false）"
+        )
 
     @filter.command("添加链接白名单", "添加链接白名单域名（按群生效）")
     async def add_link_whitelist_cmd(self, event: AstrMessageEvent, domain: str = ""):
@@ -3118,13 +3144,34 @@ class GroupAdminPlugin(Star):
             return
         msg_data = msg.get("data") if isinstance(msg, dict) else msg
         image_url = ""
-        if isinstance(msg_data, dict):
-            segs = msg_data.get("message") or []
-            for seg in segs:
-                if not isinstance(seg, dict):
-                    continue
-                if seg.get("type") == "image":
-                    image_url = (seg.get("data") or {}).get("url", "") or (seg.get("data") or {}).get("file", "")
+        segs = msg_data.get("message") if isinstance(msg_data, dict) else None
+        if isinstance(segs, str):
+            # #206：部分 OneBot 实现 get_msg 返回 CQ 字符串而非段列表
+            m = re.search(r"\[CQ:image[^\]]*?url=([^\],]+)", segs) or \
+                re.search(r"\[CQ:image[^\]]*?file=([^\],]+)", segs)
+            if m:
+                image_url = m.group(1)
+            segs = None
+        for seg in segs or []:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "image":
+                d = seg.get("data") or {}
+                image_url = d.get("url") or d.get("file") or d.get("file_id") or ""
+                if image_url:
+                    break
+        if not image_url and isinstance(msg_data, dict):
+            # #206：兜底解析 raw_message 中的 CQ image
+            rawmsg = str(msg_data.get("raw_message") or "")
+            m = re.search(r"\[CQ:image[^\]]*?url=([^\],]+)", rawmsg) or \
+                re.search(r"\[CQ:image[^\]]*?file=([^\],]+)", rawmsg)
+            if m:
+                image_url = m.group(1)
+        if not image_url:
+            # #206：兜底从当前事件消息链的引用组件中取 Image
+            for comp in getattr(event.message_obj, "message", []) or []:
+                if comp.__class__.__name__ == "Image":
+                    image_url = getattr(comp, "url", "") or getattr(comp, "file", "") or ""
                     if image_url:
                         break
         if not image_url:
@@ -3881,7 +3928,12 @@ class GroupAdminPlugin(Star):
         if any(kw in msg_text for kw in keywords):
             msg_id = raw.get("message_id")
             if msg_id:
-                await self._recall_message(event, str(msg_id))
+                # #202：记录撤回结果，失败时给出原因，避免静默
+                ok, err = await self._do_recall(event, msg_id)
+                if ok:
+                    logger.info(f"[自动撤回] 命中关键词，已撤回 bot 消息 {msg_id}")
+                else:
+                    logger.warning(f"[自动撤回] 撤回 bot 消息 {msg_id} 失败: {err}")
 
     def _extract_text(self, raw: dict) -> str:
         parts = []
