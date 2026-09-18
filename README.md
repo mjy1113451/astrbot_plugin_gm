@@ -65,6 +65,7 @@
 |------|------|
 | `/开关撤回提示 on/off` | 撤回操作群内提示（show_recall_notice） |
 | `/开关禁言提示 on/off` | 禁言/解禁结果回复（mute_notice） |
+| `/开关群名提示 on/off` | 修改群名结果回复（group_name_notice） |
 | `/开关踢人拒加 on/off` | 踢人后拒绝再次加群（reject_re_add） |
 | `/开关管理员豁免 on/off` | 管理员违规豁免（admin_bypass） |
 | `/开关违规通知 on/off` | 违规群内通知（notify_on_violation） |
@@ -187,6 +188,7 @@ pip install astrbot_plugin_group_admin
 |--------|------|--------|------|
 | `show_recall_notice` | bool | `true` | 撤回操作后在群里发送提示 |
 | `mute_notice` | bool | `true` | 禁言 / 解禁后回复结果 |
+| `group_name_notice` | bool | `true` | 修改群名成功后是否群内通知（关闭时仅失败提示；推荐按群覆盖） |
 | `reject_re_add` | bool | `false` | 踢人后自动拒绝该用户再次加群 |
 | `auto_recall_keywords` | list | `[]` | Bot 发言自动撤回关键词列表（推荐按群覆盖） |
 | `auto_recall_enabled_groups` | list | `[]` | 启用自动撤回的群 ID 列表（**留空 = 全群启用**，#192；`*` / `all` 表示全部，或填指定群号） |

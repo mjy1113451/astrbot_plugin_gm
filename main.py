@@ -136,6 +136,8 @@ class GroupAdminPlugin(Star):
         return {
             "show_recall_notice": True,
             "mute_notice": True,
+            # 修改群名成功是否群内通知（owner 09-18；关闭时仅失败提示，支持按群覆盖）
+            "group_name_notice": True,
             "reject_re_add": False,
             "groups": {},
             # 按操作类型分别配置管理员（#34 权限系统重构）
@@ -745,7 +747,7 @@ class GroupAdminPlugin(Star):
         "添加插件管理", "删除插件管理", "添加头衔管理", "删除头衔管理",
         "添加管理管理", "删除管理管理", "添加踢人管理", "删除踢人管理",
         "查看群配置", "清除群配置", "群违规检测状态",
-        "开关撤回提示", "开关禁言提示", "开关踢人拒加", "开关管理员豁免",
+        "开关撤回提示", "开关禁言提示", "开关群名提示", "开关踢人拒加", "开关管理员豁免",
         "开关违规通知", "开关加群申请提醒", "开关加群自动审核",
         "开关踢人清历史", "开关语音检测",
         "设置排名人数", "设置踢人阈值", "设置消息历史条数", "设置踢人清条数", "设置拒绝理由",
@@ -3369,7 +3371,8 @@ class GroupAdminPlugin(Star):
             return
         ok = await self._execute_action(event, "set_group_name",
                                         group_id=group_id, group_name=text)
-        yield event.plain_result(f"已修改群名为「{text}」" if ok else "修改群名失败（当前 OneBot 实现可能不支持此 API，或机器人权限不足）")
+        if self._should_notify_group_name(group_id, ok):
+            yield event.plain_result(f"已修改群名为「{text}」" if ok else "修改群名失败（当前 OneBot 实现可能不支持此 API，或机器人权限不足）")
 
     # #163: /群标签 — 添加群标签（群管/群主）
     @filter.command("群标签", "添加群标签（/群标签 标签名）")
@@ -3549,6 +3552,14 @@ class GroupAdminPlugin(Star):
         if not gid: return
         self._set_group_override(gid, "mute_notice", value.lower() not in ("off", "false", "0", "关", "关闭"))
         yield event.plain_result(f"[成功] 本群禁言提示已设为 {'开启' if value.lower() not in ('off','false','0','关','关闭') else '关闭'}")
+
+    @filter.command("开关群名提示", "开关修改群名结果回复（on/off，按群生效）")
+    async def toggle_group_name_notice_cmd(self, event: AstrMessageEvent, value: str = ""):
+        if not await self._moderation_require_admin_msg(event): return
+        gid = self._get_group_id_or_none(event)
+        if not gid: return
+        self._set_group_override(gid, "group_name_notice", value.lower() not in ("off", "false", "0", "关", "关闭"))
+        yield event.plain_result(f"[成功] 本群群名提示已设为 {'开启' if value.lower() not in ('off','false','0','关','关闭') else '关闭'}")
 
     @filter.command("开关踢人拒加", "开关踢人后拒绝重新加群（on/off，按群生效）")
     async def toggle_reject_re_add_cmd(self, event: AstrMessageEvent, value: str = ""):
@@ -4165,3 +4176,10 @@ class GroupAdminPlugin(Star):
         if not ok:
             return True  # 失败总是提示
         return bool(self.get_group_setting(group_id, "mute_notice", self.config.get("mute_notice", True)))
+
+    def _should_notify_group_name(self, group_id: str, ok: bool) -> bool:
+        """判断修改群名是否需要回复（owner 09-18）。
+        配置 group_name_notice=False 时只回复失败，成功静默。支持按群覆盖 (group_overrides)。"""
+        if not ok:
+            return True  # 失败总是提示
+        return bool(self.get_group_setting(group_id, "group_name_notice", self.config.get("group_name_notice", True)))

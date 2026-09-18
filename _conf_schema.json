@@ -11,6 +11,12 @@
         "hint": "推荐按群覆盖。",
         "default": true
     },
+    "group_name_notice": {
+        "description": "修改群名成功后是否群内通知",
+        "type": "bool",
+        "hint": "关闭后修改群名成功不回复（失败仍提示）。推荐按群覆盖：/开关群名提示 on/off。",
+        "default": true
+    },
     "reject_re_add": {
         "description": "踢人后拒绝再次加群",
         "type": "bool",
@@ -118,7 +124,7 @@
         "description": "按群独立配置覆盖：{群号: {key: value}}",
         "type": "dict",
         "items": {},
-        "hint": "按群覆盖配置（内部存储，由群内独立指令维护，#193 已移除 /设置群配置）。可用 key 包括：show_recall_notice、mute_notice、reject_re_add、auto_recall_keywords、rank_top_n、report_notify_admins、join_approve_keywords、join_notify_admins、join_request_notify_in_group、join_reject_reason、join_audit_enabled、title_admins、group_admin_admins、kick_admins、mute_kick_threshold、enabled_groups（true/false）、spam_*、profanity_*、ad_*、link_*、link_whitelist（#195）、group_promotion_*、ban_duration、whitelist_users、blacklisted_users（#194）、admin_bypass、notify_on_violation、max_message_history、kick_recall_enabled、kick_recall_count、voice_check_enabled、banned_images。语音转文字相关配置（voice_check_provider_id、voice_asr_endpoint/api_key/model、voice_check_timeout）为全局配置，不支持按群覆盖。save_config 直接序列化整个 config dict，group_overrides 下所有 key 均完整持久化。",
+        "hint": "按群覆盖配置（内部存储，由群内独立指令维护，#193 已移除 /设置群配置）。可用 key 包括：show_recall_notice、mute_notice、group_name_notice、reject_re_add、auto_recall_keywords、rank_top_n、report_notify_admins、join_approve_keywords、join_notify_admins、join_request_notify_in_group、join_reject_reason、join_audit_enabled、title_admins、group_admin_admins、kick_admins、mute_kick_threshold、enabled_groups（true/false）、spam_*、profanity_*、ad_*、link_*、link_whitelist（#195）、group_promotion_*、ban_duration、whitelist_users、blacklisted_users（#194）、admin_bypass、notify_on_violation、max_message_history、kick_recall_enabled、kick_recall_count、voice_check_enabled、banned_images。语音转文字相关配置（voice_check_provider_id、voice_asr_endpoint/api_key/model、voice_check_timeout）为全局配置，不支持按群覆盖。save_config 直接序列化整个 config dict，group_overrides 下所有 key 均完整持久化。",
         "default": {}
     },
     "api_type": {
