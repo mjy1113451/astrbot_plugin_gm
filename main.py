@@ -138,10 +138,9 @@ class GroupAdminPlugin(Star):
             "mute_notice": True,
             "reject_re_add": False,
             "groups": {},
-            # 按操作类型分别配置管理员（#34 权限系统重构）
-            "title_admins": [],
+            # 设管理专项管理员（#219 owner 09-18：仅保留设管理相关；
+            # 头衔/踢人专项列表 title_admins/kick_admins 已移除，相应操作回归插件管理员）
             "group_admin_admins": [],
-            "kick_admins": [],
             # 关键词自动撤回（#46）
             "auto_recall_keywords": [],
             "auto_recall_enabled_groups": [],
@@ -186,7 +185,7 @@ class GroupAdminPlugin(Star):
             "threshold": 0.7,
             "check_porn": True,
             "check_sexy": True,
-            # 监控群组（* 或 all 表示全部启用；为空表示不监控；可按群覆盖为 bool）
+            # 监控群组（* 或 all 表示全部启用；留空 = 全群启用（#192 owner 拍板）；可按群覆盖为 bool 显式关闭）
             "enabled_groups": [],
             "spam_check_enabled": True,
             "spam_threshold": 5,
@@ -376,25 +375,9 @@ class GroupAdminPlugin(Star):
                 self.save_config()
             return removed
 
-    def has_title_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
-        uid = str(user_id)
-        title_admins = [str(x) for x in self.get_group_setting(group_id, "title_admins", [])]
-        if uid in title_admins:
-            return True
-        if self._is_group_admin_or_owner(raw):
-            return True
-        return False
-
-    def has_kick_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
-        uid = str(user_id)
-        kick_admins = [str(x) for x in self.get_group_setting(group_id, "kick_admins", [])]
-        if uid in kick_admins:
-            return True
-        if self._is_group_admin_or_owner(raw):
-            return True
-        return False
-
     def has_group_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
+        """设管理/取消管理权限：group_admin_admins 专项名单或插件管理员（#219 owner 09-18：
+        仅设管理保留专项名单；头衔/踢人专项列表已移除）。"""
         uid = str(user_id)
         ga_admins = [str(x) for x in self.get_group_setting(group_id, "group_admin_admins", [])]
         if uid in ga_admins:
@@ -742,8 +725,7 @@ class GroupAdminPlugin(Star):
         "切换骂人检测模式", "设涉政禁言时长",
         "添加白名单用户", "删除白名单用户", "查看白名单", "查看违规统计",
         "添加广告关键词", "删除广告关键词", "查看广告关键词",
-        "添加插件管理", "删除插件管理", "添加头衔管理", "删除头衔管理",
-        "添加管理管理", "删除管理管理", "添加踢人管理", "删除踢人管理",
+        "添加插件管理", "删除插件管理", "添加管理管理", "删除管理管理",
         "查看群配置", "清除群配置", "群违规检测状态",
         "开关撤回提示", "开关禁言提示", "开关踢人拒加", "开关管理员豁免",
         "开关违规通知", "开关加群申请提醒", "开关加群自动审核",
@@ -1169,25 +1151,28 @@ class GroupAdminPlugin(Star):
         """群是否启用违规检测。
         优先级
         1. group_overrides[gid]["enabled_groups"] 为 bool 时，按 bool 决定
-        2. top-level enabled_groups 列表：包含 * / all 表示全部；包含群号表示启用
-        3. 兼容旧 violation_enabled_groups 列表
-        4. owner 09-16 拍板：留空 = 不启用（安全默认）；启用需显式配置列表或按群 bool
+        2. top-level enabled_groups 列表：包含 * / all 表示全部；包含群号表示启用；
+           非空但未命中表示不启用
+        3. 兼容旧 violation_enabled_groups 列表：非空时按旧列表判定（老用户行为不漂移）
+        4. #192 owner 拍板：两处均留空 = 全群启用
         """
         overrides = self.config.get("group_overrides", {}).get(str(group_id), {})
         v = overrides.get("enabled_groups")
         if isinstance(v, bool):
             return v
         enabled = self.config.get("enabled_groups", []) or []
-        if not enabled:
+        if enabled:
+            for x in enabled:
+                sx = str(x).lower()
+                if sx in ("*", "all"):
+                    return True
+                if str(x) == str(group_id):
+                    return True
             return False
-        for x in enabled:
-            sx = str(x).lower()
-            if sx in ("*", "all"):
-                return True
-            if str(x) == str(group_id):
-                return True
         legacy = self.config.get("violation_enabled_groups", []) or []
-        return str(group_id) in [str(x) for x in legacy]
+        if legacy:
+            return str(group_id) in [str(x) for x in legacy]
+        return True
 
     def _is_user_whitelisted(self, group_id: str, user_id: str) -> bool:
         whitelist = self.get_group_setting(group_id, "whitelist_users", []) or []
@@ -2346,13 +2331,11 @@ class GroupAdminPlugin(Star):
         qq_list = list({str(x) for x in qq_list if x})
         if not qq_list:
             yield event.plain_result(
-                "按群插件管理已改为专项权限配置。\n"
-                "请使用：/添加头衔管理 QQ、/添加管理管理 QQ、/添加踢人管理 QQ"
+                "按群插件管理已改为设管理专项权限配置。\n"
+                "请使用：/添加管理管理 QQ"
             )
             return
-        added = []
-        for key in ("title_admins", "group_admin_admins", "kick_admins"):
-            added.extend(self._add_group_override_admins(group_id, key, qq_list))
+        added = self._add_group_override_admins(group_id, "group_admin_admins", qq_list)
         yield event.plain_result(
             "已按群添加专项权限管理员: " + (", ".join(sorted(set(added))) if added else "所列QQ号均已存在")
         )
@@ -2371,26 +2354,14 @@ class GroupAdminPlugin(Star):
         qq_list = list({str(x) for x in qq_list if x})
         if not qq_list:
             yield event.plain_result(
-                "按群插件管理已改为专项权限配置。\n"
-                "请使用：/删除头衔管理 QQ、/删除管理管理 QQ、/删除踢人管理 QQ"
+                "按群插件管理已改为设管理专项权限配置。\n"
+                "请使用：/删除管理管理 QQ"
             )
             return
-        removed = []
-        for key in ("title_admins", "group_admin_admins", "kick_admins"):
-            removed.extend(self._remove_group_override_admins(group_id, key, qq_list))
+        removed = self._remove_group_override_admins(group_id, "group_admin_admins", qq_list)
         yield event.plain_result(
             "已按群移除专项权限管理员: " + (", ".join(sorted(set(removed))) if removed else "所列QQ号均不存在")
         )
-
-    @filter.command("添加头衔管理", "按群添加可设置/取消头衔的专项管理员")
-    async def add_title_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._edit_special_admins(event, target, "title_admins", "头衔", True):
-            yield result
-
-    @filter.command("删除头衔管理", "按群移除可设置/取消头衔的专项管理员")
-    async def remove_title_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._edit_special_admins(event, target, "title_admins", "头衔", False):
-            yield result
 
     @filter.command("添加管理管理", "按群添加可设置/取消群管理的专项管理员")
     async def add_group_admin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
@@ -2400,16 +2371,6 @@ class GroupAdminPlugin(Star):
     @filter.command("删除管理管理", "按群移除可设置/取消群管理的专项管理员")
     async def remove_group_admin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
         async for result in self._edit_special_admins(event, target, "group_admin_admins", "群管理", False):
-            yield result
-
-    @filter.command("添加踢人管理", "按群添加可踢人的专项管理员")
-    async def add_kick_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._edit_special_admins(event, target, "kick_admins", "踢人", True):
-            yield result
-
-    @filter.command("删除踢人管理", "按群移除可踢人的专项管理员")
-    async def remove_kick_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._edit_special_admins(event, target, "kick_admins", "踢人", False):
             yield result
 
     @filter.command("设管理", "设置群管理员（支持批量+@）")
@@ -2472,8 +2433,8 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         group_id = str(raw.get("group_id"))
-        if not self.has_title_admin_rights(sender_id, group_id, raw):
-            yield event.plain_result("只有插件管理员、头衔管理员或群管理员可执行此操作")
+        if not self._is_group_admin_or_owner(raw):
+            yield event.plain_result("只有插件管理员（群管理员/群主）可执行此操作")
             return
         target_qq = self._extract_at_qq(raw)
         if not target_qq:
@@ -2609,8 +2570,8 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         group_id = str(raw.get("group_id"))
-        if not self.has_kick_admin_rights(sender_id, group_id, raw):
-            yield event.plain_result("只有插件管理员、踢人管理员或群管理员可执行此操作")
+        if not self._is_group_admin_or_owner(raw):
+            yield event.plain_result("只有插件管理员（群管理员/群主）可执行此操作")
             return
         qq_list = self._extract_at_qqs(raw) or _parse_qq_list(target)
         if not qq_list:
@@ -3817,9 +3778,7 @@ class GroupAdminPlugin(Star):
         if group_id:
             overrides = self.config.get("group_overrides", {}).get(group_id, {})
             lines.extend([
-                f"本群 title_admins: {', '.join(map(str, self.get_group_setting(group_id, 'title_admins', []))) or '空'}",
                 f"本群 group_admin_admins: {', '.join(map(str, self.get_group_setting(group_id, 'group_admin_admins', []))) or '空'}",
-                f"本群 kick_admins: {', '.join(map(str, self.get_group_setting(group_id, 'kick_admins', []))) or '空'}",
                 f"本群 mute_kick_threshold: {self.get_group_setting(group_id, 'mute_kick_threshold', 0)}"
                 f"{'（按群覆盖）' if 'mute_kick_threshold' in overrides else '（全局默认）'}",
             ])
@@ -3995,8 +3954,11 @@ class GroupAdminPlugin(Star):
             enabled_groups = self.get_group_setting(group_id, "enabled_groups", [])
             violation_keywords = self.get_group_setting(group_id, "violation_keywords", [])
             join_approve_keywords = self.get_group_setting(group_id, "join_approve_keywords", [])
-            # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups
-            if not enabled_groups:
+            # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups；
+            # 按群覆盖 bool 最高优先（可对单群显式关）
+            if isinstance(enabled_groups, bool):
+                enabled = enabled_groups
+            elif not enabled_groups:
                 legacy_groups = self.config.get("violation_enabled_groups", []) or []
                 if legacy_groups:
                     enabled = group_id in [str(x) for x in legacy_groups]
@@ -4128,15 +4090,15 @@ class GroupAdminPlugin(Star):
 
         enabled = self.get_group_setting(group_id, "auto_recall_enabled_groups", [])
         keywords = self.get_group_setting(group_id, "auto_recall_keywords", [])
-        # #170：兼容只配 keywords 未配 enabled_groups 的场景，配了关键词则默认全群启用
-        # owner 09-16：留空且无关键词 = 不启用（安全默认）
-        if not enabled and keywords:
-            enabled = ["*"]
-        if not enabled:
-            return
-        if "*" not in [str(x) for x in enabled] and "all" not in [str(x) for x in enabled]:
-            if group_id not in [str(x) for x in enabled]:
+        # #192 owner 拍板：留空 = 全群启用（keywords 为空时本就无命中，不产生实际撤回）；
+        # 按群覆盖 bool 可单群显式开/关；非空列表按 * / all / 群号判定
+        if isinstance(enabled, bool):
+            if not enabled:
                 return
+        elif enabled:
+            if "*" not in [str(x) for x in enabled] and "all" not in [str(x) for x in enabled]:
+                if group_id not in [str(x) for x in enabled]:
+                    return
         if not keywords:
             return
         msg_text = self._extract_text(raw)
