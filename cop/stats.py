@@ -104,25 +104,25 @@ class StatsService:
 
     async def clean_inactive_members(
         self, event, group_id: str, days: int,
-    ) -> tuple[int, int, list[str]]:
+    ) -> tuple[int, int, list[str], bool]:
         """踢出 N 天内未发言的群成员。
 
-        返回 (成功踢出数, 失败数, 被跳过的不应踢成员 QQ 列表)。
-        仅使用 `get_group_member_list` 返回的 `last_sent_time` 字段判定发言时间；
-        若协议端不支持该字段则报告无法执行。
+        返回 (成功踢出数, 失败数, 被跳过的不应踢成员 QQ 列表, capability)。
+        capability=False 表示协议端不支持 last_sent_time，无法执行；
+        capability=True 表示正常执行（即使成功/失败均为 0 表示确实无人）。
         群主与管理员始终跳过（不受发言时间影响）。
         """
         if days < 1:
-            return 0, 0, []
+            return 0, 0, [], True
         cutoff = time.time() - days * 86400
         member_list_raw = await self._api._execute_action(
             event, "get_group_member_list", group_id=group_id, return_raw=True)
         member_list = self._api._normalize_member_list(member_list_raw)
-        if member_list is None:
-            return 0, 0, []
+        if member_list is None or not member_list:
+            return 0, 0, [], False
         # 检查首成员是否有 last_sent_time 字段（协议端是否支持）
         if not any(k in member_list[0] for k in ("last_sent_time", "last_message_time")):
-            return 0, 0, []
+            return 0, 0, [], False
         skipped: list[str] = []
         kicked_ok, kicked_fail = 0, 0
         for m in member_list:
@@ -140,4 +140,4 @@ class StatsService:
                     kicked_ok += 1
                 else:
                     kicked_fail += 1
-        return kicked_ok, kicked_fail, skipped
+        return kicked_ok, kicked_fail, skipped, True

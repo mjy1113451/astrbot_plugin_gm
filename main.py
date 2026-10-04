@@ -1476,8 +1476,12 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("天数必须大于 0")
             return
         yield event.plain_result(f"正在清理 {days} 天未发言的成员，请稍候...")
-        kicked_ok, kicked_fail, skipped = await self._stats.clean_inactive_members(
+        kicked_ok, kicked_fail, skipped, capable = await self._stats.clean_inactive_members(
             event, group_id, days)
+        if not capable:
+            yield event.plain_result(
+                f"无法执行（当前协议端不支持成员发言时间查询，请确认 OneBot 实现是否提供 last_sent_time 字段）")
+            return
         parts = []
         if kicked_ok > 0:
             parts.append(f"已踢出 {kicked_ok} 人")
@@ -1486,7 +1490,7 @@ class GroupAdminPlugin(Star):
         if skipped:
             parts.append(f"跳过 {len(skipped)} 人（群主/管理员）")
         if not parts:
-            yield event.plain_result(f"近 {days} 天内无未发言的普通成员（或协议端不支持发言时间查询）")
+            yield event.plain_result(f"近 {days} 天内无未发言的普通成员")
             return
         yield event.plain_result("，".join(parts))
 
