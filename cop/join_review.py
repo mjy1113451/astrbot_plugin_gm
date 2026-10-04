@@ -122,7 +122,9 @@ class JoinReviewService:
             )
             return
 
-        # #241：群员邀请（invite）自动通过；黑名单在邀请场景同样拦截（见上方）
+        # #241：群员邀请（invite）自动通过；黑名单在邀请场景同样拦截（见上方）。
+        # 警告：invite_auto_approve 等同于豁免对邀请入群者的人工审核，请谨慎开启；
+        # 如需限制同邀请人频率，建议配合 join_notify_admins 通知人工监督。
         if str(raw.get("sub_type") or "add") == "invite":
             auto_approve_invite = bool(
                 self._store.get_group_setting(group_id, "invite_auto_approve", True))

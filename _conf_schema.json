@@ -332,7 +332,7 @@
     "invite_auto_approve": {
         "description": "群员邀请进群自动通过（受加群审核总开关 join_audit_enabled 与启用群范围 enabled_groups 控制）",
         "type": "bool",
-        "hint": "推荐按群覆盖。默认开。",
+        "hint": "推荐按群覆盖。⚠️ 默认开等同于豁免对邀请入群者的人工审核，请谨慎开启，建议配合加群通知管理员（join_notify_admins）监督。默认开。",
         "default": true
     },
     "ban_duration": {
