@@ -129,6 +129,39 @@ class JoinReviewService:
             auto_approve_invite = bool(
                 self._store.get_group_setting(group_id, "invite_auto_approve", True))
             if auto_approve_invite:
+                # 安全增强（#241 review 补充）：邀请场景同样检查 reject_keywords，避免
+                # 恶意邀请人利用 invite 自动通过绕过关键词审核。
+                reject_keywords = self._store.get_group_setting(group_id, "join_reject_keywords", [])
+                if reject_keywords and any(str(kw) in comment for kw in reject_keywords):
+                    # 邀请场景命中拒绝关键词 → 拒绝并加入黑名单（同普通申请处理）
+                    hit_kw = next(str(kw) for kw in reject_keywords if str(kw) in comment)
+                    bl = self._store.get_group_override_list(group_id, "blacklisted_users")
+                    if str(user_id) not in [str(x) for x in bl]:
+                        bl.append(str(user_id))
+                        self._store.save_config()
+                    detail_reason = f"邀请含有禁止词语，自动拒绝（{reject_reason}）"
+                    handled = await self._api._handle_group_request(
+                        event, flag, False, detail_reason, sub_type="invite")
+                    logger.info(f"[加群审核] 群 {group_id} 邀请 {user_id} 命中拒绝关键词「{hit_kw}」，已拒绝并拉黑")
+                    return
+                # 速率限制：invite_auto_approve_window 秒内同邀请人超过阈值则跳过自动通过，交由后续人工审核
+                inviter_key = f"{group_id}_{user_id}"
+                try:
+                    window_sec = max(0, int(self._store.get_group_setting(
+                        group_id, "invite_auto_approve_window", 0) or 0))
+                    max_per_window = max(0, int(self._store.get_group_setting(
+                        group_id, "invite_auto_approve_max", 0) or 0))
+                except (TypeError, ValueError):
+                    window_sec, max_per_window = 0, 0
+                if window_sec > 0 and max_per_window > 0:
+                    now = time.time()
+                    records = self._runtime.invite_approve_records.setdefault(group_id, {})
+                    history = [t for t in records.get(inviter_key, []) if now - t < window_sec]
+                    if len(history) >= max_per_window:
+                        logger.info(f"[加群审核] 群 {group_id} 邀请人 {user_id} 速率超限（>{max_per_window}/{window_sec}s），跳过自动通过")
+                        return  # 交由后续人工审核流程处理
+                    history.append(now)
+                    records[inviter_key] = history
                 handled = await self._api._handle_group_request(
                     event, flag, True, "邀请入群自动通过", sub_type="invite")
                 logger.info(f"[加群审核] 群 {group_id} 邀请申请 {user_id} 自动同意: "

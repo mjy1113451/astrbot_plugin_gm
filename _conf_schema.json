@@ -332,8 +332,20 @@
     "invite_auto_approve": {
         "description": "群员邀请进群自动通过（受加群审核总开关 join_audit_enabled 与启用群范围 enabled_groups 控制）",
         "type": "bool",
-        "hint": "推荐按群覆盖。⚠️ 默认开等同于豁免对邀请入群者的人工审核，请谨慎开启，建议配合加群通知管理员（join_notify_admins）监督。默认开。",
+        "hint": "推荐按群覆盖。⚠️ 默认开等同于豁免对邀请入群者的人工审核，请谨慎开启；建议配合加群通知管理员（join_notify_admins）和速率限制（invite_auto_approve_window / invite_auto_approve_max）一起使用。默认开。",
         "default": true
+    },
+    "invite_auto_approve_window": {
+        "description": "邀请自动通过速率限制时间窗口（秒），设为 0 则关闭速率限制",
+        "type": "int",
+        "hint": "推荐按群覆盖。与 invite_auto_approve_max 配合使用，例如窗口 300 秒、最大 5 次表示同邀请人 5 分钟内最多自动通过 5 人。默认 0（关闭）。",
+        "default": 0
+    },
+    "invite_auto_approve_max": {
+        "description": "邀请自动通过速率限制阈值（时间窗口内最多自动通过人数），需配合 invite_auto_approve_window 使用",
+        "type": "int",
+        "hint": "推荐按群覆盖。默认 0（关闭）。",
+        "default": 0
     },
     "ban_duration": {
         "description": "图片违规禁言时长（秒）",

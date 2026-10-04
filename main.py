@@ -275,6 +275,7 @@ class GroupAdminPlugin(Star):
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
     _banned_file_md5_cache = _runtime_prop("_banned_file_md5_cache")
     group_exists_cache = _runtime_prop("group_exists_cache")
+    invite_approve_records = _runtime_prop("invite_approve_records")
 
     # ===================== 通用 IO（阶段1：委托 cop 存储层） =====================
     # 仅保留 load_json 作为 cop 存储层委托（仍被门面内部读写明文 JSON 使用）。

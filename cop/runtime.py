@@ -48,3 +48,7 @@ class RuntimeState:
         # 群号存在性探测缓存（#267）：group_exists_cache[群号] -> (exists: bool, timestamp: float)
         # 仅内存，进程重启清空（探测结果有时效，不做持久化）。
         self.group_exists_cache: dict = {}
+
+        # #241：群员邀请自动通过速率限制记录（内存态，进程重启清零）
+        # 结构：invite_approve_records[group_id][inviter_user_id] -> [timestamp, ...]
+        self.invite_approve_records: dict = {}
