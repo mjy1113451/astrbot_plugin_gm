@@ -1,19 +1,21 @@
+from __future__ import annotations
+
+import time
+
 """L3a 统计领域服务：发言计数、排名、重置、禁言计数与阈值踢人、违规计数。
 
 迁出自 main.py 的以下方法（逐字保留逻辑等价）：
     _increment_message_count / get_rank / reset_group_stats
-    _record_mute_and_maybe_kick / _record_violation
+    _record_mute_and_maybe_kick / _record_violation / clean_inactive_members
 
 依赖（构造注入，L3 只依赖 L0/L1/L2，不 import 同层）：
 - RuntimeState（L2）：stats / _msg_save_counter
 - ConfigStore（L1）：get_group_setting / save_stats
-- OneBotApi（L2）：_kick_member / _send
+- OneBotApi（L2）：_kick_member / _send / _execute_action / _normalize_member_list
 - MessageParser（L2）：_build_text（_record_mute_and_maybe_kick 的踢出提示）
 
 main.py 门面保留同名薄包装委托本服务，既有调用点零改动。
 """
-
-from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
@@ -97,3 +99,45 @@ class StatsService:
         bucket = counts.setdefault(kind, {})
         bucket[str(user_id)] = int(bucket.get(str(user_id), 0)) + 1
         self._store.save_stats(self._runtime.stats)
+
+    # ===================== 清理未发言成员（#225） =====================
+
+    async def clean_inactive_members(
+        self, event, group_id: str, days: int,
+    ) -> tuple[int, int, list[str]]:
+        """踢出 N 天内未发言的群成员。
+
+        返回 (成功踢出数, 失败数, 被跳过的不应踢成员 QQ 列表)。
+        仅使用 `get_group_member_list` 返回的 `last_sent_time` 字段判定发言时间；
+        若协议端不支持该字段则报告无法执行。
+        群主与管理员始终跳过（不受发言时间影响）。
+        """
+        if days < 1:
+            return 0, 0, []
+        cutoff = time.time() - days * 86400
+        member_list_raw = await self._api._execute_action(
+            event, "get_group_member_list", group_id=group_id, return_raw=True)
+        member_list = self._api._normalize_member_list(member_list_raw)
+        if member_list is None:
+            return 0, 0, []
+        # 检查首成员是否有 last_sent_time 字段（协议端是否支持）
+        if not any(k in member_list[0] for k in ("last_sent_time", "last_message_time")):
+            return 0, 0, []
+        skipped: list[str] = []
+        kicked_ok, kicked_fail = 0, 0
+        for m in member_list:
+            role = m.get("role", "") if isinstance(m, dict) else ""
+            if role in ("owner", "admin"):
+                skipped.append(str(m.get("user_id", "")))
+                continue
+            try:
+                last = float(m.get("last_sent_time") or m.get("last_message_time") or 0)
+            except (TypeError, ValueError):
+                continue
+            if 0 < last < cutoff:
+                ok = await self._api._kick_member(event, group_id, str(m.get("user_id", "")))
+                if ok:
+                    kicked_ok += 1
+                else:
+                    kicked_fail += 1
+        return kicked_ok, kicked_fail, skipped

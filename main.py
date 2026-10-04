@@ -1454,6 +1454,42 @@ class GroupAdminPlugin(Star):
         self._stats.reset_group_stats(group_id)
         yield event.plain_result("已清除本群发言数据，重新开始计数")
 
+    # #225：清人
+    @filter.command("清人", "清理 N 天未发言的成员（/清人 N）")
+    async def clean_inactive_cmd(self, event: AstrMessageEvent, value: str = ""):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        group_id = str(raw.get("group_id"))
+        if not await self._perms._moderation_require_admin_msg(event):
+            return
+        if not value:
+            yield event.plain_result("请提供天数，例如：/清人 4")
+            return
+        try:
+            days = int(value)
+        except (ValueError, TypeError):
+            yield event.plain_result("天数必须是整数")
+            return
+        if days < 1:
+            yield event.plain_result("天数必须大于 0")
+            return
+        yield event.plain_result(f"正在清理 {days} 天未发言的成员，请稍候...")
+        kicked_ok, kicked_fail, skipped = await self._stats.clean_inactive_members(
+            event, group_id, days)
+        parts = []
+        if kicked_ok > 0:
+            parts.append(f"已踢出 {kicked_ok} 人")
+        if kicked_fail > 0:
+            parts.append(f"踢出失败 {kicked_fail} 人")
+        if skipped:
+            parts.append(f"跳过 {len(skipped)} 人（群主/管理员）")
+        if not parts:
+            yield event.plain_result(f"近 {days} 天内无未发言的普通成员（或协议端不支持发言时间查询）")
+            return
+        yield event.plain_result("，".join(parts))
+
     # #21: 举报违规
     @filter.command("举报", "举报群成员违规行为（@成员或引用其消息）")
     async def report_cmd(self, event: AstrMessageEvent, reason: str = ""):

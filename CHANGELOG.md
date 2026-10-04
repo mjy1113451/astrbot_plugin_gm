@@ -6,6 +6,10 @@
 与 cop/constants.py 探测常量；`_check_group_promotion` 抽出 `_extract_promotion_group_numbers`
 供 service.py 共用；语音检测链路同步接入存在性验证。无需附带默认头像图片文件。
 
+#225 新增 `/清人 N` 命令——按 N 天未发言清理群成员（基于 OneBot `last_sent_time` 字段），
+群主/管理员始终跳过；协议端不支持该字段时报「无法执行」。新增
+`StatsService.clean_inactive_members()` 方法；`GM_COMMAND_NAMES` 新增「清人」。
+
 #233 新增群公告发布后群内通知开关（`announce_notify`，默认开）——`/发群公告` 成功发布后
 自动发送「📢 管理员已发布群公告，请各位成员注意查看」提醒；可按群覆盖，指令 `/开关公告通知`。
 
