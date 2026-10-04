@@ -237,13 +237,22 @@ class ModerationService:
                 return True
             if await self._text._check_group_promotion(msg_text, event, group_id, user_id):
                 # #267：群号推广检测增强——仅关键词+格式命中不够，需进一步验证群号是否真实存在
+                # 策略：遍历所有提取的群号，任一存在即触发；全部不存在或无法判定才放行
                 group_numbers = self._text._extract_promotion_group_numbers(msg_text)
                 if group_numbers:
-                    # 只探测第一个群号（与原正则 findall 一致，以第一个提取的群号为代表）
-                    exists = await self._group_exists.check_group_exists(
-                        group_numbers[0], group_id)
-                    # None = 网络异常/无法判定，保守跳过（不误撤回误禁言）；False = 群号不存在，放行
-                    if exists is not True:
+                    any_real = False
+                    any_unable = False
+                    for gn in group_numbers:
+                        exists = await self._group_exists.check_group_exists(gn, group_id)
+                        if exists is True:
+                            any_real = True
+                            break
+                        if exists is None:
+                            any_unable = True
+                    # None = 网络异常/无法判定，保守跳过（不误撤回误禁言）；False = 群号不存在
+                    if not any_real:
+                        if any_unable:
+                            logger.debug(f"[群违规检测] 群 {group_id} 群号推广检测部分群号无法判定，保守放行")
                         return False
                 mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
                 await self._handle_violation(event, "group_promotion", group_id, user_id, mid)
@@ -285,12 +294,19 @@ class ModerationService:
                     violated_kind = "link"
                 elif await self._text._check_group_promotion(text, event, group_id, user_id):
                     violated_kind = "group_promotion"
-                    # #267：语音群号推广同样需验证群号存在性
+                    # #267：语音群号推广同样需验证群号存在性（任一存在即触发）
                     group_numbers = self._text._extract_promotion_group_numbers(text)
                     if group_numbers:
-                        exists = await self._group_exists.check_group_exists(
-                            group_numbers[0], group_id)
-                        if exists is not True:
+                        any_real = False
+                        any_unable = False
+                        for gn in group_numbers:
+                            exists = await self._group_exists.check_group_exists(gn, group_id)
+                            if exists is True:
+                                any_real = True
+                                break
+                            if exists is None:
+                                any_unable = True
+                        if not any_real:
                             violated_kind = None
                 if violated_kind:
                     mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
