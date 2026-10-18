@@ -2530,6 +2530,20 @@ class GroupAdminPlugin(Star):
                                          "二维码识别自动撤回"):
             yield r
 
+    # #272: /开关不安全网站检测 — 开关链接目标页不安全网站分析（全局配置 + 按群覆盖）
+    @filter.command("开关不安全网站检测", "开关不安全网站检测（on/off，按群生效，#272）")
+    async def toggle_link_safety_cmd(self, event: AstrMessageEvent, value: str = ""):
+        async for r in self._toggle_body(event, value, "link_safety_check_enabled",
+                                         "不安全网站检测"):
+            yield r
+
+    # #274: /开关链接广告检测 — 开关链接目标页广告内容检测（全局配置 + 按群覆盖）
+    @filter.command("开关链接广告检测", "开关链接广告检测（on/off，按群生效，#274）")
+    async def toggle_ad_link_content_cmd(self, event: AstrMessageEvent, value: str = ""):
+        async for r in self._toggle_body(event, value, "ad_check_link_content",
+                                         "链接广告检测"):
+            yield r
+
     # ===================== #254 口语化群管指令 =====================
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)

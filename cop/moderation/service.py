@@ -118,12 +118,13 @@ class ModerationService:
             "ad": "ad_ban_duration",
             "link": "link_ban_duration",
             "group_promotion": "group_promotion_ban_duration",
+            "unsafe_site": "link_safety_ban_duration",
         }
         key = key_map.get(kind, "ban_duration")
         default_map = {
             "image": 600, "spam": 600, "profanity": 600,
             "ad": 600, "link": 600, "group_promotion": 600,
-            "banned_image": 600,
+            "banned_image": 600, "unsafe_site": 600,
         }
         if severity and key == "profanity_ban_duration" \
                 and self._store.get_group_setting(group_id, "profanity_severity_enabled", True):
@@ -173,7 +174,7 @@ class ModerationService:
             label_map = {
                 "image": "违规图片", "spam": "刷屏", "profanity": "骂人",
                 "ad": "广告", "link": "链接", "group_promotion": "群号推广",
-                "banned_image": "违禁图片",
+                "banned_image": "违禁图片", "unsafe_site": "不安全网站",
             }
             label = label_map.get(kind, "违规")
             note = f"检测到{label}行为"
@@ -234,6 +235,15 @@ class ModerationService:
             if await self._text._check_group_promotion(msg_text, event, group_id, user_id):
                 mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
                 await self._handle_violation(event, "group_promotion", group_id, user_id, mid)
+                return True
+            # #272：不安全网站检测（默认关，按群覆盖 /开关不安全网站检测）。
+            # 置于文本类检测末位：先让刷屏/骂人/广告等本地判定生效，抓取兜底最后做。
+            unsafe_hit, unsafe_reason = await self._text._check_link_safety(msg_text, group_id)
+            if unsafe_hit:
+                mid = str(raw.get("message_id", "")) if isinstance(raw, dict) else ""
+                logger.info(f"[群违规检测] 群 {group_id} 用户 {user_id} 命中不安全网站: {unsafe_reason}")
+                await self._handle_violation(event, "unsafe_site", group_id, user_id, mid,
+                                             unsafe_reason)
                 return True
         # 3) 图片检测（#162 违禁图 MD5 比对先于 AI 鉴图）
         image_urls = self._image._collect_image_urls(raw)

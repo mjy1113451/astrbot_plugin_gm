@@ -97,6 +97,8 @@
 | `/开关踢人清历史 on/off` | 踢人时撤回历史消息（kick_recall_enabled） |
 | `/开关语音检测 on/off` | 语音转文字违规检测（voice_check_enabled） |
 | `/开关二维码撤回 on/off` | 二维码识别检测（qr_code_recall_enabled，默认关，#237：普通码仅撤回；拉群广告码/黄赌毒码撤回+禁言，需 openai_vision 审核 API） |
+| `/开关不安全网站检测 on/off` | 不安全网站分析（link_safety_check_enabled，默认关，#272：内置黄赌毒特征/自定义关键词/目标站拦截服务器请求 → 撤回+禁言） |
+| `/开关链接广告检测 on/off` | 链接目标页广告内容检测（ad_check_link_content，默认关，#274：文本未命中广告词时抓取链接目标页正文，命中同一份 ad_keywords 按广告处置） |
 | `/设置排名人数 N` | 发言排名显示人数（rank_top_n，≥1） |
 | `/设置踢人阈值 N` | 刷屏禁言转踢人的阈值（mute_kick_threshold，≥0） |
 | `/设置消息历史条数 N` | 本地撤回消息缓存条数（max_message_history，≥10） |
@@ -249,6 +251,13 @@ pip install astrbot_plugin_group_admin
 | `kick_recall_enabled` | bool | `false` | 踢人时自动撤回该成员最近消息（#145，对齐 zcj-ui/astrbot_plugin_group_guardian） |
 | `kick_recall_count` | int | `10` | 踢人撤回消息条数（1-50，#145） |
 | `link_whitelist` | list | `[]` | 全局链接白名单域名列表（#195，命中不检测/撤回/禁言；本群白名单用 `/添加链接白名单` 维护） |
+| `ad_check_link_content` | bool | `false` | 链接目标页广告内容检测（#274：消息文本未命中广告关键词但含链接时，抓取目标页正文用同一份 `ad_keywords` 匹配，命中按广告处置（撤回+禁言）；抓取失败/无文本静默放行（fail-open），链接白名单不抓取；仅 `ad_check_enabled` 开启时生效；推荐按群覆盖 `/开关链接广告检测 on|off`） |
+| `link_safety_check_enabled` | bool | `false` | 不安全网站检测（#272：对群消息中的链接做安全分析——内置黄赌毒特征/自定义关键词命中，或目标站拦截服务器请求时按不安全网站处置（撤回+禁言+计数）；检测失败/无命中放行（fail-open，误放行优于误禁言）；推荐按群覆盖 `/开关不安全网站检测 on|off`） |
+| `link_safety_whitelist` | list | `["douyin.com","bilibili.com"]` | 不安全网站检测域名白名单（#272，含子域不参与检测，另复用 `link_whitelist`；可按群覆盖） |
+| `link_safety_blocked_is_unsafe` | bool | `true` | 目标站拦截服务器请求时视为不安全（#272：403/451/超时/连接重置即处置；连续多次抓取失败疑似断网时自动熔断放行，恢复后继续） |
+| `link_safety_ban_duration` | int | `600` | 不安全网站违规禁言时长（秒，#272；可按群覆盖） |
+| `link_safety_keywords` | list | 预填黄赌毒常见词 | 不安全网站关键词（#272，与链接域名或目标页正文（不区分大小写）匹配，命中即处置；可按需增删） |
+| `link_fetch_timeout` | int | `5` | 链接目标页抓取超时秒数（#272/#274 共用，1-15 异常值回退 5；单条消息最多探测 3 个链接） |
 | `blacklisted_users` | list | `[]` | 按群黑名单 QQ 列表（#194，存于 `group_overrides`，用 `/添加黑名单` 维护；黑名单用户加群自动拒绝） |
 | `voice_check_enabled` | bool | `false` | 启用语音消息转文字违规检测（#128；可按群覆盖） |
 | `voice_check_provider_id` | string | `""` | AstrBot 内置 STT provider ID（#128；留空用当前激活 provider；**全局配置**） |

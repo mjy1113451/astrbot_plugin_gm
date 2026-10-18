@@ -316,6 +316,53 @@
         "hint": "推荐按群覆盖：在群内 /添加链接白名单 domain 增加本群白名单。域名自动去 www 前缀和统一小写。",
         "default": []
     },
+    "ad_check_link_content": {
+        "description": "链接目标页广告内容检测（#274，默认关）",
+        "type": "bool",
+        "hint": "开启后，消息文本未命中广告关键词但包含链接时，抓取目标页正文并用同一份 ad_keywords 匹配，命中按广告违规处置（撤回+禁言）。抓取失败/无文本静默放行；链接白名单不抓取。仅 ad_check_enabled 开启时生效。推荐按群覆盖：/开关链接广告检测 on|off。",
+        "default": false
+    },
+    "link_safety_check_enabled": {
+        "description": "不安全网站检测开关（#272，默认关）",
+        "type": "bool",
+        "hint": "开启后对群消息中的链接做安全分析：内置黄赌毒特征/自定义关键词命中，或目标站拦截服务器请求（link_safety_blocked_is_unsafe 开）时，按不安全网站处置（撤回+按 link_safety_ban_duration 禁言）。douyin.com/bilibili.com 等默认白名单不检测。推荐按群覆盖：/开关不安全网站检测 on|off。",
+        "default": false
+    },
+    "link_safety_whitelist": {
+        "description": "不安全网站检测域名白名单（推荐按群覆盖）",
+        "type": "list",
+        "items": {"type": "string"},
+        "hint": "这些域名（含子域）不参与不安全网站检测，另复用 link_whitelist。默认预置常见大站，可按需增删：/设置群配置 link_safety_whitelist [域名列表]。",
+        "default": ["douyin.com", "bilibili.com"]
+    },
+    "link_safety_blocked_is_unsafe": {
+        "description": "目标站拦截服务器请求时视为不安全（#272）",
+        "type": "bool",
+        "hint": "开启后，链接目标页拒绝访问（403/451/超时/连接重置）即视为不安全网站并处置；连续多次抓取失败（疑似服务器断网）时自动熔断放行，抓取恢复后继续生效。关闭则仅凭域名特征/关键词与页面内容判定。",
+        "default": true
+    },
+    "link_safety_ban_duration": {
+        "description": "不安全网站违规禁言时长（秒）",
+        "type": "int",
+        "hint": "命中不安全网站时的禁言秒数，可按群覆盖。",
+        "default": 600
+    },
+    "link_safety_keywords": {
+        "description": "不安全网站关键词（域名及目标页正文匹配）",
+        "type": "list",
+        "items": {"type": "string"},
+        "hint": "与链接域名或目标页正文（不区分大小写）匹配，命中即按不安全网站处置。默认预置黄赌毒常见词，可按需增删。",
+        "default": [
+            "赌博", "博彩", "彩票", "色情", "成人", "裸聊", "约炮",
+            "娱乐城", "投注", "棋牌", "援交", "一夜情", "外围女"
+        ]
+    },
+    "link_fetch_timeout": {
+        "description": "链接目标页抓取超时（秒）",
+        "type": "int",
+        "hint": "#272/#274 抓取链接目标页的超时秒数（1-15，异常值回退 5），单条消息最多探测 3 个链接。过大会拖慢消息检测。",
+        "default": 5
+    },
     "blacklisted_users": {
         "description": "全局黑名单QQ号列表（命中自动拒绝加群申请）",
         "type": "list",

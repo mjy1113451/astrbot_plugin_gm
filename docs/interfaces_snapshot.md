@@ -5,7 +5,7 @@
 
 ## 1. 命令入口 `@filter.command`
 
-**命令总数：97**（#278 新增 `清人`、`邀请通过`、`开关二维码撤回`，行号 95-97 追加于表尾）
+**命令总数：99**（#278 新增 `清人`、`邀请通过`、`开关二维码撤回`，行号 95-97 追加于表尾；#272/#274 新增 `开关不安全网站检测`、`开关链接广告检测`，行号 98-99 追加于表尾）
 
 
 | # | 命令名 | 说明 | 别名 | 方法 |
@@ -107,6 +107,8 @@
 | 95 | `清人` | 清理 N 天未发言成员（/清人 天数 [确认]，1-30） | — | `purge_inactive_cmd` |
 | 96 | `邀请通过` | 开关第三方邀请入群自动通过（on/off，按群生效，#241） | — | `toggle_invite_auto_approve_cmd` |
 | 97 | `开关二维码撤回` | 开关二维码识别自动撤回（on/off，按群生效，#237） | — | `toggle_qr_code_recall_cmd` |
+| 98 | `开关不安全网站检测` | 开关不安全网站检测（on/off，按群生效，#272） | — | `toggle_link_safety_cmd` |
+| 99 | `开关链接广告检测` | 开关链接广告检测（on/off，按群生效，#274） | — | `toggle_ad_link_content_cmd` |
 
 ### 别名明细（命令名 → 别名集合）
 
@@ -138,7 +140,7 @@
 - `after_message_sent`
 
 
-**配置键总数：66**
+**配置键总数：73**
 
 
 | # | key | type | default |
@@ -209,6 +211,13 @@
 | 64 | `voice_asr_api_key` | string | `""` |
 | 65 | `voice_asr_model` | string | `""` |
 | 66 | `voice_check_timeout` | int | `15` |
+| 67 | `ad_check_link_content` | bool | `false` |
+| 68 | `link_safety_check_enabled` | bool | `false` |
+| 69 | `link_safety_whitelist` | list | `["douyin.com","bilibili.com"]` |
+| 70 | `link_safety_blocked_is_unsafe` | bool | `true` |
+| 71 | `link_safety_ban_duration` | int | `600` |
+| 72 | `link_safety_keywords` | list | 预填黄赌毒常见词 |
+| 73 | `link_fetch_timeout` | int | `5` |
 
 ## 4. 数据文件路径与 data_dir 推导
 
@@ -230,8 +239,8 @@ self.reports_path = self.data_dir / "reports.json"   # 举报待处理
 
 ## 5. 校验结论
 
-- `GM_COMMAND_NAMES` 项数：102（#277 记 99；#278 新增 `清人`、`邀请通过`、`开关二维码撤回` 后为 102）
-- AST 解析 `@filter.command` 项数：97（#277 记 94；#278 新增 `清人`、`邀请通过`、`开关二维码撤回` 后为 97）
+- `GM_COMMAND_NAMES` 项数：104（#277 记 99；#278 新增 3 项后为 102；#272/#274 新增 `开关不安全网站检测`、`开关链接广告检测` 后为 104）
+- AST 解析 `@filter.command` 项数：99（#277 记 94；#278 新增 3 个后为 97；#272/#274 新增 2 个后为 99）
 - 仅在 GM_COMMAND_NAMES、不在装饰器：['别人昵称', '改群昵称', '群名称', '群昵称', '设群友昵称']
 - 仅在装饰器、不在 GM_COMMAND_NAMES：['开关链接检测', '重复表情包撤回']
 - 一致：否（差额为上两行的既有差异，#278 未改动）

@@ -11,14 +11,21 @@
 - RuntimeState（L2）：spam_records
 
 延迟导入约束：`_is_link_whitelisted` 内 urlparse 保持函数内局部导入（与原实现一致）。
+
+#272/#274 新增（非迁出）：
+- _fetch_page_text / _extract_link_hosts / _extract_probe_urls
+- _hosts_hit_domain_list / _check_link_safety
+- _check_ad 扩展：链接目标页内容广告检测（ad_check_link_content）
 """
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import time
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from astrbot.api import logger
 
@@ -28,6 +35,21 @@ from ..constants import _DEFAULT_PROFANITY_PROMPT
 if TYPE_CHECKING:
     from ..config_store import ConfigStore
     from ..runtime import RuntimeState
+
+# #272：内置不安全网站域名特征（保守清单，宁缺勿滥防误报）。
+# 与归一化域名（去端口/去 www./小写）做子串匹配，命中即判违规，不访问目标页。
+_UNSAFE_DOMAIN_PATTERNS = (
+    "porn", "caoliu", "t66y", "aisex", "bocai", "yulecheng",
+)
+
+# 单条消息最多探测的目标页 URL 数（防单条刷屏消息触发大量抓取）
+_MAX_LINK_PROBES = 3
+# 抓取目标页返回的文本上限（title + 正文前若干字符）
+_PAGE_TEXT_LIMIT = 1500
+# 目标页响应体最多读取的字节数（防大文件拖爆内存）
+_PAGE_MAX_BYTES = 65536
+# 连续抓取失败熔断阈值：疑似服务器断网时，"拦截=不安全" 判定自动放行（#272 review 防误伤）
+_LINK_FETCH_BREAKER = 5
 
 
 class TextModeration:
@@ -42,6 +64,8 @@ class TextModeration:
         self._store = config_store
         self.config = config_store.config
         self._runtime = runtime
+        # #272：目标页抓取连续失败计数（熔断用，进程内状态不落盘）
+        self._link_fetch_fail_streak = 0
 
     # ===================== 刷屏检测 =====================
 
@@ -211,6 +235,33 @@ class TextModeration:
         for kw in keywords:
             if str(kw).lower() and str(kw).lower() in text_lower:
                 return True
+        # #274：文本未命中时可选检测链接目标页内容（默认关，按群覆盖）。
+        # 目标页正文命中同一份 ad_keywords 即按广告违规处置；抓取失败/无文本静默放行。
+        if not self._store.get_group_setting(group_id, "ad_check_link_content", False):
+            return False
+        return await self._ad_hit_in_link_pages(msg_text, group_id, user_id, keywords)
+
+    async def _ad_hit_in_link_pages(self, msg_text: str, group_id: str, user_id: str,
+                                    keywords: list) -> bool:
+        """#274：抓取消息中链接的目标页正文，用 ad_keywords 匹配广告内容。"""
+        if not keywords:
+            return False
+        # 链接白名单命中（全局+按群）不抓取，与链接检测口径一致
+        if self._is_link_whitelisted(msg_text, group_id):
+            return False
+        urls = self._extract_probe_urls(msg_text)[:_MAX_LINK_PROBES]
+        timeout = self._store.get_group_setting(group_id, "link_fetch_timeout", 5)
+        for url in urls:
+            page_text = await self._fetch_page_text(url, timeout)
+            if not page_text:
+                continue
+            page_lower = page_text.lower()
+            for kw in keywords:
+                k = str(kw).lower()
+                if k and k in page_lower:
+                    logger.info(f"[群违规检测] 群 {group_id} 用户 {user_id} "
+                                f"链接目标页命中广告关键词: {k}")
+                    return True
         return False
 
     @staticmethod
@@ -283,6 +334,167 @@ class TextModeration:
             return False
         group_pattern = r"[;；:,，\s]*(\d{5,12})"
         return bool(re.findall(group_pattern, msg_text))
+
+    # ===================== 链接安全 / 目标页抓取（#272 #274） =====================
+
+    @classmethod
+    def _extract_probe_urls(cls, msg_text: str) -> list:
+        """提取可探测的目标页 URL：完整 http(s) 链接 + 补协议的 www. 裸域。
+
+        仅匹配 RFC3986 合法字符，天然规避中文标点/文字粘连
+        （如「http://a.com/x，快来看」不会把标点并入 URL）。
+        """
+        url_chars = r"[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%\[\]]"
+        urls = [m.group(0) for m in
+                re.finditer(r"https?://" + url_chars + "+", msg_text, re.IGNORECASE)]
+        for m in re.finditer(r"(?:^|\s)(www\." + url_chars + "+)", msg_text, re.IGNORECASE):
+            urls.append("http://" + m.group(1))
+        return urls
+
+    def _extract_link_hosts(self, msg_text: str) -> set:
+        """提取消息中所有链接的归一化域名（口径同 _normalize_host）。"""
+        hosts = set()
+        for raw_url in self._extract_probe_urls(msg_text):
+            parsed = urlparse(raw_url)
+            if parsed.hostname:
+                hosts.add(self._normalize_host(parsed.hostname))
+        return hosts
+
+    def _hosts_hit_domain_list(self, hosts: set, entries) -> bool:
+        """hosts 是否命中域名列表（支持 `*.example.com` 通配子域，口径同 _is_link_whitelisted）。"""
+        exact_wl = set()
+        wildcard_wl = set()
+        for entry in entries or []:
+            e = self._normalize_host(str(entry))
+            if e.startswith("*."):
+                wildcard_wl.add(e[2:])
+            else:
+                exact_wl.add(e)
+        for host in hosts:
+            if host in exact_wl:
+                return True
+            for domain in wildcard_wl:
+                if host == domain or host.endswith("." + domain):
+                    return True
+        return False
+
+    async def _fetch_page_text(self, url: str, timeout) -> str:
+        """抓取 URL 目标页正文文本（#272/#274 共用探测通道）。
+
+        返回值三态：
+        - None：抓取被拒/失败（403/451/超时/连接重置等网络异常）——可能被站点拦截
+        - ""：可达但无可提取文本（非文本响应/其他状态码/页面无正文）
+        - 非空串：title + 正文前 _PAGE_TEXT_LIMIT 字符（去脚本/样式/标签后）
+
+        熔断：连续 _LINK_FETCH_BREAKER 次失败视为服务器断网，失败仍返回 None，
+        由调用方结合熔断状态决定是否把「被拦截」当违规。
+        """
+        if aiohttp is None:
+            return None
+        try:
+            t = max(1, min(15, int(timeout))) if timeout is not None else 5
+        except (TypeError, ValueError):
+            t = 5
+        try:
+            timeout_cfg = aiohttp.ClientTimeout(total=t)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=timeout_cfg,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; AstrBotGM/1.0)"},
+                ) as resp:
+                    if resp.status == 403 or resp.status == 451:
+                        self._link_fetch_fail_streak += 1
+                        return None
+                    # 站点有响应（含 404/5xx/非文本）：服务器可达，重置熔断计数
+                    self._link_fetch_fail_streak = 0
+                    if resp.status != 200:
+                        return ""
+                    ctype = resp.headers.get("Content-Type", "").lower()
+                    if ctype and not ctype.startswith("text/"):
+                        return ""
+                    data = await resp.content.read(_PAGE_MAX_BYTES)
+        except Exception as e:
+            self._link_fetch_fail_streak += 1
+            logger.debug(f"[链接探测] 抓取失败（已连续 {self._link_fetch_fail_streak} 次）: "
+                         f"{type(e).__name__}")
+            return None
+        try:
+            encoding = resp.get_encoding()
+        except Exception:
+            encoding = "utf-8"
+        raw_html = data.decode(encoding, errors="ignore")
+        # 去脚本/样式，取 title + 正文
+        raw_html = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", raw_html,
+                          flags=re.IGNORECASE | re.DOTALL)
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", raw_html,
+                            re.IGNORECASE | re.DOTALL)
+        title = html.unescape(title_m.group(1)).strip() if title_m else ""
+        # title 已单独提取，从原文移除避免正文里重复出现
+        raw_html = re.sub(r"<title\b[^>]*>.*?</title>", " ", raw_html,
+                          flags=re.IGNORECASE | re.DOTALL)
+        body = re.sub(r"<[^>]+>", " ", raw_html)
+        body = html.unescape(body)
+        body = re.sub(r"\s+", " ", body).strip()
+        return (f"{title} {body}").strip()[:_PAGE_TEXT_LIMIT]
+
+    async def _check_link_safety(self, msg_text: str, group_id: str) -> tuple:
+        """#272：不安全网站检测，返回 (是否违规, 原因)。
+
+        判定顺序（前置免抓取，抓取兜底）：
+        1. 消息无链接 → 放行
+        2. 白名单（link_safety_whitelist + 复用链接白名单 link_whitelist）→ 放行
+        3. 内置黄赌毒域名特征 _UNSAFE_DOMAIN_PATTERNS 命中 → 违规
+        4. link_safety_keywords 与域名匹配 → 违规
+        5. 抓取目标页：被拦截（403/451/超时/重置，返回 None）且
+           link_safety_blocked_is_unsafe 开 → 违规（连续失败熔断时放行）
+        6. 目标页正文命中 link_safety_keywords → 违规
+        其余情况放行（抓取失败/无关键词命中不误伤）。
+        """
+        if not self._store.get_group_setting(group_id, "link_safety_check_enabled", False):
+            return False, ""
+        if not msg_text:
+            return False, ""
+        hosts = self._extract_link_hosts(msg_text)
+        if not hosts:
+            return False, ""
+        # 2) 白名单：专属白名单 + 复用链接检测白名单（get_group_setting 已含全局回退）
+        wl_entries = list(self._store.get_group_setting(group_id, "link_safety_whitelist", []) or []) \
+            + list(self._store.get_group_setting(group_id, "link_whitelist", []) or [])
+        if self._hosts_hit_domain_list(hosts, wl_entries):
+            return False, ""
+        # 3) 内置黄赌毒域名特征
+        for host in hosts:
+            if any(pat in host for pat in _UNSAFE_DOMAIN_PATTERNS):
+                return True, f"域名特征疑似不安全网站（{host}）"
+        # 4) 自定义关键词与域名匹配
+        kws = [str(k).lower() for k in
+               (self._store.get_group_setting(group_id, "link_safety_keywords", []) or []) if str(k)]
+        for host in hosts:
+            if any(k in host for k in kws):
+                return True, "域名命中不安全网站关键词"
+        # 5)/6) 抓取目标页兜底
+        blocked_is_unsafe = self._store.get_group_setting(
+            group_id, "link_safety_blocked_is_unsafe", True)
+        breaker_open = self._link_fetch_fail_streak >= _LINK_FETCH_BREAKER
+        if breaker_open:
+            logger.warning(f"[链接安全] 连续 {self._link_fetch_fail_streak} 次抓取失败，"
+                           f"疑似服务器断网，本轮「拦截=不安全」判定放行")
+        urls = self._extract_probe_urls(msg_text)[:_MAX_LINK_PROBES]
+        timeout = self._store.get_group_setting(group_id, "link_fetch_timeout", 5)
+        for url in urls:
+            page_text = await self._fetch_page_text(url, timeout)
+            if page_text is None:
+                if blocked_is_unsafe and not breaker_open:
+                    return True, "站点拦截了服务器请求，视为不安全网站"
+                continue
+            if not page_text:
+                continue
+            page_lower = page_text.lower()
+            for k in kws:
+                if k and k in page_lower:
+                    return True, "页面内容命中不安全网站关键词"
+        return False, ""
 
 
 __all__ = ["TextModeration"]
