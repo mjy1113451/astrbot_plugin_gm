@@ -101,7 +101,7 @@ def _runtime_prop(name):
     "group_admin",
     "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "0.03",
+    "2.7.0",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
