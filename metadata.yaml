@@ -1,6 +1,6 @@
 name: astrbot_plugin_group_admin
 desc: "AstrBot 群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名/举报/根据关键词自动处理新人加群申请/入群验证问题和答案/群相册/群待办"
-version: v0.0.3
+version: v2.7.0
 author: mjy1113451
 repo: "https://github.com/mjy1113451/astrbot_plugin_gm"
 tags:
