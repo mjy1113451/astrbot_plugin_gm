@@ -99,9 +99,9 @@ def _runtime_prop(name):
 
 @register(
     "group_admin",
-    "YourName",
+    "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.5.0",
+    "0.03",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
