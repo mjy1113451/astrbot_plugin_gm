@@ -266,6 +266,8 @@ class GroupAdminPlugin(Star):
     _msg_save_counter = _runtime_prop("_msg_save_counter")
     _dup_face_seen = _runtime_prop("_dup_face_seen")
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
+    _dup_face_mid_cache = _runtime_prop("_dup_face_mid_cache")
+    _join_request_seen = _runtime_prop("_join_request_seen")
     _banned_file_md5_cache = _runtime_prop("_banned_file_md5_cache")
 
     # ===================== 通用 IO（阶段1：委托 cop 存储层） =====================
@@ -1769,6 +1771,68 @@ class GroupAdminPlugin(Star):
         text = f"待处理加群申请（{len(applies)} 条）：\n\n" + "\n\n".join(applies)
         yield event.plain_result(text)
 
+    # #288: /加群申请通路检查 — 诊断加群申请事件通路与被过滤申请（群管/群主）
+    @filter.command("加群申请通路检查", "诊断本群加群申请事件通路与被过滤申请")
+    async def join_request_path_check_cmd(self, event: AstrMessageEvent):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        sender_id = str(raw.get("user_id"))
+        if not self._perms._is_authorized(raw, sender_id):
+            yield event.plain_result("只有群管理员或群主可执行此操作")
+            return
+        group_id = str(raw.get("group_id"))
+        lines = [f"【加群申请通路检查（群 {group_id}）】"]
+
+        # 1) 请求事件是否到达过插件（#288：内存态记录，重启后归零）
+        last_ts = self._join_request_seen.get(group_id)
+        if last_ts:
+            lines.append(
+                "1. 插件最近收到本群加群请求事件："
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_ts))}（重启后归零）")
+        else:
+            lines.append(
+                "1. 插件进程内从未收到本群加群请求事件——若刚有人申请却显示这条，"
+                "说明申请在协议端/平台层就没有投递到插件（典型原因：申请被 QQ 放进了"
+                "「过滤申请」，或 bot 不是群管理员）")
+
+        # 2) 探测协议端能否查询申请列表（含被过滤申请的候选接口）
+        ok, result = await self._api._call_action_fallback(
+            event, ("get_group_system_msg", "get_group_filtered_requests",
+                    "get_group_ignore_add_request"))
+        if ok:
+            data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), (dict, list)) else (result if isinstance(result, (dict, list)) else {})
+            raw_list = data.get("join_requests") if isinstance(data, dict) else data
+            if not isinstance(raw_list, list):
+                raw_list = []
+            lines.append(f"2. 协议端支持申请列表查询，当前返回 {len(raw_list)} 条申请记录")
+            shown = 0
+            for a in raw_list:
+                if not isinstance(a, dict) or shown >= 20:
+                    continue
+                item_gid = str(a.get("group_id", "") or "")
+                if item_gid and item_gid != group_id:
+                    continue
+                uid = str(a.get("user_id") or a.get("requester_uin") or "")
+                sub = str(a.get("sub_type") or "?")
+                checked = bool(a.get("checked"))
+                lines.append(f"   - QQ {uid} | sub_type={sub} | 已处理={checked}")
+                shown += 1
+        else:
+            lines.append(
+                "2. 协议端不支持申请列表查询（get_group_system_msg 等接口均失败），"
+                "无法从协议端侧核对申请状态")
+
+        # 3) 结论与建议
+        lines.append(
+            "3. 说明：QQ 把风险账号的加群申请放进「过滤申请」时，该申请【不会】以标准 "
+            "request.group 事件投递给 bot，插件无法主动获取——这是平台侧行为，插件侧"
+            "无法根治。建议：①管理员在 QQ 客户端群管理的「过滤申请」里人工处理；"
+            "②让申请人解除账号风险状态后重新申请；③向所用协议端反馈，请求提供"
+            "查询被过滤申请的接口，插件会在接口可用后自动接入。")
+        yield event.plain_result("\n".join(lines))
+
     # #151: /群信息 — 查看本群资料（任何成员可用）
     @filter.command("群信息", "查看本群资料（名称/号/标签/人数）")
     async def group_info_cmd(self, event: AstrMessageEvent):
@@ -1793,7 +1857,7 @@ class GroupAdminPlugin(Star):
         # #276：群标签优先走 get_group_tags（NapCat 扩展接口，兼容 str/dict 混合列表）；
         # 接口失败时回退 get_group_info 响应里的 tags / group_tags 字段；
         # 接口成功但为空 → 「无」，失败且回退也为空 → 明确提示获取失败
-        tags_raw = await self._api._call_onebot_raw(event, "get_group_tags", group_id=group_id)
+        tags_raw = await self._api._get_group_tags(event, group_id)
         tags = self._parse_group_tags_result(tags_raw)
         if not tags:
             tags = info.get("tags") or info.get("group_tags") or []
@@ -1969,7 +2033,7 @@ class GroupAdminPlugin(Star):
         if self._history._should_notify_group_name(group_id, ok):
             yield event.plain_result(f"已修改群名为「{text}」" if ok else "修改群名失败（当前 OneBot 实现可能不支持此 API，或机器人权限不足）")
 
-    # #163: /群标签 — 添加群标签（群管/群主）
+    # #163: /群标签 — 添加群标签（群管/群主）；#285：统一走 add_group_tag
     @filter.command("群标签", "添加群标签（/群标签 标签名）；不带参数查看本群群标签")
     async def set_group_tag_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)
@@ -1989,7 +2053,7 @@ class GroupAdminPlugin(Star):
         if not text:
             # #276：不带参数时改为查看本群群标签（get_group_tags，NapCat 扩展接口）；
             # 区分「接口成功但无标签」与「接口失败（协议端不支持）」
-            tags_raw = await self._api._call_onebot_raw(event, "get_group_tags", group_id=group_id)
+            tags_raw = await self._api._get_group_tags(event, group_id)
             tags = self._parse_group_tags_result(tags_raw)
             if tags:
                 yield event.plain_result(f"本群群标签：{', '.join(tags)}")
@@ -2005,28 +2069,62 @@ class GroupAdminPlugin(Star):
         if len(text) > 20:
             yield event.plain_result("标签过长（最多20字符）")
             return
-        # #242: 不同 OneBot 实现的参数名不一致（tag= 或 tags=），先按 tag= 调用，
-        # 失败再用 tags=[text] 兼容重试，并拆分失败原因便于定位
-        result = await self._api._call_onebot_raw(event, "set_group_tag",
-                                             group_id=group_id, tag=text)
-        if not self._api._action_result_success(result):
-            retry = await self._api._call_onebot_raw(event, "set_group_tag",
-                                                group_id=group_id, tags=[text])
-            if self._api._action_result_success(retry):
-                result = retry
-        if self._api._action_result_success(result):
+        # #285：统一命名 add_group_tag（NapCat），旧扩展名 set_group_tag
+        # （LLOneBot 等）由封装内部回退，tag=/tags= 参数变体一并覆盖
+        ok, result = await self._api._add_group_tag(event, group_id, text)
+        if ok:
             yield event.plain_result(f"已添加群标签「{text}」")
             return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
-        detail = self._api._describe_action_failure(result, 'set_group_tag')
-        # #249：set_group_tag 是 LLOneBot 等个别协议端的扩展接口，并非 OneBot v11
-        # 标准 action，go-cqhttp / NapCat / Lagrange 均未提供，无跨实现候选可回退；
-        # 失败时把这一点讲清楚，避免用户误以为是插件或权限问题
+        detail = self._api._describe_action_failure(result, 'add_group_tag')
+        # #249：群标签接口并非 OneBot v11 标准 action，go-cqhttp / Lagrange 均未
+        # 提供；失败时把这一点讲清楚，避免用户误以为是插件或权限问题
         if ("不支持" in detail) or ("无可用调用通路" in detail):
-            detail += ("。set_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
-                       "（如 LLOneBot）提供，当前协议端不支持且无替代接口；"
+            detail += ("。群标签接口并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 NapCat / LLOneBot）提供，当前协议端不支持且无替代接口；"
                        "请更换/升级协议端，或在 QQ 客户端手动设置群标签")
         yield event.plain_result(f"添加群标签失败：{detail}")
+
+    # #285: /删群标签 — 删除群标签（群管/群主），统一走 delete_group_tag
+    @filter.command("删群标签", "删除群标签（/删群标签 标签名）")
+    async def delete_group_tag_cmd(self, event: AstrMessageEvent):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        sender_id = str(raw.get("user_id"))
+        if not self._perms._is_authorized(raw, sender_id):
+            yield event.plain_result("只有群管理员或群主可执行此操作")
+            return
+        group_id = str(raw.get("group_id"))
+        text = self._mp._extract_text(raw).strip()
+        for prefix in ("/删群标签", "删群标签"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        if not text:
+            # 不带参数时先展示当前标签，提示用法
+            tags_raw = await self._api._get_group_tags(event, group_id)
+            tags = self._parse_group_tags_result(tags_raw)
+            if tags:
+                yield event.plain_result(
+                    f"本群群标签：{', '.join(tags)}\n"
+                    f"请发送 /删群标签 标签名 进行删除")
+            else:
+                yield event.plain_result(
+                    "本群没有可删除的群标签（或当前协议端不支持 get_group_tags）")
+            return
+        ok, result = await self._api._delete_group_tag(event, group_id, text)
+        if ok:
+            yield event.plain_result(f"已删除群标签「{text}」")
+            return
+        logger.warning(f"删除群标签失败: group={group_id} tag={text} result={result}")
+        detail = self._api._describe_action_failure(result, 'delete_group_tag')
+        if ("不支持" in detail) or ("无可用调用通路" in detail):
+            detail += ("。delete_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 NapCat）提供，当前协议端不支持；"
+                       "请更换/升级协议端，或在 QQ 客户端手动删除群标签")
+        yield event.plain_result(f"删除群标签失败：{detail}")
 
     # #162: /添加违禁图片 — 引用图片消息加入违禁图列表（群管/群主）
     @filter.command("添加违禁图片", "引用图片消息加入违禁图列表")

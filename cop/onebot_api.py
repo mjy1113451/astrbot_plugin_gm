@@ -377,6 +377,45 @@ class OneBotApi:
         return await self._execute_action(event, "set_group_card",
                                           group_id=group_id, user_id=qq, card=card)
 
+    # ---------- 群标签（#285：统一 add_group_tag / delete_group_tag / get_group_tags） ----------
+
+    async def _add_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
+        """添加群标签。#285：NapCat 等协议端统一命名为 add_group_tag，
+        旧扩展名 set_group_tag（LLOneBot 等）保留为兼容回退；参数名逐候选
+        尝试（tag= / tags=）。返回 (是否成功, 最后一个原始响应)。"""
+        last = None
+        for action, extra in (
+            ("add_group_tag", {"tag": tag}),
+            ("add_group_tag", {"tags": [tag]}),
+            ("set_group_tag", {"tag": tag}),
+            ("set_group_tag", {"tags": [tag]}),
+        ):
+            p = {"group_id": str(group_id)}
+            p.update(extra)
+            last = await self._call_onebot_raw(event, action, **p)
+            if self._action_result_success(last):
+                return True, last
+        return False, last
+
+    async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
+        """删除群标签。#285：统一命名 delete_group_tag；参数名逐候选尝试。
+        返回 (是否成功, 最后一个原始响应)。"""
+        last = None
+        for action, extra in (
+            ("delete_group_tag", {"tag": tag}),
+            ("delete_group_tag", {"tags": [tag]}),
+        ):
+            p = {"group_id": str(group_id)}
+            p.update(extra)
+            last = await self._call_onebot_raw(event, action, **p)
+            if self._action_result_success(last):
+                return True, last
+        return False, last
+
+    async def _get_group_tags(self, event: AstrMessageEvent, group_id: str):
+        """查询群标签。#285：统一命名 get_group_tags，返回原始响应由调用方解析。"""
+        return await self._call_onebot_raw(event, "get_group_tags", group_id=str(group_id))
+
     async def _set_essence(self, event: AstrMessageEvent, message_id: str, group_id: str = None):
         """OneBot 标准 API 名为 set_essence_msg，部分实现也支持 set_essence。"""
         kwargs = {"message_id": message_id}
@@ -590,6 +629,8 @@ class OneBotApi:
         【新人加群】通知等群通知重复发送两次的问题——只要判定发送成功，
         无论能否取到 message_id 都立即返回，不再进入任何回退通路。
         """
+        # #284：多群环境下部分群通知发不出来时，必须把失败原因与群号落到日志，
+        # 否则只有「b 群发不了」的现象、没有任何线索。
         raw = await self._call_onebot_raw(event, "send_group_msg",
                                           group_id=str(group_id), message=text)
         if self._action_result_success(raw):
@@ -600,6 +641,9 @@ class OneBotApi:
             # 消息内容兜底定位），绝不能再次发送，否则同一段文本会重复发送（#265）
             logger.warning("[加群审核] send_group_msg 成功但未返回 message_id")
             return ""
+        logger.warning(
+            f"[加群审核] send_group_msg 直调失败 group={group_id}: "
+            f"{self._describe_action_failure(raw, 'send_group_msg')}")
         # 仅在首次发送确实失败时，才尝试其它通路
         try:
             if hasattr(self.context, "send_group_msg"):
@@ -610,10 +654,16 @@ class OneBotApi:
                 if self._action_result_success(result):
                     logger.warning("[加群审核] context.send_group_msg 成功但未返回 message_id")
                     return ""
+                logger.warning(
+                    f"[加群审核] context.send_group_msg 失败 group={group_id}: {result}")
         except Exception as e:
-            logger.error(f"发送群消息失败: {e}")
+            logger.error(f"发送群消息失败 group={group_id}: {e}")
         # 回退：使用 _send 但拿不到 message_id
-        await self._send(event, [Plain(text)])
+        sent = await self._send(event, [Plain(text)])
+        if not sent:
+            logger.error(
+                f"[加群审核] 群 {group_id} 的通知所有发送通路均失败，"
+                f"请检查 bot 是否在目标群、协议端连接是否正常")
         return ""
 
     @staticmethod
