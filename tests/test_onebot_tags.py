@@ -123,8 +123,21 @@ class GroupTagsReadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.read(None), (False, []))
         self.assertEqual(await self.read("bad"), (False, []))
 
-    async def test_success_without_tags_field_is_empty(self):
-        self.assertEqual(await self.read({"status": "ok", "data": {}}), (True, []))
+    async def test_success_with_empty_list_is_trusted(self):
+        # 明确返回空列表 = 本群确实没有标签，可以当可信基线
+        self.assertEqual(await self.read({"status": "ok", "data": []}), (True, []))
+        self.assertEqual(
+            await self.read({"status": "ok", "data": {"tags": []}}), (True, [])
+        )
+
+    async def test_success_without_recognized_tags_field_is_failure(self):
+        # 成功但响应里找不到可识别的标签字段：按读取失败处理，绝不能当成
+        # "本群没有标签"，否则覆盖型回退会把已有标签做基线清空
+        # （PR #289 审查：incompatible-response-shape）。
+        self.assertEqual(await self.read({"status": "ok", "data": {}}), (False, []))
+        self.assertEqual(
+            await self.read({"status": "ok", "result": {"tags": ["A"]}}), (False, [])
+        )
 
     async def test_tags_are_deduplicated(self):
         self.assertEqual(
@@ -314,6 +327,16 @@ class JoinRequestCollectionTests(unittest.TestCase):
         requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=True)
         self.assertEqual(requests, [])
         self.assertEqual(others, 0)
+
+    def test_bare_list_system_entries_need_flag(self):
+        # 裸数组没有字段名可依：只有带 flag 的条目才算申请
+        data = [
+            {"group_id": "100", "flag": "f1", "sub_type": "add"},
+            {"group_id": "100", "sub_type": "invite", "type": "系统通知"},
+        ]
+        requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=True)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(others, 1)
 
     def test_plain_system_entries_are_not_requests(self):
         self.assertFalse(OneBotApi.looks_like_join_request({"type": "member_increase"}))

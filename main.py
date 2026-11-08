@@ -2605,13 +2605,24 @@ class GroupAdminPlugin(Star):
                 yield event.plain_result(f"本群未设置 {key}")
                 return
             # 值 + 增量操作 + 整体快照标记一起清，避免残留让本群配置"复活"
-            self._store.drop_group_override(group_id, key)
+            try:
+                self._store.drop_group_override(group_id, key)
+            except Exception as e:
+                logger.error(f"清除本群配置 {key} 失败（群 {group_id}）: {e}")
+                yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
+                return
             yield event.plain_result(f"已清除本群 {key} 覆盖")
         else:
-            overrides = self._store.runtime_map("group_overrides")
-            if group_id in overrides:
-                del overrides[group_id]
-                self._store.save_config()
+            # 整群清除同样走事务：保存失败要回滚，不能内存删了磁盘还在
+            try:
+                cleared = self._store.drop_group_overrides(group_id)
+            except Exception as e:
+                logger.error(f"清除本群全部配置失败（群 {group_id}）: {e}")
+                yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
+                return
+            if not cleared:
+                yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
+                return
             yield event.plain_result("已清除本群所有覆盖")
 
     @filter.command("status", "查看插件配置")

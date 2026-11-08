@@ -839,6 +839,21 @@ class GroupOverrideTests(unittest.TestCase):
             store.get_group_setting("100", "whitelist_users"), ["g1"]
         )
 
+    def test_drop_group_overrides_rolls_back_on_save_failure(self):
+        # 整群清除也是事务：保存失败必须把本群覆盖整体恢复，否则内存里已经
+        # 没有本群配置、磁盘上还在，命令却报"已清除"
+        # （PR #289 审查：missing-rollback）。
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.set_group_override("100", "whitelist_users", ["s1"])
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.drop_group_overrides("100")
+        self.assertIn("100", store.runtime_map("group_overrides"))
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["s1"]
+        )
+
     def test_drop_group_override_rolls_back_on_save_failure(self):
         config = _FailingConfig(whitelist_users=["g1"])
         store = self.make_store(config)

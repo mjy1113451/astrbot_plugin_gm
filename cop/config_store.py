@@ -933,6 +933,21 @@ class ConfigStore:
             return []
         return [value] if value else []
 
+    def drop_group_overrides(self, group_id: str) -> bool:
+        """清除本群全部运行时覆盖并落盘；保存失败时整群回滚。
+
+        返回本群原先是否存在覆盖。清除整群和清除单个键一样必须走事务：
+        直接 `del overrides[gid]` 再保存，失败后内存里已经没有本群配置，
+        而磁盘上还在，命令还回执"已清除"（PR #289 审查：missing-rollback）。
+        """
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            if str(group_id) not in overrides:
+                return False
+
+        self._commit_runtime_change(group_id, lambda: overrides.pop(str(group_id), None))
+        return True
+
     def drop_group_override(self, group_id: str, key: str) -> bool:
         """清除本群某个配置项（连同增量操作与整体快照标记）并落盘。
 

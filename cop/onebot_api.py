@@ -417,6 +417,8 @@ class OneBotApi:
           系统消息误报成加群申请（PR #289 审查：misleading-diagnostic-output）；
         - system_msg=False（get_group_filtered_requests / get_group_ignore_add_request）：
           这类接口整个列表就是请求列表，列表内条目都算申请；
+        - system_msg=True 且响应是裸数组（没有字段名可依）时，只有带 ``flag``
+          的条目才算申请——flag 是执行同意/拒绝的必要标识，用它把系统通知挡掉；
         - 两种情况都只统计 group_id 与本群一致（或未提供群号）的条目。
         """
         requests, others = [], 0
@@ -442,7 +444,13 @@ class OneBotApi:
                         others += 1
         elif isinstance(data, list):
             for item in data:
-                is_req = (not system_msg) or cls.looks_like_join_request(item)
+                if system_msg:
+                    # 裸数组没有字段名可依，只能按"带 flag"（可执行同意/拒绝的
+                    # 申请标识）判定，避免把系统通知也当成申请
+                    # （PR #289 审查：misleading-diagnostic-output）。
+                    is_req = isinstance(item, dict) and bool(item.get("flag"))
+                else:
+                    is_req = True
                 if is_req:
                     if isinstance(item, dict) and _belongs(item):
                         requests.append(item)
@@ -457,7 +465,11 @@ class OneBotApi:
         结果（协议端不支持 get_group_tags 时返回 (False, [])，不能当作
         "标签不存在"的证据）。
 
-        兼容协议端三种返回形态：裸数组、{data: [...]}、{data: {tags: [...]}}
+        兼容协议端三种返回形态：裸数组、{data: [...]}、{data: {tags: [...]}}。
+
+        区分"成功且明确返回空列表"（(True, [])）与"成功但响应里找不到可识别的
+        标签字段"（(False, []) 并记 warning）：后者多半是协议端响应结构不兼容，
+        当成"没有标签"会让覆盖型回退把已有标签当基线清空
         （PR #289 审查：incompatible-response-shape）。
         """
         raw = await self._get_group_tags(event, group_id)
@@ -465,13 +477,21 @@ class OneBotApi:
             return True, self._normalize_tags(raw)
         if not (isinstance(raw, dict) and self._action_result_success(raw)):
             return False, []
-        for data in (raw.get("data"), raw.get("tags"), raw.get("group_tags")):
-            if isinstance(data, dict):
-                data = data.get("tags") or data.get("group_tags")
-            if isinstance(data, list):
-                return True, self._normalize_tags(data)
-        # 接口成功但没有标签字段：按"本群没有标签"处理。
-        return True, []
+        candidates = []
+        data = raw.get("data")
+        for source in (raw, data):
+            if isinstance(source, dict):
+                candidates.append(source.get("tags"))
+                candidates.append(source.get("group_tags"))
+        for candidate in (raw.get("data"), raw.get("tags"), raw.get("group_tags")):
+            if isinstance(candidate, list):
+                candidates.append(candidate)
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                return True, self._normalize_tags(candidate)
+        # 成功但结构无法识别：按读取失败处理，不能当作"本群没有标签"
+        logger.warning(f"[OneBot] get_group_tags 响应结构无法识别（按读取失败处理）: {raw}")
+        return False, []
 
     async def _add_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """添加群标签。返回 (是否成功, 最后一个原始响应, 告警码)。
