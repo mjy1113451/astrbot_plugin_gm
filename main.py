@@ -1883,41 +1883,21 @@ class GroupAdminPlugin(Star):
         # #276：群标签优先走 get_group_tags（NapCat 扩展接口，兼容 str/dict 混合列表）；
         # 接口失败时回退 get_group_info 响应里的 tags / group_tags 字段；
         # 接口成功但为空 → 「无」，失败且回退也为空 → 明确提示获取失败
-        tags_raw = await self._api._get_group_tags(event, group_id)
-        tags = self._parse_group_tags_result(tags_raw)
+        tags_ok, tags = await self._api._group_tags_read(event, group_id)
         if not tags:
             tags = info.get("tags") or info.get("group_tags") or []
         if tags:
             tags_str = ", ".join(str(t) for t in tags)
-        elif isinstance(tags_raw, dict) and self._api._action_result_success(tags_raw):
-            tags_str = "无"
-        else:
+        elif not tags_ok:
             tags_str = "获取失败（当前协议端可能不支持 get_group_tags）"
+        else:
+            tags_str = "无"
         text = f"群名称: {name}\n群号: {gid}\n群标签: {tags_str}\n成员数: {member_count}"
         yield event.plain_result(text)
 
-    def _parse_group_tags_result(self, result) -> list:
-        """#276：解析 get_group_tags 响应中的标签列表。
-
-        兼容 data 为字符串列表 / dict 列表（取 tag/name/title 字段）/
-        {"tags": [...]} 包裹三种形态；响应失败或结构异常返回空列表。
-        """
-        if not isinstance(result, dict) \
-                or not self._api._action_result_success(result):
-            return []
-        data = result.get("data")
-        if isinstance(data, dict):
-            data = data.get("tags") or data.get("group_tags")
-        if not isinstance(data, list):
-            return []
-        tags = []
-        for t in data:
-            if isinstance(t, dict):
-                t = t.get("tag") or t.get("name") or t.get("title") or ""
-            t = str(t).strip()
-            if t and t not in tags:
-                tags.append(t)
-        return tags
+    # 群标签读取统一走 OneBotApi._group_tags_read（同时返回"查询是否成功"
+    # 与"标签列表"），不再在插件层重复实现一份解析
+    # （PR #289 审查：misleading-empty-state）。
 
 # #164: /群相册 — 引用图片消息上传到群相册（群管/群主）
     @filter.command("群相册", "引用图片上传到群相册（/群相册 相册名）")
@@ -2079,18 +2059,17 @@ class GroupAdminPlugin(Star):
         if not text:
             # #276：不带参数时改为查看本群群标签（get_group_tags，NapCat 扩展接口）；
             # 区分「接口成功但无标签」与「接口失败（协议端不支持）」
-            tags_raw = await self._api._get_group_tags(event, group_id)
-            tags = self._parse_group_tags_result(tags_raw)
+            tags_ok, tags = await self._api._group_tags_read(event, group_id)
             if tags:
                 yield event.plain_result(f"本群群标签：{', '.join(tags)}")
                 return
-            if isinstance(tags_raw, dict) and self._api._action_result_success(tags_raw):
+            if not tags_ok:
                 yield event.plain_result(
-                    "本群暂无群标签；如需添加请发送 /群标签 标签名，例如 /群标签 编程交流")
+                    "查看群标签失败（当前协议端可能不支持 get_group_tags），"
+                    "或请提供标签内容进行添加，例如 /群标签 编程交流")
                 return
             yield event.plain_result(
-                "查看群标签失败（当前协议端可能不支持 get_group_tags），"
-                "或请提供标签内容进行添加，例如 /群标签 编程交流")
+                "本群暂无群标签；如需添加请发送 /群标签 标签名，例如 /群标签 编程交流")
             return
         if len(text) > 20:
             yield event.plain_result("标签过长（最多20字符）")
@@ -2130,15 +2109,19 @@ class GroupAdminPlugin(Star):
                 break
         if not text:
             # 不带参数时先展示当前标签，提示用法
-            tags_raw = await self._api._get_group_tags(event, group_id)
-            tags = self._parse_group_tags_result(tags_raw)
+            tags_ok, tags = await self._api._group_tags_read(event, group_id)
             if tags:
                 yield event.plain_result(
                     f"本群群标签：{', '.join(tags)}\n"
                     f"请发送 /删群标签 标签名 进行删除")
-            else:
+            elif not tags_ok:
+                # 查不到 ≠ 没有：接口失败/不支持要说清楚，别让管理员以为标签被清空了
+                # （PR #289 审查：misleading-empty-state）
                 yield event.plain_result(
-                    "本群没有可删除的群标签（或当前协议端不支持 get_group_tags）")
+                    "获取群标签失败（当前协议端可能不支持 get_group_tags），"
+                    "无法列出可删除的标签；可直接发送 /删群标签 标签名 尝试删除")
+            else:
+                yield event.plain_result("本群暂无群标签")
             return
         ok, result, reason = await self._api._delete_group_tag(event, group_id, text)
         if ok:

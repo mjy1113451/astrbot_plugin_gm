@@ -57,6 +57,34 @@ _install_astrbot_stubs()
 from cop.onebot_api import OneBotApi  # noqa: E402
 
 
+class GroupTagsStateContractTests(unittest.IsolatedAsyncioTestCase):
+    """区分"本群没有标签"与"查询失败"（PR #289 审查：misleading-empty-state）。
+
+    命令层（/群标签、/删群标签）依赖这个 (ok, tags) 契约来决定提示文案，
+    所以这里把它固定成回归测试。
+    """
+
+    async def read(self, raw):
+        api = OneBotApi.__new__(OneBotApi)
+
+        async def fake_get_tags(event, group_id):
+            return raw
+
+        api._get_group_tags = fake_get_tags
+        return await api._group_tags_read(None, "100")
+
+    async def test_empty_success_is_not_a_failure(self):
+        self.assertEqual(await self.read([]), (True, []))
+        self.assertEqual(await self.read({"status": "ok", "data": []}), (True, []))
+
+    async def test_missing_api_is_a_failure(self):
+        # None = 没有可用调用通路（协议端不支持 get_group_tags）
+        self.assertEqual(await self.read(None), (False, []))
+
+    async def test_failed_response_is_a_failure_not_empty(self):
+        self.assertEqual(await self.read({"status": "failed"}), (False, []))
+
+
 class GroupTagsReadTests(unittest.IsolatedAsyncioTestCase):
     def make_api(self, raw):
         api = OneBotApi.__new__(OneBotApi)

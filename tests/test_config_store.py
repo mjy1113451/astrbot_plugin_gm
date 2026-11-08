@@ -417,6 +417,60 @@ class GroupOverrideTests(unittest.TestCase):
         config["whitelist_users"] = ["g1", "x"]
         self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g1", "x"])
 
+    def test_remove_readd_baseline_item_stays_present(self):
+        # 删除基线项 → 重新添加 → 基线再删掉又加回来：按"最后一次操作优先"，
+        # 该项仍然是本群显式加入的，最终只出现一次
+        # （PR #289 审查：list-operation-state-loss）。
+        config = _Config(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g2"])
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "add", "g1")
+        self.assertTrue(ok)
+        # 重新添加后 removed / removed_baseline 一起清掉，只剩 added
+        ops = store._list_ops("100", "whitelist_users")
+        self.assertEqual(ops["removed"], [])
+        self.assertEqual(ops["removed_baseline"], {})
+        self.assertEqual(ops["added"], ["g1"])
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g1", "g2"]
+        )
+        # 基线删掉 g1：本群仍通过 added 保留它
+        config["whitelist_users"] = ["g2"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g2", "g1"]
+        )
+        # 基线再加回 g1：集合语义下只出现一次
+        config["whitelist_users"] = ["g1", "g2"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g1", "g2"]
+        )
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users").count("g1"), 1
+        )
+
+    def test_template_defaults_match_global_defaults(self):
+        # 模板字段默认值必须与全局同名字段一致，否则"填了非默认值"会被误判成
+        # "没覆盖"，或反之（PR #289 审查：template-default-mismatch）。
+        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        items = schema["group_overrides_templates"]["templates"]["group_config"]["items"]
+        meta = {"group_id", "explicit_override_fields"}
+        checked = 0
+        for key, spec in items.items():
+            if key in meta:
+                continue
+            with self.subTest(field=key):
+                self.assertIn(key, schema, "模板字段在全局 schema 里不存在")
+                self.assertEqual(
+                    spec.get("default"),
+                    schema[key].get("default"),
+                    "模板字段默认值与全局不一致",
+                )
+                checked += 1
+        self.assertGreater(checked, 40)
+
     def test_removed_baseline_flag_is_recorded(self):
         config = _Config(whitelist_users=["g1"])
         store = self.make_store(config)

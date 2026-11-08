@@ -265,10 +265,14 @@ class ConfigStore:
             field = schema.get("group_overrides_templates") or {}
             template = (field.get("templates") or {}).get("group_config") or {}
             items = template.get("items") or {}
+            # 模板自身的管理字段不参与覆盖判定：group_id 是群号，
+            # explicit_override_fields 是"显式覆盖声明"，都不是群配置项
+            # （PR #289 审查：template-default-mismatch）。
+            meta = {"group_id", "explicit_override_fields"}
             return {
                 k: (v.get("default") if isinstance(v, dict) else None)
                 for k, v in items.items()
-                if k != "group_id"
+                if k not in meta
             }
         except Exception as e:
             logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
@@ -472,7 +476,10 @@ class ConfigStore:
             item = str(item).strip()
             if not item:
                 continue
-            # 重新添加：撤销对应的删除意图，再记一次添加（重复项保持重复）
+            # 重新添加 = 显式撤销此前的删除：added / removed / removed_baseline
+            # 三处一起清掉再记一次添加。此后该项按"本群显式加入"生效，基线之后
+            # 增删同名项都不再影响它——优先级固定为「最后一次操作优先」
+            # （PR #289 审查：list-operation-state-loss）。
             ops["removed"] = [x for x in ops["removed"] if x != item]
             ops.get("removed_baseline", {}).pop(item, None)
             ops["added"] = list(ops["added"]) + [item]
