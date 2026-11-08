@@ -48,6 +48,7 @@ class _Store:
         self.config = {}
         self._maps = {}
         self.mutations = []
+        self.fail_mutation = False
 
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
@@ -58,6 +59,8 @@ class _Store:
     def mutate_group_list(self, group_id, key, op, value):
         """桩：模拟原子读写，记录调用并按 add/remove 真正改动 settings。"""
         self.mutations.append((group_id, key, op, value))
+        if self.fail_mutation:
+            raise OSError("config.json 写入失败（模拟）")
         current = [str(x) for x in (self.settings.get(key) or [])]
         value = str(value)
         if op == "add":
@@ -85,6 +88,7 @@ class _Api:
         self.admin_texts = []
         self.group_texts = []
         self.nickname_queries = []
+        self.handled = []
 
     def _get_self_id(self, event, raw=None):
         return "999000111"
@@ -107,6 +111,7 @@ class _Api:
         self.admin_texts.append(text)
 
     async def _handle_group_request(self, event, flag, approve, reason, sub_type=None):
+        self.handled.append((flag, approve, reason))
         return True
 
 
@@ -317,6 +322,61 @@ class BlacklistPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(("100", "blacklisted_users", "add", "777"), store.mutations)
         self.assertEqual(store.settings["blacklisted_users"], ["777"])
+
+
+class BlacklistErrorHandlingTests(unittest.IsolatedAsyncioTestCase):
+    """黑名单写入失败必须被处理（PR #289 审查：missing-error-handling）。"""
+
+    async def test_auto_reject_still_rejects_when_blacklist_write_fails(self):
+        store = _Store({"join_reject_keywords": ["广告"], "blacklisted_users": []})
+        store.fail_mutation = True
+        api = _Api()
+        raw = {
+            "group_id": 100,
+            "user_id": "777",
+            "sub_type": "add",
+            "flag": "f-kw",
+            "comment": "低价广告推广",
+        }
+        out = await _drain(
+            _make_service(store, api)._handle_group_join_request(_Event(), raw)
+        )
+
+        # 安全处置优先：拒绝照常执行
+        self.assertEqual(len(api.handled), 1)
+        self.assertFalse(api.handled[0][1])
+        text = str(out[-1])
+        self.assertIn("已拒绝", text)
+        self.assertIn("黑名单保存失败", text)
+        # 管理员通知里也要标明没写进去
+        self.assertIn("黑名单写入失败", api.admin_texts[-1])
+
+    async def test_quote_reply_blacklist_failure_is_not_reported_as_success(self):
+        store = _Store()
+        store.fail_mutation = True
+        record = {
+            "flag": "f-1",
+            "group_id": "100",
+            "user_id": "777",
+            "inviter_user_id": "",
+            "sub_type": "add",
+            "ts": 1,
+        }
+        store.runtime_map("pending_join_requests")["mid-1"] = record
+        api = _Api()
+        svc = JoinReviewService(
+            config_store=store,
+            onebot_api=api,
+            runtime=SimpleNamespace(_join_request_seen={}),
+            permissions=_Perms(),
+            message_parse=_Parser("拉黑"),
+        )
+        out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+
+        # 没写进黑名单就不处理申请，也不能回执"已拉黑"
+        self.assertEqual(api.handled, [])
+        self.assertNotIn("已拉黑", str(out))
+        self.assertIn("失败", str(out))
 
 
 if __name__ == "__main__":

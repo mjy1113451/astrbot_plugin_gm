@@ -390,6 +390,40 @@ class GroupOverrideTests(unittest.TestCase):
             store.get_group_setting("100", "whitelist_users"), ["g2", "g3"]
         )
 
+    def test_removal_of_baseline_item_survives_baseline_remove_and_readd(self):
+        # 本群删的是基线里的项 → 之后全局删了又加回来，本群仍然保持删除
+        # （PR #289 审查：stale-list-operation-conflict）。
+        config = _Config(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        config["whitelist_users"] = ["g2"]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g2"])
+        config["whitelist_users"] = ["g1", "g2"]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g2"])
+
+    def test_removal_of_group_added_item_follows_later_baseline(self):
+        # 本群自己加进去又删掉的项，记录的是"删除时基线里没有"，全局后来新增
+        # 同名项时仍然生效，不会因为一次删除就永久屏蔽
+        # （PR #289 审查：stale-list-operation-conflict）。
+        config = _Config(whitelist_users=["g1"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "add", "x")
+        self.assertTrue(ok)
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g1", "x"])
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "x")
+        self.assertTrue(ok)
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g1"])
+        config["whitelist_users"] = ["g1", "x"]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g1", "x"])
+
+    def test_removed_baseline_flag_is_recorded(self):
+        config = _Config(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        ops = store._list_ops("100", "whitelist_users")
+        self.assertEqual(ops["removed_baseline"], {"g1": True})
+
     def test_explicit_set_is_authoritative_snapshot(self):
         config = _Config(whitelist_users=["g1"])
         store = self.make_store(config)

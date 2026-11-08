@@ -385,15 +385,28 @@ class ConfigStore:
         return [] if value is None else [str(value).strip()]
 
     def _list_ops(self, group_id: str, key: str) -> dict:
-        """取某个列表键的增量操作（没有则返回空操作）。"""
+        """取某个列表键的增量操作（没有则返回空操作）。
+
+        removed_baseline 记录"删除该项时基线里到底有没有它"，用于区分两种删除：
+        - True：删的是模板/全局传下来的项 → 本群明确不要，以后基线再加也不生效；
+        - False：删的是本群自己加进去的项 → 基线后续新增同名项仍然生效
+        （PR #289 审查：stale-list-operation-conflict）。
+        """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         meta = overrides.get(self._LIST_OPS) if isinstance(overrides, dict) else None
         ops = meta.get(key) if isinstance(meta, dict) else None
         if not isinstance(ops, dict):
-            return {"added": [], "removed": []}
+            return {"added": [], "removed": [], "removed_baseline": {}}
+        removed_baseline = ops.get("removed_baseline")
         return {
             "added": self._as_str_list(ops.get("added")),
             "removed": self._as_str_list(ops.get("removed")),
+            "removed_baseline": {
+                str(k): bool(v)
+                for k, v in (removed_baseline or {}).items()
+            }
+            if isinstance(removed_baseline, dict)
+            else {},
         }
 
     def _store_list_ops(self, group_id: str, key: str, ops: dict) -> None:
@@ -404,7 +417,14 @@ class ConfigStore:
             meta = {}
             gconf[self._LIST_OPS] = meta
         if ops["added"] or ops["removed"]:
-            meta[key] = {"added": list(ops["added"]), "removed": list(ops["removed"])}
+            payload = {"added": list(ops["added"]), "removed": list(ops["removed"])}
+            removed_baseline = {
+                item: bool(ops.get("removed_baseline", {}).get(item, True))
+                for item in ops["removed"]
+            }
+            if removed_baseline:
+                payload["removed_baseline"] = removed_baseline
+            meta[key] = payload
         else:
             meta.pop(key, None)
             if not meta:
@@ -423,11 +443,16 @@ class ConfigStore:
     def _merge_list_ops(self, group_id: str, key: str, ops=None) -> list:
         """把增量操作套到最新的模板/全局基线上得到生效列表。"""
         ops = ops if ops is not None else self._list_ops(group_id, key)
+        removed_baseline = ops.get("removed_baseline") or {}
         merged = []
         # 名单类配置按"值集合"语义生效：基线里的重复值只保留一份，
         # 添加也保持首次出现顺序（PR #289 审查：lossy-list-diff）。
         for item in self._as_str_list(self._template_or_global_setting(group_id, key, [])):
-            if item not in ops["removed"] and item not in merged:
+            if item in ops["removed"] and removed_baseline.get(item, True):
+                # 只有"删的是基线里的项"才一直压住；本群自己加又删掉的项，
+                # 基线后续新增时仍然生效（否则删一次等于永久屏蔽全局名单）
+                continue
+            if item not in merged:
                 merged.append(item)
         for item in ops["added"]:
             if item not in merged:
@@ -441,12 +466,15 @@ class ConfigStore:
     def _apply_list_ops(self, group_id: str, key: str, add=(), remove=()) -> list:
         """记录一次增/删操作并物化生效列表（不做持久化，由调用方提交）。"""
         ops = self._list_ops(group_id, key)
+        # 记录删除时的基线（模板/全局）内容，供后续区分"删的是谁的项"
+        baseline = self._as_str_list(self._template_or_global_setting(group_id, key, []))
         for item in add:
             item = str(item).strip()
             if not item:
                 continue
             # 重新添加：撤销对应的删除意图，再记一次添加（重复项保持重复）
             ops["removed"] = [x for x in ops["removed"] if x != item]
+            ops.get("removed_baseline", {}).pop(item, None)
             ops["added"] = list(ops["added"]) + [item]
         for item in remove:
             item = str(item).strip()
@@ -454,6 +482,7 @@ class ConfigStore:
                 continue
             ops["added"] = [x for x in ops["added"] if x != item]
             ops["removed"] = [x for x in ops["removed"] if x != item] + [item]
+            ops.setdefault("removed_baseline", {})[item] = item in baseline
         merged = self._merge_list_ops(group_id, key, ops)
         overrides = self.runtime_map("group_overrides")
         gconf = overrides.setdefault(str(group_id), {})

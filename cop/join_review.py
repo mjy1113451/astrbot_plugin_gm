@@ -259,22 +259,41 @@ class JoinReviewService:
             # #270：拉黑对象是申请人/被邀请人 B，不能误写邀请人 A
             # PR#289 审查（blacklist-update-not-persisted）：get_group_override_list
             # 返回的是拷贝，直接 append 不会落盘；统一走 mutate_group_list 原子写入
-            self._store.mutate_group_list(
-                group_id, "blacklisted_users", "add", str(applicant_id))
+            bl_saved = True
+            try:
+                self._store.mutate_group_list(
+                    group_id, "blacklisted_users", "add", str(applicant_id))
+            except Exception as e:
+                # 存储异常不能中断整条申请的处理：先完成拒绝（安全处置优先），
+                # 再把"黑名单没保存"如实告知，避免管理员以为已经拉黑
+                # （PR #289 审查：missing-error-handling）。
+                bl_saved = False
+                logger.error(f"[加群审核] 写黑名单失败（群 {group_id} 用户 {applicant_id}）: {e}")
             detail_reason = f"您的加群申请含有本群禁止的词语，自动拒绝（{reject_reason}）"
             handled = await self._api._handle_group_request(
                 event, flag, False, detail_reason, sub_type=sub_type)
-            yield event.plain_result(
-                f"已拒绝 {applicant_id} 的加群申请（命中自动拒绝关键词「{hit_keyword}」，已加入本群黑名单）" if handled else
-                f"拒绝 {applicant_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志；该用户已加入本群黑名单）")
+            if handled and bl_saved:
+                yield event.plain_result(
+                    f"已拒绝 {applicant_id} 的加群申请（命中自动拒绝关键词「{hit_keyword}」，已加入本群黑名单）")
+            elif handled:
+                yield event.plain_result(
+                    f"已拒绝 {applicant_id} 的加群申请（命中自动拒绝关键词「{hit_keyword}」），"
+                    "但黑名单保存失败，请稍后手动拉黑")
+            elif bl_saved:
+                yield event.plain_result(
+                    f"拒绝 {applicant_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志；该用户已加入本群黑名单）")
+            else:
+                yield event.plain_result(
+                    f"拒绝 {applicant_id} 的加群申请失败（协议端拒绝或接口不可用，详见日志；黑名单也未保存成功）")
             if not handled:
                 return
             invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
+            bl_note = "已加入本群黑名单" if bl_saved else "【黑名单写入失败，请手动拉黑】"
             await self._api._notify_admins(
                 f"[加群请求] 已拒绝 {applicant_id}（群 {group_id}）\n"
                 f"{invite_note}"
                 f"验证消息: {comment}\n"
-                f"原因: 命中加群自动拒绝关键词「{hit_keyword}」，已加入本群黑名单",
+                f"原因: 命中加群自动拒绝关键词「{hit_keyword}」，{bl_note}",
                 group_id=group_id,
             )
             return
@@ -494,8 +513,18 @@ class JoinReviewService:
             if info.get("user_id"):
                 # PR#289 审查（blacklist-update-not-persisted）：返回的是拷贝，
                 # 必须走 mutate_group_list 才会真正落盘
-                self._store.mutate_group_list(
-                    group_id, "blacklisted_users", "add", str(info["user_id"]))
+                try:
+                    self._store.mutate_group_list(
+                        group_id, "blacklisted_users", "add", str(info["user_id"]))
+                except Exception as e:
+                    # 写入失败就不能继续按"拉黑"处理，否则会回执"已拉黑"但实际没落盘
+                    # （PR #289 审查：missing-error-handling）。
+                    logger.error(
+                        f"[加群审核] 写黑名单失败（群 {group_id} 用户 {info['user_id']}）: {e}")
+                    yield event.plain_result(
+                        f"拉黑 {info['user_id']} 失败（配置保存异常，详见日志），"
+                        "该申请未处理，请稍后重试")
+                    return
         elif deny:
             parts = msg_text.split("拒绝", 1)
             custom = parts[1].strip() if len(parts) > 1 else ""
