@@ -2345,14 +2345,20 @@ class GroupAdminPlugin(Star):
             changed = [q for q in qq_list if q not in current]
         else:
             changed = [q for q in qq_list if q in current]
-        total = len(current)
-        for q in changed:
-            ok, latest = self._store.mutate_group_list(
-                gid, key, "add" if add else "remove", q
-            )
-            if ok:
-                total = len(latest)
-        yield event.plain_result(ok_tpl.format(n=len(changed), total=total) if changed else empty_msg)
+        if not changed:
+            yield event.plain_result(empty_msg)
+            return
+        # 一次性提交（单次落盘、失败整体回滚），避免逐项写入时中途失败留下
+        # "写了一半"的状态（PR #289 审查：partial-batch-persistence）。
+        try:
+            _changed, latest = self._store.mutate_group_list_batch(
+                gid, key, add=changed if add else (), remove=() if add else changed)
+        except Exception as e:
+            logger.error(f"批量变更本群配置 {key} 失败（群 {gid}）: {e}")
+            yield event.plain_result(
+                "[错误] 保存失败，本次变更未生效（已整体回滚），请稍后重试")
+            return
+        yield event.plain_result(ok_tpl.format(n=len(changed), total=len(latest)))
 
     # --- Bool 开关指令 ---
     @filter.command("开关撤回提示", "开关撤回消息提示（on/off，按群生效）")

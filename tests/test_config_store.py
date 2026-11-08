@@ -39,6 +39,8 @@ if "astrbot" not in sys.modules:
     sys.modules["astrbot"] = astrbot
     sys.modules["astrbot.api"] = api
 
+from unittest.mock import patch  # noqa: E402
+
 from cop.config_store import ConfigStore  # noqa: E402
 
 
@@ -54,7 +56,12 @@ class _FailingConfig(_Config):
 
     fail = False
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.saves = 0
+
     def save_config(self):
+        self.saves += 1
         if self.fail:
             raise OSError("config.json 写入失败（模拟）")
 
@@ -472,6 +479,49 @@ class GroupOverrideTests(unittest.TestCase):
         with self.assertRaises(OSError):
             store.mutate_group_list("100", "whitelist_users", "remove", "g2")
         self.assertEqual(store.runtime_path.read_text(encoding="utf-8"), before)
+
+    def test_save_config_read_failure_aborts_without_touching_file(self):
+        # 备份都读不到时不能继续写：否则之后的回滚会删掉一个原本存在的文件
+        # （PR #289 审查：incorrect-rollback-deletion）。
+        config = _FailingConfig(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        before = store.runtime_path.read_text(encoding="utf-8")
+        config.fail = True
+        with patch.object(Path, "read_text", side_effect=OSError("磁盘读取失败")):
+            with self.assertRaises(OSError):
+                store.mutate_group_list("100", "whitelist_users", "remove", "g2")
+        self.assertTrue(store.runtime_path.exists())
+        self.assertEqual(store.runtime_path.read_text(encoding="utf-8"), before)
+
+    def test_batch_add_saves_once(self):
+        config = _FailingConfig(whitelist_users=[])
+        store = self.make_store(config)
+        changed, latest = store.mutate_group_list_batch(
+            "100", "whitelist_users", add=["a", "b", "c"])
+        self.assertTrue(changed)
+        self.assertEqual(latest, ["a", "b", "c"])
+        self.assertEqual(config.saves, 1)
+
+    def test_batch_failure_rolls_back_everything(self):
+        # 批量变更必须整体成功或整体失败，不能留下"写了一半"
+        # （PR #289 审查：partial-batch-persistence）。
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.mutate_group_list_batch("100", "whitelist_users", add=["a", "b"])
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g1"])
+
+    def test_batch_without_changes_does_not_write(self):
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        changed, latest = store.mutate_group_list_batch(
+            "100", "whitelist_users", add=["g1"], remove=["nope"])
+        self.assertFalse(changed)
+        self.assertEqual(latest, ["g1"])
+        self.assertEqual(config.saves, 0)
 
     def test_save_config_success_keeps_runtime_file_updated(self):
         config = _FailingConfig(whitelist_users=["g1", "g2"])

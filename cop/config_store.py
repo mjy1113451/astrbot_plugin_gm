@@ -135,19 +135,21 @@ class ConfigStore:
         写前内容，保证磁盘与内存一致（PR #289 审查：non-atomic-persistence）。
         """
         with self._lock:
+            # 用哨兵区分"文件本来就不存在"（回滚时删除）与"读到了内容"（回滚时写回）。
+            # 其它 OSError 直接抛出：连备份都读不到就无法在失败时恢复，宁可这次
+            # 不写，也不能在之后的回滚里删掉一个原本存在的文件
+            # （PR #289 审查：incorrect-rollback-deletion）。
+            missing = object()
             try:
                 prev_runtime = self.runtime_path.read_text(encoding="utf-8")
             except FileNotFoundError:
-                prev_runtime = None
-            except OSError as e:
-                logger.warning(f"[群管插件] 读取 runtime.json 备份失败，跳过回滚保护: {e}")
-                prev_runtime = None
+                prev_runtime = missing
             self.save_json(self.runtime_path, self._runtime_maps)
             try:
                 self.config.save_config()
             except Exception:
                 try:
-                    if prev_runtime is None:
+                    if prev_runtime is missing:
                         self.runtime_path.unlink(missing_ok=True)
                     else:
                         self.runtime_path.write_text(prev_runtime, encoding="utf-8")
@@ -177,6 +179,30 @@ class ConfigStore:
                 if not any(str(x) == value for x in current):
                     return False, list(current)
                 merged = self._commit_list_change(group_id, key, remove=[value])
+            return True, list(merged)
+
+    def mutate_group_list_batch(self, group_id: str, key: str, add=(), remove=()) -> tuple:
+        """一次性增删多个值的原子版本（review#192 / PR#289 partial-batch-persistence）。
+
+        批量名单命令逐项调用 mutate_group_list 时，中途落盘失败会留下"写了一半"
+        的状态；这里先在锁内算出真正要变更的集合，再用一次 _commit_list_change
+        落盘，失败整体回滚。返回 (是否有变更, 生效列表拷贝)。
+        """
+        with self._lock:
+            current = [str(x) for x in self.get_group_override_list(group_id, key)]
+            add_items, remove_items = [], []
+            for item in add:
+                item = str(item).strip()
+                if item and item not in current and item not in add_items:
+                    add_items.append(item)
+            for item in remove:
+                item = str(item).strip()
+                if item and item in current and item not in remove_items:
+                    remove_items.append(item)
+            if not add_items and not remove_items:
+                return False, current
+            merged = self._commit_list_change(
+                group_id, key, add=add_items, remove=remove_items)
             return True, list(merged)
 
     # ===================== stats / reports =====================
