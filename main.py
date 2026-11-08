@@ -2069,9 +2069,16 @@ class GroupAdminPlugin(Star):
             return
         # #285：统一命名 add_group_tag（NapCat），旧扩展名 set_group_tag
         # （LLOneBot 等）由封装内部回退，tag=/tags= 参数变体一并覆盖
-        ok, result = await self._api._add_group_tag(event, group_id, text)
+        ok, result, warn = await self._api._add_group_tag(event, group_id, text)
         if ok:
             yield event.plain_result(f"已添加群标签「{text}」")
+            return
+        if warn == "tags_may_be_lost":
+            # 覆盖型回退把本群原有标签弄丢又没补回来：必须让管理员人工核对，
+            # 不能当普通失败处理（否则原标签会静默消失）
+            yield event.plain_result(
+                "添加群标签失败：协议端执行覆盖型标签接口后，本群原有标签可能已丢失，"
+                "请到 QQ 客户端核对并手动恢复")
             return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'add_group_tag')

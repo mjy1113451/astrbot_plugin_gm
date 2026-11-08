@@ -62,6 +62,10 @@ class ConfigStore:
         # "schema 内的配置键"与"框架注入的内部键"（PR #289 审查：
         # unregistered-global-write）。
         self._schema_keys = self._load_schema_keys()
+        # set_global_setting 登记的单键写前值：save_config 的快照是在改动之后
+        # 才拍的，靠它才能把回滚目标修正回真正的写前状态
+        # （PR #289 审查：double-rollback-corruption）。
+        self._touched_prev: dict = {}
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -182,12 +186,16 @@ class ConfigStore:
             # （PR #289 审查：incomplete-persistence-rollback）。
             prev_global = copy.deepcopy(dict(self.config)) if isinstance(self.config, dict) else None
             prev_global_file = self._snapshot_framework_file()
+            touched_keys = tuple(self._touched_keys)
+            touched_prev = dict(self._touched_prev)
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
                 self.config.save_config()
             except Exception as exc:
-                failure = self._restore_framework_config(prev_global, self._touched_keys)
+                failure = self._restore_framework_config(
+                    prev_global, touched_keys, touched_prev)
                 self._touched_keys = ()
+                self._touched_prev = {}
                 failure = failure or self._restore_framework_file(prev_global_file)
                 try:
                     if prev_runtime is missing:
@@ -209,32 +217,32 @@ class ConfigStore:
                 raise
             else:
                 self._touched_keys = ()
+                self._touched_prev = {}
 
     def set_global_setting(self, key: str, value) -> None:
-        """写入单个全局配置项并持久化；保存失败时只回滚这一个键。
+        """写入单个全局配置项并持久化；保存失败时由 save_config 统一回滚。
 
         命令层直接 `self.config[key] = value` 再 save 的话，落盘失败后进程内会
-        留下未落盘的新值；这里把"改了哪个键"显式登记下来，回滚只碰这一个键，
-        不会误删框架在保存过程中注入的内部键
-        （PR #289 审查：overbroad-memory-rollback）。
+        留下未落盘的新值；这里把"改了哪个键"及其写前值显式登记下来交给
+        save_config——因为 save_config 的快照是在本次改动**之后**才拍的，
+        自己拿不到旧值。
+
+        回滚只发生在 save_config 里，这里不再二次写值：两层各改一遍很容易把
+        已恢复的旧值又覆盖成新值（PR #289 审查：double-rollback-corruption）。
         """
         with self._lock:
-            had_key = isinstance(self.config, dict) and key in self.config
-            prev_value = copy.deepcopy(self.config.get(key)) if isinstance(self.config, dict) else None
+            if isinstance(self.config, dict):
+                self._touched_prev = {key: (copy.deepcopy(self.config.get(key)), key in self.config)}
+            else:
+                self._touched_prev = {}
             self._touched_keys = (key,)
             if isinstance(self.config, dict):
                 self.config[key] = value
             try:
                 self.save_config()
             except Exception:
-                try:
-                    if had_key:
-                        self.config[key] = prev_value
-                    else:
-                        self.config.pop(key, None)
-                except Exception as e:
-                    logger.error(f"[群管插件] 回滚全局配置项 {key} 失败: {e}")
                 self._touched_keys = ()
+                self._touched_prev = {}
                 raise
 
     def _snapshot_framework_file(self):
@@ -262,20 +270,31 @@ class ConfigStore:
             return e
         return None
 
-    def _restore_framework_config(self, prev_global, touched=None):
+    def _restore_framework_config(self, prev_global, touched=None, touched_prev=None):
         """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
 
-        只做两件安全的事：把快照里存在的键改回原值；把"本次新增且可确认属于
+        只做两件安全的事：把目标快照里的键改回原值；把"本次新增且可确认属于
         插件"的键删掉——可确认 = 通过 set_global_setting 显式登记，或在
         _conf_schema.json 里有声明（业务层直接改 `self.config` 绕过了登记时
         仍然能收拾掉）。框架自己注入的内部键既不在 touched 里也没有 schema
         声明，因此不会被误删（PR #289 审查：overbroad-memory-rollback /
         unregistered-global-write）。
+
+        touched_prev 是 set_global_setting 记下的"这些键的写前值"：save_config
+        的快照是在调用方改完之后才拍的，必须用它把目标快照修正回真正的写前状态，
+        否则回滚会把新值当成旧值留下来（PR #289 审查：double-rollback-corruption）。
         """
         if prev_global is None or not isinstance(self.config, dict):
             return None
+        target = dict(prev_global)
+        for key, info in (touched_prev or {}).items():
+            value, had_key = info
+            if had_key:
+                target[key] = value
+            else:
+                target.pop(key, None)
         failures = []
-        for key, value in prev_global.items():
+        for key, value in target.items():
             try:
                 if key in self.config and self.config[key] == value:
                     continue
@@ -283,7 +302,7 @@ class ConfigStore:
             except Exception as e:
                 failures.append(e)
         try:
-            new_keys = [k for k in self.config.keys() if k not in prev_global]
+            new_keys = [k for k in self.config.keys() if k not in target]
         except Exception:
             new_keys = []
         removable = [

@@ -157,7 +157,7 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_unsupported_does_not_requery_per_candidate(self):
         api = self.make_api(None, {"status": "failed", "retcode": -1})
-        ok, _ = await api._add_group_tag(None, "100", "标签A")
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签A")
         self.assertFalse(ok)
         # 只探一次读能力；读不回来时无法确认是否已生效，只打一个最匹配的
         # action 就停手，不再拿含糊失败去试其余变体（duplicate-side-effect）
@@ -170,7 +170,7 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         # 但不会降级到覆盖型 set_group_tag——读不回来就无法确认它有没有把
         # 本群其它标签整体改写掉（PR #289 审查：unsafe-action-fallback）。
         api = self.make_api(None, {"status": "failed", "wording": "unknown action"})
-        ok, _ = await api._add_group_tag(None, "100", "标签A")
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签A")
         self.assertFalse(ok)
         self.assertEqual(
             [c[0] for c in self.action_calls],
@@ -181,13 +181,13 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         # 读接口不可用 + 首个 action 回应含糊（有载荷但没有 status/retcode）：
         # 按成功处理并立即返回，不再重复调用其余有副作用的变体
         api = self.make_api(None, {"data": None})
-        ok, _ = await api._add_group_tag(None, "100", "标签B")
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签B")
         self.assertTrue(ok)
         self.assertEqual(len(self.action_calls), 1)
 
     async def test_preexisting_tag_skips_side_effect(self):
         api = self.make_api(["标签A"], {"status": "ok"})
-        ok, result = await api._add_group_tag(None, "100", "标签A")
+        ok, result, _warn = await api._add_group_tag(None, "100", "标签A")
         self.assertTrue(ok)
         self.assertIsNone(result)
         self.assertEqual(self.action_calls, [])
@@ -195,14 +195,14 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_success_response_without_status_returns_early(self):
         api = self.make_api([], {"data": None})
-        ok, _ = await api._add_group_tag(None, "100", "标签B")
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签B")
         self.assertTrue(ok)
         # 首个候选即成功，不再尝试其余变体
         self.assertEqual(len(self.action_calls), 1)
 
     async def test_missing_tag_after_all_candidates_fails(self):
         api = self.make_api([], {"status": "failed", "retcode": -1})
-        ok, _ = await api._add_group_tag(None, "100", "标签C")
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签C")
         self.assertFalse(ok)
         self.assertEqual(len(self.action_calls), 4)
 
@@ -211,14 +211,18 @@ class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
     """覆盖型 set_group_tag 只能"读得通"时才用，且要补回被挤掉的旧标签。
 
     PR #289 审查：unsafe-action-fallback——set_group_tag 可能整体改写标签集合，
-    读接口不可用时无法发现副作用，也不该自动降级过去。
+    读接口不可用时无法发现副作用，也不该自动降级过去；
+    ignored-side-effect-failure——补回旧标签时不能只看有没有抛异常。
     """
 
-    def make_api(self, tags, read_ok=True):
+    def make_api(self, tags, read_ok=True, restore_add_works=True):
         api = OneBotApi.__new__(OneBotApi)
         self.tags = list(tags)
+        self.baseline = list(tags)
         self.calls = []
         self.read_ok = read_ok
+        # 补回旧标签时 add_group_tag 是否真的生效（模拟协议端接受/拒绝）
+        self.restore_add_works = restore_add_works
 
         async def fake_get_tags(event, group_id):
             if not self.read_ok:
@@ -227,13 +231,17 @@ class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_call(event, action, **params):
             self.calls.append((action, params))
+            tag = params.get("tag") or (params.get("tags") or [""])[0]
             if action == "set_group_tag":
-                new_tag = params.get("tag") or (params.get("tags") or [""])[0]
                 # 覆盖语义：整体改写，原有标签全部丢失
-                self.tags[:] = [new_tag]
+                self.tags[:] = [tag]
                 return {"status": "ok"}
             if action == "add_group_tag":
-                # 模拟"协议端不认识这个 action"：没有任何副作用
+                # 只让"补回原有标签"的调用生效，新增的标签一律当"action 不支持"
+                if self.restore_add_works and tag in self.baseline:
+                    if tag not in self.tags:
+                        self.tags.append(tag)
+                    return {"status": "ok"}
                 return {"status": "failed", "wording": "unknown action"}
             return {"status": "failed", "wording": "unknown action"}
 
@@ -242,19 +250,28 @@ class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
         return api
 
     async def test_overwrite_action_restores_displaced_tags(self):
-        api = self.make_api(["旧标签1", "旧标签2"])
-        ok, _ = await api._add_group_tag(None, "100", "新标签")
+        api = self.make_api(["旧标签1", "旧标签2"], restore_add_works=True)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
         self.assertTrue(ok)
+        self.assertEqual(warn, "")
         # 走的是覆盖型接口，且把被挤掉的两个旧标签补了回来
         self.assertIn("set_group_tag", [a for a, _ in self.calls])
-        restored = [p.get("tag") for a, p in self.calls
-                    if a == "add_group_tag" and p.get("tag") in ("旧标签1", "旧标签2")]
-        self.assertEqual(sorted(restored), ["旧标签1", "旧标签2"])
+        self.assertEqual(sorted(self.tags), sorted(["旧标签1", "旧标签2", "新标签"]))
+
+    async def test_restore_failure_is_reported(self):
+        # 补回的 action 返回 failed 但没有异常：不能当成"已恢复"，
+        # 必须回报 tags_may_be_lost 让管理员人工核对
+        # （PR #289 审查：ignored-side-effect-failure）。
+        api = self.make_api(["旧标签1", "旧标签2"], restore_add_works=False)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "tags_may_be_lost")
 
     async def test_overwrite_action_not_used_without_read(self):
         api = self.make_api([], read_ok=False)
-        ok, _ = await api._add_group_tag(None, "100", "新标签")
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
         self.assertFalse(ok)
+        self.assertEqual(warn, "")
         self.assertEqual({a for a, _ in self.calls}, {"add_group_tag"})
 
 

@@ -4,6 +4,7 @@ config-override-cannot-clear）。
 只依赖标准库 + cop 包本身，用最小桩替换 astrbot.api.logger。
 """
 
+import copy
 import json
 import sys
 import tempfile
@@ -125,6 +126,18 @@ class _BypassWriteConfig(_FailingConfig):
         self["framework_helper_key"] = "内部键"
         if self.fail:
             raise OSError("config.json 写入失败（模拟）")
+
+
+class _CountingRollbackConfig(_FailingConfig):
+    """记录每次赋值，用来验证同一个键在回滚里只被写一次。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.writes = []
+
+    def __setitem__(self, key, value):
+        self.writes.append((key, copy.deepcopy(value)))
+        super().__setitem__(key, value)
 
 
 class _JsonStore:
@@ -778,6 +791,18 @@ class GroupOverrideTests(unittest.TestCase):
         with self.assertRaises(OSError):
             store.set_global_setting("whitelist_users", ["changed"])
         self.assertEqual(config["whitelist_users"], ["g1"])
+
+    def test_global_setting_rolls_back_only_once(self):
+        # set_global_setting 不再自己回滚，全部交给 save_config：同一个键只写回
+        # 一次旧值，避免两层回滚把已恢复的旧值又覆盖回新值
+        # （PR #289 审查：double-rollback-corruption）。
+        config = _CountingRollbackConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.set_global_setting("whitelist_users", ["changed"])
+        writes = [v for k, v in config.writes if k == "whitelist_users"]
+        self.assertEqual(writes, [["changed"], ["g1"]])
 
     def test_unregistered_schema_key_is_removed_on_failure(self):
         # 业务层绕过 set_global_setting 直接写配置时，回滚仍能收拾"schema 内的
