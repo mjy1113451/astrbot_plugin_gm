@@ -496,6 +496,35 @@ class GroupOverrideTests(unittest.TestCase):
             store.get_group_setting("100", "whitelist_users").count("g1"), 1
         )
 
+    def test_explicit_snapshot_is_not_reattached_to_baseline(self):
+        # set_group_override 是显式整体赋值：之后模板/全局怎么变都以这份快照为
+        # 基线，增删只在快照上叠加，不能被重新挂回模板/全局
+        # （PR #289 审查：explicit-snapshot-semantics-loss）。
+        config = _Config(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.set_group_override("100", "whitelist_users", ["s1", "s2"])
+        config["whitelist_users"] = ["g1", "g2"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["s1", "s2"]
+        )
+        ok, current = store.mutate_group_list("100", "whitelist_users", "add", "s3")
+        self.assertTrue(ok)
+        self.assertEqual(current, ["s1", "s2", "s3"])
+        # 全局再改也不影响本群：基线是快照而不是全局名单
+        config["whitelist_users"] = ["g3"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["s1", "s2", "s3"]
+        )
+        store.mutate_group_list("100", "whitelist_users", "remove", "s1")
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["s2", "s3"]
+        )
+        # 清除覆盖（值 + 增量 + 快照标记）后回到跟随全局
+        self.assertTrue(store.drop_group_override("100", "whitelist_users"))
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g3"]
+        )
+
     def test_legacy_plain_snapshot_survives_first_add(self):
         # 升级前 runtime.json 里的普通列表快照（没有 __list_ops__）首次被增删时
         # 必须转成增量继承下来，不能用"模板/全局基线 + 本次新增"把它覆盖掉

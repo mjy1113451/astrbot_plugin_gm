@@ -2593,9 +2593,8 @@ class GroupAdminPlugin(Star):
             if key not in gconf:
                 yield event.plain_result(f"本群未设置 {key}")
                 return
-            del gconf[key]
-            self._store.drop_list_ops(group_id, key)
-            self._store.save_config()
+            # 值 + 增量操作 + 整体快照标记一起清，避免残留让本群配置"复活"
+            self._store.drop_group_override(group_id, key)
             yield event.plain_result(f"已清除本群 {key} 覆盖")
         else:
             overrides = self._store.runtime_map("group_overrides")

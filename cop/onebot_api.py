@@ -480,6 +480,11 @@ class OneBotApi:
         读回只在"读得通"时才做，且每个候选最多读一次：协议端压根不支持
         get_group_tags 时首轮就读失败，后续候选不再重复查询，避免一次添加
         打出 4 次无效请求（PR #289 审查：duplicate-side-effect）。
+
+        读接口不可用时只剩"按 action 结果判定"这一条路，此时重试门槛更高：
+        只有响应明确指出 action/参数不被接受才换下一个变体，权限不足、群号
+        错误、响应结构含糊（读不回来也无法确认是否已生效）一律停手，避免对
+        同一个有副作用的 action 反复执行（PR #289 审查：duplicate-side-effect）。
         """
         # 读接口能力先探一次：探不通就彻底不做读回，只按 action 结果判定
         baseline_ok, baseline_tags = await self._group_tags_read(event, group_id)
@@ -487,26 +492,37 @@ class OneBotApi:
             # 标签本来就在：幂等成功，不再调用有副作用的 action
             return True, None
         read_supported = baseline_ok
-        last = None
-        for action, extra in (
+        candidates = (
             ("add_group_tag", {"tag": tag}),
             ("add_group_tag", {"tags": [tag]}),
             ("set_group_tag", {"tag": tag}),
             ("set_group_tag", {"tags": [tag]}),
-        ):
+        )
+        last = None
+        for index, (action, extra) in enumerate(candidates):
             p = {"group_id": str(group_id)}
             p.update(extra)
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
                 return True, last
-            if not read_supported:
-                continue
-            read_ok, tags = await self._group_tags_read(event, group_id)
-            if read_ok and tag in tags:
-                return True, last
-            if not read_ok:
-                # 中途读不通了：后续候选不再重复查询
-                read_supported = False
+            # 读回是判断"到底生效没"的唯一依据：确认标签不在才能放心换变体重试
+            confirmed_absent = False
+            if read_supported:
+                read_ok, tags = await self._group_tags_read(event, group_id)
+                if read_ok and tag in tags:
+                    return True, last
+                if not read_ok:
+                    # 中途读不通了：后续候选不再重复查询
+                    read_supported = False
+                else:
+                    confirmed_absent = True
+            if index + 1 >= len(candidates):
+                break
+            # 读不回来时无法确认上一次是否已生效，只有"action/参数不被接受"
+            # 才换变体；含糊响应一律停手，避免重复执行有副作用的 action
+            if not self._failure_invites_retry(
+                    last, action, ambiguous_retry=confirmed_absent):
+                break
         return False, last
 
     async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
@@ -563,12 +579,16 @@ class OneBotApi:
         return False, last, ""
 
     @staticmethod
-    def _failure_invites_retry(result, action: str) -> bool:
+    def _failure_invites_retry(result, action: str, ambiguous_retry: bool = True) -> bool:
         """失败是否属于"换个参数/action 还能成"的类型（决定要不要重试）。
 
         只有"接口/参数不被接受"才值得换变体；权限不足、群号错误等失败继续
         重试只会对同一个有副作用的 action 重复执行（PR #289 审查：
         duplicate-side-effect）。
+
+        ambiguous_retry 控制"响应结构含糊（无 status/retcode 也没有错误文案）"
+        是否算可重试：删除有读回兜底，可以再试一次变体；添加在读接口不可用时
+        无法确认上一次到底生效没有，必须停手。
         """
         if result is None:
             return True   # 无可用调用通路：可能别的 action 名可用
@@ -576,8 +596,8 @@ class OneBotApi:
             str(result.get(k, "")) for k in ("message", "msg", "wording", "error", "errmsg")
         ).lower()
         if not text.strip():
-            # 结构含糊（只有 retcode）：换一个参数变体成本低，允许一次
-            return True
+            # 结构含糊（只有 retcode 或空响应）
+            return bool(ambiguous_retry)
         hints = ("unknown action", "unknown method", "no such action", "not found",
                  "unsupported", "not support", "不支持", "参数", "param")
         blockers = ("权限", "permission", "forbidden", "denied", "not admin",

@@ -458,6 +458,13 @@ class ConfigStore:
     # （PR #289 审查：lossy-list-diff）。
     _LIST_OPS = "__list_ops__"
 
+    # 整体快照标记：group_overrides[群号][__list_snapshot__][key] = True
+    # 表示该键的值是"显式整体赋值"（set_group_override / WebUI 整体写），
+    # 合并基线就是这份快照本身，不随模板/全局变化；没有这个标记的普通列表
+    # 才是旧版残留快照，首次变更时转成增量（_adopt_snapshot）
+    # （PR #289 审查：explicit-snapshot-semantics-loss）。
+    _LIST_SNAPSHOT = "__list_snapshot__"
+
     @staticmethod
     def _as_str_list(value) -> list:
         """把任意配置值规整成去空白的字符串列表。"""
@@ -466,6 +473,40 @@ class ConfigStore:
         if isinstance(value, str):
             return [x for x in re.split(r"[,，;；\s]+", value) if x]
         return [] if value is None else [str(value).strip()]
+
+    def _is_explicit_snapshot(self, group_id: str, key: str) -> bool:
+        """该键的运行时值是否为"显式整体快照"（不参与基线重算）。"""
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        meta = overrides.get(self._LIST_SNAPSHOT) if isinstance(overrides, dict) else None
+        return bool(isinstance(meta, dict) and meta.get(key))
+
+    def _mark_explicit_snapshot(self, group_id: str, key: str, on: bool = True) -> None:
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.get(str(group_id))
+        if not isinstance(gconf, dict):
+            if not on:
+                return
+            gconf = overrides.setdefault(str(group_id), {})
+        meta = gconf.get(self._LIST_SNAPSHOT)
+        if on:
+            if not isinstance(meta, dict):
+                meta = {}
+                gconf[self._LIST_SNAPSHOT] = meta
+            meta[key] = True
+            return
+        if isinstance(meta, dict):
+            meta.pop(key, None)
+            if not meta:
+                gconf.pop(self._LIST_SNAPSHOT, None)
+
+    def _list_baseline(self, group_id: str, key: str) -> list:
+        """列表合并用的基线：显式整体快照 > 模板 > 全局。"""
+        if self._is_explicit_snapshot(group_id, key):
+            overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+            snapshot = overrides.get(key) if isinstance(overrides, dict) else None
+            if isinstance(snapshot, list):
+                return self._as_str_list(snapshot)
+        return self._as_str_list(self._template_or_global_setting(group_id, key, []))
 
     def _list_ops(self, group_id: str, key: str) -> dict:
         """取某个列表键的增量操作（没有则返回空操作）。
@@ -524,13 +565,13 @@ class ConfigStore:
                 gconf.pop(self._LIST_OPS, None)
 
     def _merge_list_ops(self, group_id: str, key: str, ops=None) -> list:
-        """把增量操作套到最新的模板/全局基线上得到生效列表。"""
+        """把增量操作套到基线上得到生效列表（基线见 _list_baseline）。"""
         ops = ops if ops is not None else self._list_ops(group_id, key)
         removed_baseline = ops.get("removed_baseline") or {}
         merged = []
         # 名单类配置按"值集合"语义生效：基线里的重复值只保留一份，
         # 添加也保持首次出现顺序（PR #289 审查：lossy-list-diff）。
-        for item in self._as_str_list(self._template_or_global_setting(group_id, key, [])):
+        for item in self._list_baseline(group_id, key):
             if item in ops["removed"] and removed_baseline.get(item, True):
                 # 只有"删的是基线里的项"才一直压住；本群自己加又删掉的项，
                 # 基线后续新增时仍然生效（否则删一次等于永久屏蔽全局名单）
@@ -549,10 +590,13 @@ class ConfigStore:
     def _adopt_snapshot(self, group_id: str, key: str, baseline: list, ops: dict) -> dict:
         """首次变更旧版"普通列表快照"时，先把快照转成增量操作再叠加。
 
-        老版本（以及 set_group_override 的整体赋值）直接在 group_overrides 里
-        写完整列表、没有 __list_ops__ 记录。若不做转换，第一次增删就会用
-        "模板/全局基线 + 本次操作"覆盖掉快照，本群原有的名单条目会静默消失
-        （PR #289 审查：legacy-data-loss）。
+        老版本直接在 group_overrides 里写完整列表、没有 __list_ops__ 记录。
+        若不做转换，第一次增删就会用"模板/全局基线 + 本次操作"覆盖掉快照，
+        本群原有的名单条目会静默消失（PR #289 审查：legacy-data-loss）。
+
+        带 __list_snapshot__ 标记的显式整体赋值不走这里——那种键的基线就是
+        快照本身（见 _list_baseline），转换反而会把它挂回模板/全局
+        （PR #289 审查：explicit-snapshot-semantics-loss）。
 
         转换规则：快照里有、基线里没有的项记 added；基线里有、快照里没有的项
         记 removed（来源记为基线，与手动删除同语义）。转换后合并结果与快照一致，
@@ -561,6 +605,8 @@ class ConfigStore:
         overrides = self.runtime_map("group_overrides")
         gconf = overrides.get(str(group_id))
         if not isinstance(gconf, dict):
+            return ops
+        if self._is_explicit_snapshot(group_id, key):
             return ops
         snapshot = gconf.get(key)
         if not isinstance(snapshot, list):
@@ -586,8 +632,9 @@ class ConfigStore:
         第一次变更旧版普通列表快照时先把快照转成增量（见 _adopt_snapshot）。
         """
         ops = self._list_ops(group_id, key)
-        # 记录删除时的基线（模板/全局）内容，供后续区分"删的是谁的项"
-        baseline = self._as_str_list(self._template_or_global_setting(group_id, key, []))
+        # 记录删除时的基线内容（显式快照 / 模板 / 全局），供后续区分"删的是谁的项"
+        baseline = self._list_baseline(group_id, key)
+        explicit_snapshot = self._is_explicit_snapshot(group_id, key)
         if not (ops["added"] or ops["removed"]):
             ops = self._adopt_snapshot(group_id, key, baseline, ops)
         for item in add:
@@ -614,7 +661,9 @@ class ConfigStore:
         overrides = self.runtime_map("group_overrides")
         gconf = overrides.setdefault(str(group_id), {})
         self._store_list_ops(group_id, key, ops)
-        if ops["added"] or ops["removed"]:
+        if ops["added"] or ops["removed"] or explicit_snapshot:
+            # 显式整体赋值即使增删互相抵消也保留快照：它的基线就是这份值，
+            # 删掉就等于把本群配置改回跟随模板/全局
             gconf[key] = merged
         else:
             # 增删互相抵消后没有任何增量：删掉物化的运行时值，让读取重新
@@ -638,6 +687,7 @@ class ConfigStore:
             gconf = overrides.get(str(group_id))
             prev_value = copy.deepcopy(gconf.get(key)) if isinstance(gconf, dict) else None
             prev_ops = copy.deepcopy(gconf.get(self._LIST_OPS)) if isinstance(gconf, dict) else None
+            prev_marks = copy.deepcopy(gconf.get(self._LIST_SNAPSHOT)) if isinstance(gconf, dict) else None
             merged = self._apply_list_ops(group_id, key, add, remove)
             try:
                 self.save_config()
@@ -651,6 +701,10 @@ class ConfigStore:
                     gconf.pop(self._LIST_OPS, None)
                 else:
                     gconf[self._LIST_OPS] = prev_ops
+                if prev_marks is None:
+                    gconf.pop(self._LIST_SNAPSHOT, None)
+                else:
+                    gconf[self._LIST_SNAPSHOT] = prev_marks
                 # 本次写入前本群没有任何覆盖时，回滚后不留空字典
                 if not gconf and not had_group:
                     overrides.pop(str(group_id), None)
@@ -706,15 +760,39 @@ class ConfigStore:
             return []
         return [value] if value else []
 
+    def drop_group_override(self, group_id: str, key: str) -> bool:
+        """清除本群某个配置项（连同增量操作与整体快照标记）并落盘。
+
+        返回是否确实删掉了东西。三个痕迹要一起清：只删值会留下 __list_ops__
+        反向"复活"本群配置，只删 ops 会留下 __list_snapshot__ 让后续读取
+        继续把这份值当基线（PR #289 审查：explicit-snapshot-semantics-loss）。
+        """
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            gconf = overrides.get(str(group_id))
+            if not isinstance(gconf, dict) or key not in gconf:
+                return False
+            del gconf[key]
+            self.drop_list_ops(group_id, key)
+            self._mark_explicit_snapshot(group_id, key, False)
+            if not gconf:
+                overrides.pop(str(group_id), None)
+            self.save_config()
+            return True
+
     def set_group_override(self, group_id: str, key: str, value) -> None:
         """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。
 
-        列表值按"显式整体设置"处理：清掉该键的增量操作，此后以这份快照为准。
+        列表值按"显式整体设置"处理：清掉该键的增量操作并打上整体快照标记，
+        此后以这份快照为基线（不随模板/全局变化）。标记与"旧版残留列表"区分开，
+        后者在首次增删时才转成增量操作
+        （PR #289 审查：explicit-snapshot-semantics-loss）。
         """
         with self._lock:
             overrides = self.runtime_map("group_overrides")
             overrides.setdefault(str(group_id), {})[key] = value
             self.drop_list_ops(group_id, key)
+            self._mark_explicit_snapshot(group_id, key, isinstance(value, list))
             self.save_config()
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:

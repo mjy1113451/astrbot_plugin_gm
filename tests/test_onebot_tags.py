@@ -159,9 +159,30 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         api = self.make_api(None, {"status": "failed", "retcode": -1})
         ok, _ = await api._add_group_tag(None, "100", "标签A")
         self.assertFalse(ok)
-        # 只探一次读能力，其余 4 个候选都不再读回
+        # 只探一次读能力；读不回来时无法确认是否已生效，只打一个最匹配的
+        # action 就停手，不再拿含糊失败去试其余变体（duplicate-side-effect）
         self.assertEqual(self.read_calls, 1)
+        self.assertEqual(len(self.action_calls), 1)
+        self.assertEqual(self.action_calls[0][0], "add_group_tag")
+
+    async def test_unsupported_action_still_falls_back_when_read_unavailable(self):
+        # 明确"不认识这个 action"时换变体是安全的：上一次根本没被执行
+        api = self.make_api(None, {"status": "failed", "wording": "unknown action"})
+        ok, _ = await api._add_group_tag(None, "100", "标签A")
+        self.assertFalse(ok)
         self.assertEqual(len(self.action_calls), 4)
+        self.assertEqual(
+            [c[0] for c in self.action_calls],
+            ["add_group_tag", "add_group_tag", "set_group_tag", "set_group_tag"],
+        )
+
+    async def test_ambiguous_success_without_read_back_stops_after_one_call(self):
+        # 读接口不可用 + 首个 action 回应含糊（有载荷但没有 status/retcode）：
+        # 按成功处理并立即返回，不再重复调用其余有副作用的变体
+        api = self.make_api(None, {"data": None})
+        ok, _ = await api._add_group_tag(None, "100", "标签B")
+        self.assertTrue(ok)
+        self.assertEqual(len(self.action_calls), 1)
 
     async def test_preexisting_tag_skips_side_effect(self):
         api = self.make_api(["标签A"], {"status": "ok"})
