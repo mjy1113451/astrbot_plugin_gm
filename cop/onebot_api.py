@@ -648,6 +648,14 @@ class OneBotApi:
                     if tag in tags:
                         return True, last, ""
                     confirmed_absent = True
+                    if self._action_result_explicit_success(last):
+                        # 明确成功却读不回来：重复执行同一个有副作用的 action
+                        # 只会多做一次无效改写，直接按"未生效"上报
+                        # （PR #289 审查：unnecessary-side-effect-retry）
+                        logger.warning(
+                            f"[OneBot] add_group_tag 回报成功但读回仍无该标签，"
+                            f"不再重复调用（群 {group_id} 标签 {tag}）")
+                        return False, last, ""
                 else:
                     read_supported = False
             if index + 1 >= len(candidates):

@@ -255,9 +255,18 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.action_calls), 1)
         self.assertEqual(self.read_calls, 2)
 
-    async def test_success_response_without_tag_added_tries_other_variant(self):
-        # 动作回成功但读回一直没有该标签：确认没生效，可以安全换参数变体（纯新增）
+    async def test_explicit_success_without_tag_added_stops_immediately(self):
+        # 明确成功但读回仍没有该标签：不再换参数变体重复执行有副作用的调用
+        # （PR #289 审查：unnecessary-side-effect-retry）。
         api = self.make_api([], {"status": "ok"})
+        ok, _, warn = await api._add_group_tag(None, "100", "标签B")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "")
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"])
+
+    async def test_ambiguous_failure_with_confirmed_absence_tries_variant(self):
+        # 响应含糊 + 读回确认目标确实不在：换参数变体是安全的（上一次没生效）
+        api = self.make_api([], {"status": "failed"})
         ok, _, warn = await api._add_group_tag(None, "100", "标签B")
         self.assertFalse(ok)
         self.assertEqual(warn, "")
