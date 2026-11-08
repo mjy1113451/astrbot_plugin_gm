@@ -2209,10 +2209,7 @@ class GroupAdminPlugin(Star):
                 group_id, "banned_images", "add", md5
             )
         except Exception as e:
-            # 持久化失败时回滚内存态，避免用户下次被提示『已存在』
-            runtime = self._store.runtime_group_list(group_id, "banned_images")
-            if md5 in runtime:
-                runtime.remove(md5)
+            # 持久化失败：ConfigStore 已回滚运行时覆盖本体，这里只记录并回复
             logger.error(f"保存违禁图片配置失败: {e}")
             yield event.plain_result("保存失败，未添加该违禁图片")
             return
@@ -2255,10 +2252,7 @@ class GroupAdminPlugin(Star):
                 group_id, "banned_images", "remove", target
             )
         except Exception as e:
-            # 持久化失败时回滚内存态
-            runtime = self._store.runtime_group_list(group_id, "banned_images")
-            if target not in runtime:
-                runtime.append(target)
+            # 持久化失败：ConfigStore 已回滚运行时覆盖本体，这里只记录并回复
             logger.error(f"保存违禁图片配置失败: {e}")
             yield event.plain_result("保存失败，未删除该违禁图片")
             return
@@ -2622,7 +2616,7 @@ class GroupAdminPlugin(Star):
                 yield event.plain_result(f"本群未设置 {key}")
                 return
             del gconf[key]
-            self._store.drop_list_baseline(group_id, key)
+            self._store.drop_list_ops(group_id, key)
             self._store.save_config()
             yield event.plain_result(f"已清除本群 {key} 覆盖")
         else:

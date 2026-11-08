@@ -718,7 +718,7 @@
                         "description": "AI 分级禁言时长（秒，#243）",
                         "type": "dict",
                         "hint": "格式 {\"mild\":180,\"medium\":600,\"severe\":1800}，留空回退全局",
-                        "default": {}
+                        "default": {"mild": 180, "medium": 600, "severe": 1800}
                     },
                     "ad_check_enabled": {
                         "description": "启用广告检测",
@@ -733,8 +733,8 @@
                     "ad_keywords": {
                         "description": "广告关键词列表",
                         "type": "list",
-                        "hint": "留空回退全局 ad_keywords",
-                        "default": []
+                        "hint": "留空回退全局 ad_keywords 本项默认值与全局一致：不填时沿用全局；要清空本群广告词，请把列表删成空数组并在「显式覆盖字段」里写上 ad_keywords。",
+                        "default": ["加群", "加微信", "加QQ", "联系我", "私聊", "代练", "代打", "刷钻", "刷币", "外挂", "辅助", "出售", "转让", "低价", "优惠", "促销", "折扣", "代购", "微商", "兼职", "赚钱", "日赚", "月入", "进群"]
                     },
                     "ad_check_link_content": {
                         "description": "链接目标页广告内容检测（#274）",
@@ -764,7 +764,7 @@
                     "link_safety_whitelist": {
                         "description": "不安全网站检测域名白名单",
                         "type": "list",
-                        "default": []
+                        "default": ["douyin.com", "bilibili.com"]
                     },
                     "link_safety_ban_duration": {
                         "description": "不安全网站违规禁言时长（秒）",

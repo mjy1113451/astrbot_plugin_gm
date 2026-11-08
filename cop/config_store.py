@@ -9,6 +9,7 @@
 - 原 main.py 中的方法体逻辑逐字保留（含异常兜底、注释语义），仅参数名从 self.xxx 改为存储字段。
 """
 
+import copy
 import json
 
 import re
@@ -136,32 +137,24 @@ class ConfigStore:
     def mutate_group_list(self, group_id: str, key: str, op: str, value: str) -> tuple:
         """群 list 配置的原子读-改-写（review#192 race-condition）。
 
-        取列表→增/删→落盘 全程在 _CFG_LOCK 内串行化，避免并发覆盖丢失更新；
-        返回 (ok, 当前列表拷贝)。
+        读生效值 → 判断是否真的会变 → 记录增量操作 → 落盘，全程在 _CFG_LOCK
+        内串行化，避免并发覆盖丢失更新；返回 (ok, 当前生效列表拷贝)。
 
-        先用只读接口判断本次操作是否真的会改变列表，只有确定要写入时才创建
-        运行时覆盖（以当前生效值为基线），失败路径不留下任何 group_overrides
-        痕迹（PR #289 审查：unexpected-runtime-materialization）。
+        没有任何变化时不做写入，不留下 group_overrides 痕迹
+        （PR #289 审查：unexpected-runtime-materialization）；
+        落盘失败会回滚运行时对象（rollback-not-persisted）。
         """
         with self._lock:
             current = self.get_group_override_list(group_id, key)
             if op == "add":
                 if any(str(x) == value for x in current):
                     return False, list(current)
+                merged = self._commit_list_change(group_id, key, add=[value])
             else:
                 if not any(str(x) == value for x in current):
                     return False, list(current)
-            lst = self.get_group_override_list(group_id, key, for_update=True)
-            if op == "add":
-                lst.append(value)
-            else:
-                target = next((x for x in list(lst) if str(x) == value), None)
-                if target is None:
-                    return False, list(lst)
-                lst.remove(target)
-            self._refresh_after_list_write(group_id, key)
-            self.save_config()
-            return True, list(lst)
+                merged = self._commit_list_change(group_id, key, remove=[value])
+            return True, list(merged)
 
     # ===================== stats / reports =====================
 
@@ -224,7 +217,10 @@ class ConfigStore:
         if isinstance(overrides, dict) and key in overrides:
             value = overrides[key]
             if isinstance(value, list):
-                return self._merge_runtime_list(group_id, key, value)
+                # 有增量操作时以最新模板/全局基线重算，否则按整体快照返回
+                if self._has_list_ops(group_id, key):
+                    return self._merge_list_ops(group_id, key)
+                return self._as_str_list(value)
             return value
         return self._template_or_global_setting(group_id, key, default)
 
@@ -360,10 +356,11 @@ class ConfigStore:
 
     # ===================== 按群覆盖读写 =====================
 
-    # 运行时列表快照的基线记录：group_overrides[群号][__list_baseline__][key]
-    # = {"value": [...创建快照时的模板/全局值...]}，用于在模板/全局变化后
-    # 重新合并，而不是让一次性快照永久遮蔽 WebUI 配置。
-    _LIST_BASELINE = "__list_baseline__"
+    # 运行时列表的增量操作记录：group_overrides[群号][__list_ops__][key]
+    # = {"added": [...], "removed": [...]}，生效值 = 模板/全局基线 应用这些操作。
+    # 不靠"最终列表减去基线"反推操作——那样无法表达重复项与顺序意图
+    # （PR #289 审查：lossy-list-diff）。
+    _LIST_OPS = "__list_ops__"
 
     @staticmethod
     def _as_str_list(value) -> list:
@@ -374,59 +371,113 @@ class ConfigStore:
             return [x for x in re.split(r"[,，;；\s]+", value) if x]
         return [] if value is None else [str(value).strip()]
 
-    def _list_baseline_meta(self, group_id: str, key: str):
+    def _list_ops(self, group_id: str, key: str) -> dict:
+        """取某个列表键的增量操作（没有则返回空操作）。"""
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
-        meta = overrides.get(self._LIST_BASELINE) if isinstance(overrides, dict) else None
-        info = meta.get(key) if isinstance(meta, dict) else None
-        return info if isinstance(info, dict) else None
+        meta = overrides.get(self._LIST_OPS) if isinstance(overrides, dict) else None
+        ops = meta.get(key) if isinstance(meta, dict) else None
+        if not isinstance(ops, dict):
+            return {"added": [], "removed": []}
+        return {
+            "added": self._as_str_list(ops.get("added")),
+            "removed": self._as_str_list(ops.get("removed")),
+        }
 
-    def _merge_runtime_list(self, group_id: str, key: str, stored: list) -> list:
-        """把运行时列表快照与最新的模板/全局基线重新合并。
+    def _store_list_ops(self, group_id: str, key: str, ops: dict) -> None:
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.setdefault(str(group_id), {})
+        meta = gconf.get(self._LIST_OPS)
+        if not isinstance(meta, dict):
+            meta = {}
+            gconf[self._LIST_OPS] = meta
+        if ops["added"] or ops["removed"]:
+            meta[key] = {"added": list(ops["added"]), "removed": list(ops["removed"])}
+        else:
+            meta.pop(key, None)
+            if not meta:
+                gconf.pop(self._LIST_OPS, None)
 
-        快照 = 创建时的基线 + 后续增删。这里反推出"加了哪些、删了哪些"，
-        再套到当前基线之上——WebUI 模板/全局列表后来新增的项不会因为
-        本群曾经执行过一次 /添加白名单 就永久失效
-        （PR #289 审查：config-override-precedence-loss）。
-        """
-        info = self._list_baseline_meta(group_id, key)
-        if not info:
-            return self._as_str_list(stored)
-        old_base = self._as_str_list(info.get("value"))
-        current = self._as_str_list(stored)
-        added = [x for x in current if x not in old_base]
-        removed = {x for x in old_base if x not in current}
-        new_base = self._as_str_list(self._template_or_global_setting(group_id, key, []))
-        merged = [x for x in new_base if x not in removed]
-        for item in added:
+    def drop_list_ops(self, group_id: str, key: str) -> None:
+        """丢弃某 key 的增量操作：此后的运行时列表视为完整快照。"""
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.get(str(group_id))
+        meta = gconf.get(self._LIST_OPS) if isinstance(gconf, dict) else None
+        if isinstance(meta, dict):
+            meta.pop(key, None)
+            if not meta:
+                gconf.pop(self._LIST_OPS, None)
+
+    def _merge_list_ops(self, group_id: str, key: str, ops=None) -> list:
+        """把增量操作套到最新的模板/全局基线上得到生效列表。"""
+        ops = ops if ops is not None else self._list_ops(group_id, key)
+        merged = []
+        # 名单类配置按"值集合"语义生效：基线里的重复值只保留一份，
+        # 添加也保持首次出现顺序（PR #289 审查：lossy-list-diff）。
+        for item in self._as_str_list(self._template_or_global_setting(group_id, key, [])):
+            if item not in ops["removed"] and item not in merged:
+                merged.append(item)
+        for item in ops["added"]:
             if item not in merged:
                 merged.append(item)
         return merged
 
-    def _record_list_baseline(self, group_id: str, key: str) -> None:
-        """按当前模板/全局值记录基线，作为后续重算的锚点。"""
-        overrides = self.runtime_map("group_overrides")
-        gconf = overrides.get(str(group_id))
-        if not isinstance(gconf, dict):
-            return
-        meta = gconf.get(self._LIST_BASELINE)
-        if not isinstance(meta, dict):
-            meta = {}
-            gconf[self._LIST_BASELINE] = meta
-        meta[key] = {"value": self._as_str_list(self._template_or_global_setting(group_id, key, []))}
+    def _has_list_ops(self, group_id: str, key: str) -> bool:
+        ops = self._list_ops(group_id, key)
+        return bool(ops["added"] or ops["removed"])
 
-    def drop_list_baseline(self, group_id: str, key: str) -> None:
-        """公开入口：丢弃某 key 的列表派生基线（清除按群覆盖时调用）。"""
-        self._drop_list_baseline(group_id, key)
-
-    def _drop_list_baseline(self, group_id: str, key: str) -> None:
-        """丢弃基线记录：此后的运行时列表视为完整快照（显式整体设置）。"""
+    def _apply_list_ops(self, group_id: str, key: str, add=(), remove=()) -> list:
+        """记录一次增/删操作并物化生效列表（不做持久化，由调用方提交）。"""
+        ops = self._list_ops(group_id, key)
+        for item in add:
+            item = str(item).strip()
+            if not item:
+                continue
+            # 重新添加：撤销对应的删除意图，再记一次添加（重复项保持重复）
+            ops["removed"] = [x for x in ops["removed"] if x != item]
+            ops["added"] = list(ops["added"]) + [item]
+        for item in remove:
+            item = str(item).strip()
+            if not item:
+                continue
+            ops["added"] = [x for x in ops["added"] if x != item]
+            ops["removed"] = [x for x in ops["removed"] if x != item] + [item]
+        merged = self._merge_list_ops(group_id, key, ops)
         overrides = self.runtime_map("group_overrides")
-        gconf = overrides.get(str(group_id))
-        meta = gconf.get(self._LIST_BASELINE) if isinstance(gconf, dict) else None
-        if isinstance(meta, dict):
-            meta.pop(key, None)
-            if not meta:
-                gconf.pop(self._LIST_BASELINE, None)
+        gconf = overrides.setdefault(str(group_id), {})
+        gconf[key] = merged
+        self._store_list_ops(group_id, key, ops)
+        return merged
+
+    def _commit_list_change(self, group_id: str, key: str, add=(), remove=()) -> list:
+        """执行列表增删并落盘；保存失败时回滚运行时对象再抛出。
+
+        回滚直接改运行时覆盖本体（值 + 增量记录），不是改读出来的副本
+        （PR #289 审查：rollback-not-persisted）。
+        """
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            had_group = str(group_id) in overrides
+            gconf = overrides.get(str(group_id))
+            prev_value = copy.deepcopy(gconf.get(key)) if isinstance(gconf, dict) else None
+            prev_ops = copy.deepcopy(gconf.get(self._LIST_OPS)) if isinstance(gconf, dict) else None
+            merged = self._apply_list_ops(group_id, key, add, remove)
+            try:
+                self.save_config()
+            except Exception:
+                gconf = overrides.get(str(group_id)) or {}
+                if prev_value is None:
+                    gconf.pop(key, None)
+                else:
+                    gconf[key] = prev_value
+                if prev_ops is None:
+                    gconf.pop(self._LIST_OPS, None)
+                else:
+                    gconf[self._LIST_OPS] = prev_ops
+                # 本次写入前本群没有任何覆盖时，回滚后不留空字典
+                if not gconf and not had_group:
+                    overrides.pop(str(group_id), None)
+                raise
+            return merged
 
     def _effective_list(self, group_id: str, key: str) -> list:
         """当前生效的列表值（运行时 → 模板 → 全局），返回可安全改动的新列表。"""
@@ -440,69 +491,57 @@ class ConfigStore:
     def get_group_override_list(
         self, group_id: str, key: str, for_update: bool = False
     ) -> list:
-        """取本群覆盖列表。
+        """取本群覆盖列表（只读）。
 
-        - for_update=False（只读）：本群已有运行时覆盖时返回其"与最新模板/全局
-          合并后"的拷贝，否则返回当前生效值（模板/全局）的拷贝——不创建运行时
-          条目，避免"看一眼就把模板值冻结成本群快照"。
-        - for_update=True（写入）：本群还没有运行时覆盖时，以当前生效值为基线
-          创建条目并记录基线，增删操作在其上增量进行，不会整体遮蔽 WebUI 按群
-          模板里的列表（PR #289 审查：config-override-data-loss）。
+        - 有增量操作记录：与最新模板/全局基线合并后返回；
+        - 只有运行时快照（整体赋值 / 旧版本残留）：原样返回该快照；
+        - 都没有：返回当前生效值（模板/全局）的拷贝。
+
+        任何情况都不创建运行时条目——"看一眼"不该把模板值冻结成本群快照
+        （PR #289 审查：unexpected-runtime-materialization）。
+        for_update 参数保留以兼容旧调用点，语义上不再需要"可写本体"。
         """
-        # review#192 race-condition：首次创建也加锁，
-        # 避免并发首建同 (group_id,key) 产生多个空 list 互相覆盖；RLock 可重入
         with self._lock:
-            overrides = self.runtime_map("group_overrides")
-            gconf = overrides.get(str(group_id))
-            value = gconf.get(key) if isinstance(gconf, dict) else None
+            overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+            value = overrides.get(key) if isinstance(overrides, dict) else None
             if isinstance(value, list):
-                if for_update:
-                    return value
-                return self._merge_runtime_list(group_id, key, value)
-            if not for_update:
-                if value is None:
-                    return self._effective_list(group_id, key)
-                return [value] if value else []
-            baseline = self._effective_list(group_id, key) if value is None else (
-                [value] if value else []
-            )
-            gconf = overrides.setdefault(str(group_id), {})
-            gconf[key] = baseline
-            # 先记录基线再返回本体：调用方增删后由 _refresh_after_list_write
-            # 更新基线，等价于"基线 + 增量操作"。
-            self._record_list_baseline(group_id, key)
-            return baseline
-
-    def _refresh_after_list_write(self, group_id: str, key: str) -> None:
-        """列表写入落盘后刷新基线，保证下次重算的差集仍然正确。"""
-        self._record_list_baseline(group_id, key)
+                if self._has_list_ops(group_id, key):
+                    return self._merge_list_ops(group_id, key)
+                return self._as_str_list(value)
+            if value is None:
+                return self._effective_list(group_id, key)
+            return [value] if value else []
 
     def runtime_group_list(self, group_id: str, key: str) -> list:
         """只取本群运行时覆盖列表（没有则空列表，不回退模板/全局）。
 
         用于「本群 XXX + 全局 XXX」同时展示的命令，避免本群段落把全局值
-        再显示一遍；若有派生基线，则展示与最新模板/全局合并后的结果。
+        再显示一遍；有增量操作时展示与最新模板/全局合并后的结果。
         """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         value = overrides.get(key) if isinstance(overrides, dict) else None
         if isinstance(value, list):
-            return self._merge_runtime_list(group_id, key, value)
+            if self._has_list_ops(group_id, key):
+                return self._merge_list_ops(group_id, key)
+            return self._as_str_list(value)
         if value is None:
             return []
         return [value] if value else []
 
     def set_group_override(self, group_id: str, key: str, value) -> None:
-        """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。"""
+        """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。
+
+        列表值按"显式整体设置"处理：清掉该键的增量操作，此后以这份快照为准。
+        """
         with self._lock:
             overrides = self.runtime_map("group_overrides")
             overrides.setdefault(str(group_id), {})[key] = value
-            # 整体赋值是显式快照语义，不再与模板/全局重算。
-            self._drop_list_baseline(group_id, key)
+            self.drop_list_ops(group_id, key)
             self.save_config()
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
-            # 只读判定先行：没有任何新增时不创建运行时覆盖。
+            # 只读判定先行：没有任何新增时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]
             pending = []
             for qq in qq_list:
@@ -511,32 +550,18 @@ class ConfigStore:
                     pending.append(qq)
             if not pending:
                 return []
-            admins = self.get_group_override_list(group_id, key, for_update=True)
-            for qq in pending:
-                admins.append(qq)
-            self._refresh_after_list_write(group_id, key)
-            self.save_config()
+            self._commit_list_change(group_id, key, add=pending)
             return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
-            # 只读判定先行：没有任何删除时不创建运行时覆盖。
+            # 只读判定先行：没有任何删除时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]
             pending = [qq for qq in (str(x) for x in qq_list) if qq and qq in current]
             if not pending:
                 return []
-            admins = self.get_group_override_list(group_id, key, for_update=True)
-            removed = []
-            for qq in pending:
-                for item in list(admins):
-                    if str(item) == qq:
-                        admins.remove(item)
-                        removed.append(qq)
-                        break
-            if removed:
-                self._refresh_after_list_write(group_id, key)
-                self.save_config()
-            return removed
+            self._commit_list_change(group_id, key, remove=pending)
+            return pending
 
     def normalize_qq_list_value(self, value) -> list:
         """把 WebUI / 配置里各种写法的名单值归一化为 QQ 字符串列表。

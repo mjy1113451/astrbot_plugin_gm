@@ -350,6 +350,50 @@ class GroupOverrideTests(unittest.TestCase):
         config["whitelist_users"] = ["g1", "g2"]
         self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["x"])
 
+    def test_list_ops_dedupe_and_keep_order(self):
+        # 名单按"值集合"语义：基线重复值只生效一份，添加保持出现顺序
+        # （PR #289 审查：lossy-list-diff）。
+        config = _Config(ad_keywords=["a", "a", "b"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "ad_keywords", "remove", "b")
+        self.assertTrue(ok)
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["a"])
+        ok, _ = store.mutate_group_list("100", "ad_keywords", "add", "c")
+        self.assertTrue(ok)
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["a", "c"])
+
+    def test_remove_then_readd_restores_baseline_position(self):
+        config = _Config(whitelist_users=["a", "b"])
+        store = self.make_store(config)
+        store.mutate_group_list("100", "whitelist_users", "remove", "a")
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["b"])
+        store.mutate_group_list("100", "whitelist_users", "add", "a")
+        # 删除意图被撤销，该值回到基线里的位置；列表仍是基线顺序
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["a", "b"]
+        )
+
+    def test_list_ops_are_recorded_explicitly(self):
+        store = self.make_store(_Config(whitelist_users=["a"]))
+        store.mutate_group_list("100", "whitelist_users", "add", "x")
+        store.mutate_group_list("100", "whitelist_users", "remove", "a")
+        ops = store.runtime_map("group_overrides")["100"]["__list_ops__"]["whitelist_users"]
+        self.assertEqual(ops["added"], ["x"])
+        self.assertEqual(ops["removed"], ["a"])
+
+    def test_save_failure_rolls_back_runtime_state(self):
+        config = _Config(whitelist_users=["g1"])
+
+        def _boom():
+            raise RuntimeError("disk full")
+
+        config.save_config = _boom
+        store = self.make_store(config)
+        with self.assertRaises(RuntimeError):
+            store.mutate_group_list("100", "whitelist_users", "add", "x")
+        # 落盘失败后运行时覆盖本体已回滚，不会残留"已添加"的假状态
+        self.assertNotIn("100", store.runtime_map("group_overrides"))
+
 
 if __name__ == "__main__":
     unittest.main()
