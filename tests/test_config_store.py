@@ -49,6 +49,16 @@ class _Config(dict):
         pass
 
 
+class _FailingConfig(_Config):
+    """可切换失败的配置桩：用来验证"框架配置写失败"时的回滚。"""
+
+    fail = False
+
+    def save_config(self):
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
 class _JsonStore:
     def load_json(self, path, default):
         path = Path(path)
@@ -449,6 +459,67 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertEqual(
             store.get_group_setting("100", "whitelist_users").count("g1"), 1
         )
+
+    def test_save_config_failure_restores_runtime_file(self):
+        # 框架配置写失败时必须把已落盘的 runtime.json 恢复原样，否则磁盘上
+        # 运行时数据领先于配置（PR #289 审查：non-atomic-persistence）。
+        config = _FailingConfig(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        before = store.runtime_path.read_text(encoding="utf-8")
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.mutate_group_list("100", "whitelist_users", "remove", "g2")
+        self.assertEqual(store.runtime_path.read_text(encoding="utf-8"), before)
+
+    def test_save_config_success_keeps_runtime_file_updated(self):
+        config = _FailingConfig(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        self.assertIn("100", store.runtime_path.read_text(encoding="utf-8"))
+
+    def test_later_declaration_without_value_drops_declaration(self):
+        # 后条声明了字段却没给值：字段值与声明都要去掉，条目不再声称覆盖它
+        # （PR #289 审查：template-override-scope-loss）。
+        store = self.make_store(
+            _Config(
+                ad_keywords=["global_ad"],
+                group_overrides_templates=[
+                    _template_entry(
+                        "100",
+                        ad_keywords=["first"],
+                        explicit_override_fields="ad_keywords",
+                    ),
+                    _template_entry("100", explicit_override_fields="ad_keywords"),
+                ],
+            )
+        )
+        entry = store._template_group_entry("100")
+        self.assertNotIn("ad_keywords", entry)
+        self.assertNotIn("explicit_override_fields", entry)
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["global_ad"])
+
+    def test_third_entry_after_empty_declaration_wins(self):
+        # 前条有值并声明 → 后条只声明无值 → 第三条给值：最终取第三条
+        store = self.make_store(
+            _Config(
+                ad_keywords=["global_ad"],
+                group_overrides_templates=[
+                    _template_entry(
+                        "100",
+                        ad_keywords=["first"],
+                        explicit_override_fields="ad_keywords",
+                    ),
+                    _template_entry("100", explicit_override_fields="ad_keywords"),
+                    _template_entry("100", ad_keywords=["third"]),
+                ],
+            )
+        )
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["third"])
+        entry = store._template_group_entry("100")
+        self.assertEqual(entry["ad_keywords"], ["third"])
 
     def test_template_defaults_match_global_defaults(self):
         # 模板字段默认值必须与全局同名字段一致，否则"填了非默认值"会被误判成

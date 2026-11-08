@@ -129,10 +129,33 @@ class ConfigStore:
         说明：框架在加载带 _conf_schema.json 的插件时必定以 config=<AstrBotConfig>
         注入（star_manager 中 AstrBotConfig(config_path=..., schema=...)），故直接调用
         官方接口，不再做「无 save_config() 时另存本地文件」的假落盘分支。
+
+        两个目标分两步写，中间失败会留下"runtime.json 已更新、框架配置还是旧的"
+        状态，因此这里先备份 runtime.json 原文：框架配置写入失败时把它恢复到
+        写前内容，保证磁盘与内存一致（PR #289 审查：non-atomic-persistence）。
         """
         with self._lock:
+            try:
+                prev_runtime = self.runtime_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                prev_runtime = None
+            except OSError as e:
+                logger.warning(f"[群管插件] 读取 runtime.json 备份失败，跳过回滚保护: {e}")
+                prev_runtime = None
             self.save_json(self.runtime_path, self._runtime_maps)
-            self.config.save_config()
+            try:
+                self.config.save_config()
+            except Exception:
+                try:
+                    if prev_runtime is None:
+                        self.runtime_path.unlink(missing_ok=True)
+                    else:
+                        self.runtime_path.write_text(prev_runtime, encoding="utf-8")
+                except OSError as e:
+                    logger.error(
+                        f"[群管插件] 保存框架配置失败后回滚 runtime.json 也失败，"
+                        f"磁盘运行时数据可能领先于配置: {e}")
+                raise
 
     def mutate_group_list(self, group_id: str, key: str, op: str, value: str) -> tuple:
         """群 list 配置的原子读-改-写（review#192 race-condition）。
@@ -334,6 +357,16 @@ class ConfigStore:
                 # 声明了却没给值 → 前一条的值作废，回退全局配置
                 merged.pop(name, None)
         if merged is not None:
+            # 合并完再按最终结果重算显式覆盖声明：只保留"最终确实存在"的字段。
+            # 后条声明的字段若没给值（前面已 pop 掉），它的声明也要一并去掉，
+            # 否则条目会对外声称覆盖了一个自己并不存在的字段
+            # （PR #289 审查：template-override-scope-loss）。
+            declared = self._explicit_field_names(merged.get("explicit_override_fields"))
+            kept = [name for name in declared if name in merged]
+            if kept:
+                merged["explicit_override_fields"] = kept
+            else:
+                merged.pop("explicit_override_fields", None)
             # 记录"条目里到底写过哪些字段"，用于区分「字段没写」与「写了但仍是
             # 默认值」两种都按未覆盖处理的情况，排查模板不生效时看 debug 日志
             # （PR #289 审查：template-default-fallback）。

@@ -63,14 +63,24 @@ _DUP_FACE_MID_CACHE = 50  # 每群最近处理过的 message_id 缓存条数（#
 # - url 字段：QQ 图床 URL 路径里通常带 32 位文件哈希，可从中提取；
 # 三者都拿不到内容哈希时宁可放弃该段的判重，也不能拿无关值误判。
 _MD5_NAME_RE = re.compile(r"^([0-9a-fA-F]{32})(?:\.[A-Za-z0-9]+)?$")
-_MD5_IN_URL_RE = re.compile(r"/([0-9a-fA-F]{32})(?:[./?]|$)")
+# URL 里的哈希不一定是独立路径段（QQ 图床形如 .../0-0-<hash>/0），
+# 因此按"前后都不是十六进制字符的 32 位 hex 串"匹配，而不是要求以 / 开头。
+_MD5_IN_URL_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])")
+_MD5_ONLY_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 def _image_fingerprint(data: dict) -> str:
-    """从 image 段提取内容哈希指纹；拿不到真实哈希时返回空串（不判重）。"""
+    """从 image 段提取内容哈希指纹；拿不到真实哈希时返回空串（不判重）。
+
+    md5 字段也要过 32 位十六进制校验：部分协议端在这个字段里塞的是序号或
+    短标识，直接当指纹会让不同图片撞在一起、把只发一次的表情误撤回
+    （PR #289 审查：weak-fingerprint-validation）。
+    """
     md5 = str(data.get("md5") or "").strip().lower()
-    if md5:
+    if md5 and _MD5_ONLY_RE.match(md5):
         return md5
+    if md5:
+        logger.debug(f"[重复表情] md5 字段不是 32 位十六进制，已忽略: {md5[:40]}")
     file_name = str(data.get("file") or "").strip()
     m = _MD5_NAME_RE.match(file_name)
     if m:
