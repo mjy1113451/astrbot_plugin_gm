@@ -445,20 +445,40 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["g2"])
         ok, _ = store.mutate_group_list("100", "whitelist_users", "add", "g1")
         self.assertTrue(ok)
-        # 重新添加后 removed / removed_baseline 一起清掉，只剩 added
+        # 重新添加基线里已有的值 = 撤销删除、恢复基线继承：不写 added，
+        # 避免同一值既在基线又在 added（PR #289 审查：duplicate-list-operation）。
         ops = store._list_ops("100", "whitelist_users")
         self.assertEqual(ops["removed"], [])
         self.assertEqual(ops["removed_baseline"], {})
-        self.assertEqual(ops["added"], ["g1"])
+        self.assertEqual(ops["added"], [])
         self.assertEqual(
             store.get_group_setting("100", "whitelist_users"), ["g1", "g2"]
         )
-        # 基线删掉 g1：本群仍通过 added 保留它
+        # 恢复继承后基线删掉 g1：本群也随之下线（不再固定保留）
         config["whitelist_users"] = ["g2"]
         self.assertEqual(
-            store.get_group_setting("100", "whitelist_users"), ["g2", "g1"]
+            store.get_group_setting("100", "whitelist_users"), ["g2"]
         )
-        # 基线再加回 g1：集合语义下只出现一次
+
+    def test_cancelled_list_ops_leave_no_materialized_snapshot(self):
+        # 删掉再加回同一基线项后增量记录清零；此时运行时里不能留下物化快照，
+        # 否则这份快照会把"抵消那一刻"的基线冻结下来，之后基线怎么变都传不到
+        # 本群（PR #289 审查：stale-materialized-snapshot）。
+        config = _Config(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        store.mutate_group_list("100", "whitelist_users", "add", "g1")
+        runtime = store.runtime_map("group_overrides")
+        self.assertNotIn("100", runtime)
+        # 落盘内容同样干净，重启后不会读到冻结快照
+        saved = json.loads(Path(store.runtime_path).read_text(encoding="utf-8"))
+        self.assertNotIn("100", saved.get("group_overrides", {}))
+        # 基线新增的值直接生效，说明读取走的是实时基线而不是快照
+        config["whitelist_users"] = ["g1", "g2", "g3"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g1", "g2", "g3"]
+        )
+        # 基线再加回 g1：本群重新拿到它，且只出现一次
         config["whitelist_users"] = ["g1", "g2"]
         self.assertEqual(
             store.get_group_setting("100", "whitelist_users"), ["g1", "g2"]

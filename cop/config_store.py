@@ -144,10 +144,20 @@ class ConfigStore:
                 prev_runtime = self.runtime_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 prev_runtime = missing
+            # 框架配置对象也拍一份快照：save_config() 失败时进程内可能已经改了
+            # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
+            # （PR #289 审查：incomplete-persistence-rollback）。
+            prev_global = copy.deepcopy(dict(self.config)) if isinstance(self.config, dict) else None
             self.save_json(self.runtime_path, self._runtime_maps)
             try:
                 self.config.save_config()
             except Exception:
+                if prev_global is not None:
+                    try:
+                        self.config.clear()
+                        self.config.update(prev_global)
+                    except Exception as e:
+                        logger.error(f"[群管插件] 回滚框架配置内存值失败: {e}")
                 try:
                     if prev_runtime is missing:
                         self.runtime_path.unlink(missing_ok=True)
@@ -535,13 +545,15 @@ class ConfigStore:
             item = str(item).strip()
             if not item:
                 continue
-            # 重新添加 = 显式撤销此前的删除：added / removed / removed_baseline
-            # 三处一起清掉再记一次添加。此后该项按"本群显式加入"生效，基线之后
-            # 增删同名项都不再影响它——优先级固定为「最后一次操作优先」
-            # （PR #289 审查：list-operation-state-loss）。
+            # 重新添加 = 显式撤销此前的删除：removed / removed_baseline 一起清掉。
+            # 值本来就在基线里时不写 added——否则同一值既在基线又在 added，
+            # 操作状态重复、优先级也变得含糊（PR #289 审查：duplicate-list-operation）。
             ops["removed"] = [x for x in ops["removed"] if x != item]
             ops.get("removed_baseline", {}).pop(item, None)
-            ops["added"] = list(ops["added"]) + [item]
+            if item in baseline:
+                ops["added"] = [x for x in ops["added"] if x != item]
+            else:
+                ops["added"] = list(ops["added"]) + [item]
         for item in remove:
             item = str(item).strip()
             if not item:
@@ -552,8 +564,17 @@ class ConfigStore:
         merged = self._merge_list_ops(group_id, key, ops)
         overrides = self.runtime_map("group_overrides")
         gconf = overrides.setdefault(str(group_id), {})
-        gconf[key] = merged
         self._store_list_ops(group_id, key, ops)
+        if ops["added"] or ops["removed"]:
+            gconf[key] = merged
+        else:
+            # 增删互相抵消后没有任何增量：删掉物化的运行时值，让读取重新
+            # 按最新模板/全局基线推导。否则这份快照会把"抵消那一刻"的
+            # 基线冻结下来，后续基线变化就再也传不到本群
+            # （PR #289 审查：stale-materialized-snapshot）。
+            gconf.pop(key, None)
+            if not gconf:
+                overrides.pop(str(group_id), None)
         return merged
 
     def _commit_list_change(self, group_id: str, key: str, add=(), remove=()) -> list:

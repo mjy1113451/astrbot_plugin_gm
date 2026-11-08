@@ -214,7 +214,8 @@ class JoinRequestCollectionTests(unittest.TestCase):
     def test_plain_system_entries_are_not_requests(self):
         self.assertFalse(OneBotApi.looks_like_join_request({"type": "member_increase"}))
         self.assertTrue(OneBotApi.looks_like_join_request({"request_type": "add"}))
-        self.assertTrue(OneBotApi.looks_like_join_request({"comment": "想进群"}))
+        # comment 系统消息也可能带，不能作为申请判据
+        self.assertFalse(OneBotApi.looks_like_join_request({"comment": "想进群"}))
 
 
 if __name__ == "__main__":

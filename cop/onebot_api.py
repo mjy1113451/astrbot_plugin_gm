@@ -392,10 +392,11 @@ class OneBotApi:
 
     @staticmethod
     def looks_like_join_request(item) -> bool:
-        """条目是否带加群申请专属字段（flag / sub_type / request_type / comment）。
+        """条目是否带加群申请专属字段（flag / sub_type / request_type）。
 
         群系统消息里的普通条目（成员变动通知等）没有这些字段，用它来区分
-        「真申请」与「系统消息」，避免诊断输出把系统消息误标成申请记录
+        「真申请」与「系统消息」，避免诊断输出把系统消息误标成申请记录。
+        不用 comment 判断：系统消息也可能带备注文本，会把非申请条目放进来
         （PR #289 审查：misleading-diagnostic-output）。
         """
         if not isinstance(item, dict):
@@ -404,7 +405,6 @@ class OneBotApi:
             item.get("flag")
             or item.get("sub_type")
             or item.get("request_type")
-            or item.get("comment")
         )
 
     @classmethod
@@ -518,32 +518,73 @@ class OneBotApi:
         PR #289 审查：所有候选失败后读回标签做副作用确认——但必须先确认
         标签在调用前确实存在，否则"本来就没有这个标签"会被误报成删除成功
         （false-success-delete）。
+
+        失败后换参数变体前同样先读回：标签已消失即视为成功立即返回；读不到
+        标签列表时不再重试有副作用的调用；只有"参数/action 不被接受"这类
+        失败才换下一个变体，权限不足等明确失败不重复执行
+        （duplicate-side-effect）。
         """
         before_ok, before_tags = await self._group_tags_read(event, group_id)
         tag_exists = before_ok and tag in before_tags
+        if before_ok and not tag_exists:
+            # 删除前就不存在：不必发出任何删除请求
+            return False, None, "not_found"
 
-        last = None
-        for action, extra in (
+        candidates = (
             ("delete_group_tag", {"tag": tag}),
             ("delete_group_tag", {"tags": [tag]}),
-        ):
+        )
+        last = None
+        read_supported = before_ok
+        after_ok, after_tags = before_ok, before_tags
+        for index, (action, extra) in enumerate(candidates):
             p = {"group_id": str(group_id)}
             p.update(extra)
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
                 return True, last, ""
-        after_ok, after_tags = await self._group_tags_read(event, group_id)
-        if tag in after_tags:
-            # 读回仍存在：删除确实没生效（可能是权限不足或参数不被接受）
+            if read_supported:
+                after_ok, after_tags = await self._group_tags_read(event, group_id)
+                if after_ok and tag not in after_tags:
+                    # 读回确认已删除：部分协议端成功响应缺 status/retcode
+                    return True, last, ""
+                if not after_ok:
+                    read_supported = False
+            if index + 1 >= len(candidates):
+                break
+            if not self._failure_invites_retry(last, action):
+                break
+        if read_supported and after_ok and tag in after_tags:
+            # 读回仍存在：删除确实没生效（权限不足或参数不被接受）
             return False, last, ""
-        if not before_ok or not after_ok:
-            # 前后任一侧读不到标签列表，就无法确认"原本存在、现在消失"，
-            # 保持失败语义，交给管理员人工核对
+        if not before_ok or not (read_supported and after_ok):
+            # 两侧读不到标签列表，无法确认"原本存在、现在消失"，保持失败语义
             return False, last, "read_failed"
-        if not tag_exists:
-            # 删除前就不存在——响应含糊不能当成删除成功
-            return False, last, "not_found"
-        return True, last, ""
+        return False, last, ""
+
+    @staticmethod
+    def _failure_invites_retry(result, action: str) -> bool:
+        """失败是否属于"换个参数/action 还能成"的类型（决定要不要重试）。
+
+        只有"接口/参数不被接受"才值得换变体；权限不足、群号错误等失败继续
+        重试只会对同一个有副作用的 action 重复执行（PR #289 审查：
+        duplicate-side-effect）。
+        """
+        if result is None:
+            return True   # 无可用调用通路：可能别的 action 名可用
+        text = str(result).lower() if not isinstance(result, dict) else " ".join(
+            str(result.get(k, "")) for k in ("message", "msg", "wording", "error", "errmsg")
+        ).lower()
+        if not text.strip():
+            # 结构含糊（只有 retcode）：换一个参数变体成本低，允许一次
+            return True
+        hints = ("unknown action", "unknown method", "no such action", "not found",
+                 "unsupported", "not support", "不支持", "参数", "param")
+        blockers = ("权限", "permission", "forbidden", "denied", "not admin",
+                    "群号", "group not", "retcode=1")
+        if any(b in text for b in blockers):
+            return False
+        return any(h in text for h in hints)
 
     async def _get_group_tags(self, event: AstrMessageEvent, group_id: str):
         """查询群标签。#285：统一命名 get_group_tags，返回原始响应由调用方解析。"""
