@@ -379,10 +379,38 @@ class OneBotApi:
 
     # ---------- 群标签（#285：统一 add_group_tag / delete_group_tag / get_group_tags） ----------
 
+    async def _group_tags_read(self, event: AstrMessageEvent, group_id: str):
+        """读取当前群标签，返回 (读取是否成功, 标签列表)。
+
+        供 add/delete 的副作用确认使用：只有读取本身成功时调用方才应信任
+        结果（协议端不支持 get_group_tags 时返回 (False, [])，不能当作
+        "标签不存在"的证据）。
+        """
+        raw = await self._get_group_tags(event, group_id)
+        if not (isinstance(raw, dict) and self._action_result_success(raw)):
+            return False, []
+        data = raw.get("data")
+        if isinstance(data, dict):
+            data = data.get("tags") or data.get("group_tags")
+        items = data if isinstance(data, list) else []
+        tags = []
+        for t in items:
+            if isinstance(t, dict):
+                t = t.get("tag") or t.get("name") or t.get("title") or ""
+            t = str(t).strip()
+            if t and t not in tags:
+                tags.append(t)
+        return True, tags
+
     async def _add_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """添加群标签。#285：NapCat 等协议端统一命名为 add_group_tag，
         旧扩展名 set_group_tag（LLOneBot 等）保留为兼容回退；参数名逐候选
-        尝试（tag= / tags=）。返回 (是否成功, 最后一个原始响应)。"""
+        尝试（tag= / tags=）。返回 (是否成功, 最后一个原始响应)。
+
+        PR #289 审查（duplicate-side-effect）：add 是有副作用的 action，且部分
+        协议端的成功响应缺 status/retcode 会被误判为失败；重试下一组候选前先
+        读回标签确认——已存在即幂等成功，避免同一标签被重复添加。
+        """
         last = None
         for action, extra in (
             ("add_group_tag", {"tag": tag}),
@@ -395,11 +423,18 @@ class OneBotApi:
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
                 return True, last
+            read_ok, tags = await self._group_tags_read(event, group_id)
+            if read_ok and tag in tags:
+                return True, last
         return False, last
 
     async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """删除群标签。#285：统一命名 delete_group_tag；参数名逐候选尝试。
-        返回 (是否成功, 最后一个原始响应)。"""
+        返回 (是否成功, 最后一个原始响应)。
+
+        PR #289 审查：所有候选失败后读回标签做副作用确认——目标已不在列表
+        即视为删除成功（幂等）；读取本身失败时不判定，保持原失败语义。
+        """
         last = None
         for action, extra in (
             ("delete_group_tag", {"tag": tag}),
@@ -410,6 +445,9 @@ class OneBotApi:
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
                 return True, last
+        read_ok, tags = await self._group_tags_read(event, group_id)
+        if read_ok and tag not in tags:
+            return True, last
         return False, last
 
     async def _get_group_tags(self, event: AstrMessageEvent, group_id: str):

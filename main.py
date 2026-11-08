@@ -1797,32 +1797,54 @@ class GroupAdminPlugin(Star):
                 "说明申请在协议端/平台层就没有投递到插件（典型原因：申请被 QQ 放进了"
                 "「过滤申请」，或 bot 不是群管理员）")
 
-        # 2) 探测协议端能否查询申请列表（含被过滤申请的候选接口）
-        ok, result = await self._api._call_action_fallback(
-            event, ("get_group_system_msg", "get_group_filtered_requests",
-                    "get_group_ignore_add_request"))
-        if ok:
-            data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), (dict, list)) else (result if isinstance(result, (dict, list)) else {})
+        # 2) 逐个探测协议端申请查询接口。PR #289 审查（misleading-diagnostic-output）：
+        #    get_group_system_msg 返回的是群系统消息，其元素未必是加群申请，不能
+        #    统称"申请记录"——只有明确带 user_id 且带 flag/sub_type 的条目才按
+        #    申请展示，其余归为"非申请条目"，避免空 QQ / sub_type=? 的误导输出。
+        candidates = (
+            ("get_group_system_msg", "标准群系统消息/申请接口"),
+            ("get_group_filtered_requests", "被过滤申请"),
+            ("get_group_ignore_add_request", "被忽略申请"),
+        )
+        probed_ok = False
+        lines.append("2. 协议端申请查询接口逐个探测：")
+        for action, label in candidates:
+            raw = await self._api._call_onebot_raw(event, action, group_id=group_id)
+            if not (isinstance(raw, dict) and self._api._action_result_success(raw)):
+                lines.append(f"   - {action}（{label}）：不支持或调用失败")
+                continue
+            probed_ok = True
+            data = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
             raw_list = data.get("join_requests") if isinstance(data, dict) else data
             if not isinstance(raw_list, list):
                 raw_list = []
-            lines.append(f"2. 协议端支持申请列表查询，当前返回 {len(raw_list)} 条申请记录")
-            shown = 0
+            requests, others = [], 0
             for a in raw_list:
-                if not isinstance(a, dict) or shown >= 20:
+                if not isinstance(a, dict):
+                    others += 1
+                    continue
+                uid = str(a.get("user_id") or a.get("request_uin")
+                          or a.get("requester_uin") or "").strip()
+                if not uid or not (a.get("flag") or a.get("sub_type")):
+                    others += 1  # 无法识别为申请的条目（系统消息等）
                     continue
                 item_gid = str(a.get("group_id", "") or "")
                 if item_gid and item_gid != group_id:
-                    continue
-                uid = str(a.get("user_id") or a.get("requester_uin") or "")
+                    continue  # 其他群的申请不计入本群展示
+                requests.append(a)
+            summary = f"   - {action}（{label}）：申请记录 {len(requests)} 条"
+            if others:
+                summary += f"，非申请条目 {others} 条（系统消息等，不展示）"
+            lines.append(summary)
+            for a in requests[:20]:
+                uid = str(a.get("user_id") or a.get("request_uin")
+                          or a.get("requester_uin") or "")
                 sub = str(a.get("sub_type") or "?")
                 checked = bool(a.get("checked"))
-                lines.append(f"   - QQ {uid} | sub_type={sub} | 已处理={checked}")
-                shown += 1
-        else:
+                lines.append(f"     · QQ {uid} | sub_type={sub} | 已处理={checked}")
+        if not probed_ok:
             lines.append(
-                "2. 协议端不支持申请列表查询（get_group_system_msg 等接口均失败），"
-                "无法从协议端侧核对申请状态")
+                "   （所有候选接口均不可用，无法从协议端侧核对申请状态）")
 
         # 3) 结论与建议
         lines.append(
