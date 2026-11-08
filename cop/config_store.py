@@ -138,12 +138,21 @@ class ConfigStore:
 
         取列表→增/删→落盘 全程在 _CFG_LOCK 内串行化，避免并发覆盖丢失更新；
         返回 (ok, 当前列表拷贝)。
+
+        先用只读接口判断本次操作是否真的会改变列表，只有确定要写入时才创建
+        运行时覆盖（以当前生效值为基线），失败路径不留下任何 group_overrides
+        痕迹（PR #289 审查：unexpected-runtime-materialization）。
         """
         with self._lock:
+            current = self.get_group_override_list(group_id, key)
+            if op == "add":
+                if any(str(x) == value for x in current):
+                    return False, list(current)
+            else:
+                if not any(str(x) == value for x in current):
+                    return False, list(current)
             lst = self.get_group_override_list(group_id, key, for_update=True)
             if op == "add":
-                if any(str(x) == value for x in lst):
-                    return False, list(lst)
                 lst.append(value)
             else:
                 target = next((x for x in list(lst) if str(x) == value), None)
@@ -347,23 +356,31 @@ class ConfigStore:
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
-            admins = self.get_group_override_list(group_id, key, for_update=True)
-            added = []
+            # 只读判定先行：没有任何新增时不创建运行时覆盖。
+            current = [str(x) for x in self.get_group_override_list(group_id, key)]
+            pending = []
             for qq in qq_list:
                 qq = str(qq)
-                if qq and qq not in [str(x) for x in admins]:
-                    admins.append(qq)
-                    added.append(qq)
-            if added:
-                self.save_config()
-            return added
+                if qq and qq not in current and qq not in pending:
+                    pending.append(qq)
+            if not pending:
+                return []
+            admins = self.get_group_override_list(group_id, key, for_update=True)
+            for qq in pending:
+                admins.append(qq)
+            self.save_config()
+            return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
+            # 只读判定先行：没有任何删除时不创建运行时覆盖。
+            current = [str(x) for x in self.get_group_override_list(group_id, key)]
+            pending = [qq for qq in (str(x) for x in qq_list) if qq and qq in current]
+            if not pending:
+                return []
             admins = self.get_group_override_list(group_id, key, for_update=True)
             removed = []
-            for qq in qq_list:
-                qq = str(qq)
+            for qq in pending:
                 for item in list(admins):
                     if str(item) == qq:
                         admins.remove(item)

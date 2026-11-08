@@ -196,6 +196,30 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(current, ["g1", "u1"])
 
+    def test_failed_add_does_not_materialize_override(self):
+        store = self.make_store(_Config(whitelist_users=["g1"]))
+        ok, current = store.mutate_group_list("100", "whitelist_users", "add", "g1")
+        self.assertFalse(ok)
+        self.assertEqual(current, ["g1"])
+        self.assertNotIn("100", store.runtime_map("group_overrides"))
+
+    def test_failed_remove_does_not_materialize_override(self):
+        store = self.make_store(_Config(whitelist_users=["g1"]))
+        ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "none")
+        self.assertFalse(ok)
+        self.assertNotIn("100", store.runtime_map("group_overrides"))
+
+    def test_admin_add_without_change_does_not_materialize(self):
+        store = self.make_store(_Config(group_admin_admins=["1"]))
+        self.assertEqual(
+            store.add_group_override_admins("100", "group_admin_admins", ["1"]), []
+        )
+        self.assertNotIn("100", store.runtime_map("group_overrides"))
+        self.assertEqual(
+            store.add_group_override_admins("100", "group_admin_admins", ["2"]), ["2"]
+        )
+        self.assertEqual(store.get_group_setting("100", "group_admin_admins"), ["1", "2"])
+
     def test_runtime_override_wins_over_template(self):
         store = self.make_store(
             _Config(

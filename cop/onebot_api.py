@@ -379,28 +379,39 @@ class OneBotApi:
 
     # ---------- 群标签（#285：统一 add_group_tag / delete_group_tag / get_group_tags） ----------
 
+    @staticmethod
+    def _normalize_tags(items) -> list:
+        tags = []
+        for t in items or []:
+            if isinstance(t, dict):
+                t = t.get("tag") or t.get("name") or t.get("title") or ""
+            t = str(t).strip()
+            if t and t not in tags:
+                tags.append(t)
+        return tags
+
     async def _group_tags_read(self, event: AstrMessageEvent, group_id: str):
         """读取当前群标签，返回 (读取是否成功, 标签列表)。
 
         供 add/delete 的副作用确认使用：只有读取本身成功时调用方才应信任
         结果（协议端不支持 get_group_tags 时返回 (False, [])，不能当作
         "标签不存在"的证据）。
+
+        兼容协议端三种返回形态：裸数组、{data: [...]}、{data: {tags: [...]}}
+        （PR #289 审查：incompatible-response-shape）。
         """
         raw = await self._get_group_tags(event, group_id)
+        if isinstance(raw, list):
+            return True, self._normalize_tags(raw)
         if not (isinstance(raw, dict) and self._action_result_success(raw)):
             return False, []
-        data = raw.get("data")
-        if isinstance(data, dict):
-            data = data.get("tags") or data.get("group_tags")
-        items = data if isinstance(data, list) else []
-        tags = []
-        for t in items:
-            if isinstance(t, dict):
-                t = t.get("tag") or t.get("name") or t.get("title") or ""
-            t = str(t).strip()
-            if t and t not in tags:
-                tags.append(t)
-        return True, tags
+        for data in (raw.get("data"), raw.get("tags"), raw.get("group_tags")):
+            if isinstance(data, dict):
+                data = data.get("tags") or data.get("group_tags")
+            if isinstance(data, list):
+                return True, self._normalize_tags(data)
+        # 接口成功但没有标签字段：按"本群没有标签"处理。
+        return True, []
 
     async def _add_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """添加群标签。#285：NapCat 等协议端统一命名为 add_group_tag，
