@@ -58,10 +58,6 @@ class ConfigStore:
         # 本次保存事务里由插件显式改写的全局配置键：回滚时只删这些键，
         # 不做"当前键集合 − 快照"的差集删除（PR #289 审查：overbroad-memory-rollback）。
         self._touched_keys: tuple = ()
-        # _conf_schema.json 声明的顶层键：回滚删除"本次新增键"时用来区分
-        # "schema 内的配置键"与"框架注入的内部键"（PR #289 审查：
-        # unregistered-global-write）。
-        self._schema_keys = self._load_schema_keys()
         # set_global_setting 登记的单键写前值：save_config 的快照是在改动之后
         # 才拍的，靠它才能把回滚目标修正回真正的写前状态
         # （PR #289 审查：double-rollback-corruption）。
@@ -273,12 +269,16 @@ class ConfigStore:
     def _restore_framework_config(self, prev_global, touched=None, touched_prev=None):
         """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
 
-        只做两件安全的事：把目标快照里的键改回原值；把"本次新增且可确认属于
-        插件"的键删掉——可确认 = 通过 set_global_setting 显式登记，或在
-        _conf_schema.json 里有声明（业务层直接改 `self.config` 绕过了登记时
-        仍然能收拾掉）。框架自己注入的内部键既不在 touched 里也没有 schema
-        声明，因此不会被误删（PR #289 审查：overbroad-memory-rollback /
-        unregistered-global-write）。
+        只做两件安全的事：把目标快照里的键改回原值；把"本次通过
+        set_global_setting 显式登记、且写前并不存在"的键删掉。
+
+        新增键只删登记过的：快照是在调用方改动之后才拍的，所以出现在 new_keys
+        里的键必然是 **save_config() 执行过程中** 才多出来的——那是框架自己在
+        写盘前后注入的键（含 schema 声明过的辅助/内部键）。仅凭"在
+        _conf_schema.json 里有声明"就去删，会把框架刚注入的合法键删掉，反而
+        让进程内配置与磁盘不一致（PR #289 审查：overbroad-schema-rollback）。
+        业务层若绕过 set_global_setting 直接写配置，其写入发生在快照之前，
+        已随快照一起恢复，不需要靠删键兜底。
 
         touched_prev 是 set_global_setting 记下的"这些键的写前值"：save_config
         的快照是在调用方改完之后才拍的，必须用它把目标快照修正回真正的写前状态，
@@ -305,10 +305,7 @@ class ConfigStore:
             new_keys = [k for k in self.config.keys() if k not in target]
         except Exception:
             new_keys = []
-        removable = [
-            k for k in new_keys
-            if k in (touched or ()) or k in self._schema_keys
-        ]
+        removable = [k for k in new_keys if k in (touched or ())]
         for key in removable:
             try:
                 self.config.pop(key, None)
@@ -316,23 +313,12 @@ class ConfigStore:
                 failures.append(e)
         kept = [k for k in new_keys if k not in removable]
         if kept:
-            # 不删：无法区分"我们的新增键"与"框架注入的内部键"
+            # 不删：无法区分"我们的新增键"与"框架注入的内部键/辅助键"
             logger.debug(f"[群管插件] 回滚后仍存在写前没有的配置键（保留未删）: {kept}")
         if failures:
             logger.error(f"[群管插件] 回滚框架配置内存值失败: {failures[0]}")
             return failures[0]
         return None
-
-    @staticmethod
-    def _load_schema_keys():
-        """读取 _conf_schema.json 的顶层键集合（读不到时返回空集合）。"""
-        schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
-        try:
-            schema = json.loads(schema_path.read_text(encoding="utf-8"))
-            return frozenset(schema.keys()) if isinstance(schema, dict) else frozenset()
-        except Exception as e:
-            logger.warning(f"[群管插件] 读取 _conf_schema.json 键集合失败: {e}")
-            return frozenset()
 
     @staticmethod
     def _atomic_write_text(path: Path, text: str) -> None:

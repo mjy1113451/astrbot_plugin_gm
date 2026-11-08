@@ -396,14 +396,18 @@ class JoinReviewService:
                 f"回复 /同意 或 /拒绝 或 /拉黑（引用本消息）"
             )
             # 暂存 flag 等待引用回复
-            sent_id = await self._api._send_group_text(event, group_id, notify_text)
+            sent, sent_id = await self._api._send_group_text(event, group_id, notify_text)
             # #284：群内通知发送结果落日志，多群排查「b 群没发通知」的关键线索
             if sent_id:
                 logger.info(f"[加群审核] 群 {group_id} 群内提醒已发送 message_id={sent_id}")
-            else:
+            elif sent:
                 logger.warning(
                     f"[加群审核] 群 {group_id} 群内提醒发送后未拿到 message_id "
-                    f"（发送可能失败或协议端未返回 ID，详见上方 send_group_msg 日志）")
+                    f"（协议端未返回 ID，详见上方 send_group_msg 日志）")
+            else:
+                logger.error(
+                    f"[加群审核] 群 {group_id} 群内提醒所有通路均发送失败，"
+                    f"本次不登记待处理记录")
             pending = self._store.runtime_map("pending_join_requests")
             # #270：user_id 一律存申请人/被邀请人；inviter_user_id 仅作记录
             record = {"flag": flag, "group_id": group_id, "user_id": applicant_id,
@@ -414,18 +418,33 @@ class JoinReviewService:
                      if isinstance(v, dict) and int(v.get("ts", 0) or 0) < int(time.time()) - 7 * 86400]
             for k in stale:
                 del pending[k]
-            if sent_id:
+            changed = bool(stale)
+            if not sent:
+                # 通知根本没发出去：不能登记待处理记录，否则管理员在群里看不到
+                # 任何消息、记录却一直挂着，之后引用一条不存在的通知处理的是
+                # 早已失效的申请（PR #289 审查：stale-pending-request）。
+                # 只走下面的私聊通知，让管理员直接用 /加群申请待处理 处理。
+                pass
+            elif sent_id:
                 pending[str(sent_id)] = record
+                changed = True
             else:
-                # #258：拿不到通知消息 ID（协议端未回 message_id）时也要落记录，
-                # 否则管理员引用通知回复 /同意 时无法定位该申请
+                # #258：发送成功但协议端未回 message_id 时也要落记录，否则管理员
+                # 引用通知回复 /同意 时无法定位该申请
                 pending[f"flag:{flag}"] = record
+                changed = True
                 logger.warning("[加群审核] 未能获取申请通知的 message_id，"
                                "待处理记录改按 flag 暂存，引用回复时按内容兜底定位")
-            self._store.save_config()
+            if changed:
+                self._store.save_config()
             # #229：原 join_request_notify_enabled（#205）全局开关已移除，通知改为始终发送
             # #283/PR#289：被邀请人未知的邀请入群请求，管理员通知沿用 invite 专用文案，
             # 不能拼成「[加群请求]  申请加入群 X」这种申请人为空的普通申请通知
+            if not sent:
+                # 群内提醒没发出去：私聊文案不能说"已在群内发送提醒"
+                tail = "群内提醒发送失败，请直接用 /加群申请待处理 处理"
+            else:
+                tail = "已在群内发送提醒，请管理员引用回复同意/拒绝"
             if sub_type == "invite" and not applicant_id:
                 admin_text = (
                     f"[加群请求] 收到群 {group_id} 的邀请入群请求\n"
@@ -433,14 +452,14 @@ class JoinReviewService:
                     f"邀请人QQ: {inviter_id}\n"
                     f"被邀请人：未知（协议端未提供，标准语义下为本 bot）\n"
                     f"申请标识：{flag}\n"
-                    f"已在群内发送提醒，请管理员引用回复同意/拒绝"
+                    f"{tail}"
                 )
             else:
                 invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
                 admin_text = (
                     f"[加群请求] {applicant_id} 申请加入群 {group_id}\n"
                     f"{invite_note}"
-                    f"已在群内发送提醒，请管理员引用回复同意/拒绝"
+                    f"{tail}"
                 )
             await self._api._notify_admins(admin_text, group_id=group_id)
         else:

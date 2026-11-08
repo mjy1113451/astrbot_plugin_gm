@@ -458,6 +458,42 @@ class OneBotApi:
                     others += 1
         return requests, others
 
+    def _tags_response_ok(self, raw) -> bool:
+        """判断 get_group_tags 的字典响应是否**明确**成功。
+
+        查询类响应不能用宽松的 `_action_result_success`：它把"既没有 status
+        也没有 retcode、只带 data 的字典"当成功（有副作用 action 的语义），
+        于是一份错误载荷（例如 {"error": "..."}、{"code": 1} 或干脆只有
+        {"data": []}）会被读成"本群没有标签"，覆盖型回退便会拿它当基线把
+        已有标签整体清空（PR #289 审查：misleading-empty-state）。
+
+        这里要求显式成功信号：status 为 ok/async/success，或 retcode/code
+        存在且为 0；同时显式失败信号优先——status 是失败态、success 为 False、
+        带非空 error、retcode/code 非 0，一律判失败。
+        """
+        if not isinstance(raw, dict) or not raw:
+            return False
+        status = str(raw.get("status", "")).strip().lower()
+        if status in {"failed", "fail", "failure", "error"}:
+            return False
+        if raw.get("success") is False:
+            return False
+        if raw.get("error"):
+            return False
+        codes = []
+        for key in ("retcode", "code"):
+            if key in raw and raw[key] is not None:
+                try:
+                    codes.append(int(raw[key]))
+                except (TypeError, ValueError):
+                    # 取不到数值的成功码无法确认结果，按失败处理
+                    return False
+        if any(code != 0 for code in codes):
+            return False
+        if codes:
+            return True
+        return status in {"ok", "async", "success", "succeeded"}
+
     async def _group_tags_read(self, event: AstrMessageEvent, group_id: str):
         """读取当前群标签，返回 (读取是否成功, 标签列表)。
 
@@ -466,6 +502,8 @@ class OneBotApi:
         "标签不存在"的证据）。
 
         兼容协议端三种返回形态：裸数组、{data: [...]}、{data: {tags: [...]}}。
+        "响应本身就是列表"视为成功（没有任何状态字段可看，形态明确即证据）；
+        字典响应则必须通过 `_tags_response_ok` 的显式成功判定。
 
         区分"成功且明确返回空列表"（(True, [])）与"成功但响应里找不到可识别的
         标签字段"（(False, []) 并记 warning）：后者多半是协议端响应结构不兼容，
@@ -475,7 +513,7 @@ class OneBotApi:
         raw = await self._get_group_tags(event, group_id)
         if isinstance(raw, list):
             return True, self._normalize_tags(raw)
-        if not (isinstance(raw, dict) and self._action_result_success(raw)):
+        if not self._tags_response_ok(raw):
             return False, []
         candidates = []
         data = raw.get("data")
@@ -923,7 +961,10 @@ class OneBotApi:
         return ""
 
     async def _send_group_text(self, event: AstrMessageEvent, group_id: str, text: str):
-        """向指定群发送纯文本消息，返回 message_id（用于后续引用回复关联）。
+        """向指定群发送纯文本消息，返回 (是否已发出, message_id)。
+
+        message_id 用于后续引用回复关联；拿不到时为空串，由调用方按被引用
+        消息内容兜底定位。
 
         #258：旧实现探测 self.context.send_group_msg——AstrBot Context 并不暴露
         该 OneBot action，探测必然失败，实际总走 _send 兜底并返回空串，导致
@@ -934,6 +975,11 @@ class OneBotApi:
         #265：修复「发送成功但 message_id 提取失败后继续回退发送」造成
         【新人加群】通知等群通知重复发送两次的问题——只要判定发送成功，
         无论能否取到 message_id 都立即返回，不再进入任何回退通路。
+
+        返回值第一项区分"发出去了但没拿到 ID"与"根本没发出去"：旧实现两者
+        都返回空串，调用方无法判断，只能一律把待处理记录按 flag 暂存，管理员
+        因此可能引用一条**从未发出**的通知去处理早已失效的申请
+        （PR #289 审查：stale-pending-request）。
         """
         # #284：多群环境下部分群通知发不出来时，必须把失败原因与群号落到日志，
         # 否则只有「b 群发不了」的现象、没有任何线索。
@@ -942,11 +988,11 @@ class OneBotApi:
         if self._action_result_success(raw):
             mid = self._extract_message_id(raw)
             if mid:
-                return mid
+                return True, mid
             # 消息已成功发出：拿不到 message_id 时只能返回空串（由调用方按被引用
             # 消息内容兜底定位），绝不能再次发送，否则同一段文本会重复发送（#265）
             logger.warning("[加群审核] send_group_msg 成功但未返回 message_id")
-            return ""
+            return True, ""
         logger.warning(
             f"[加群审核] send_group_msg 直调失败 group={group_id}: "
             f"{self._describe_action_failure(raw, 'send_group_msg')}")
@@ -956,10 +1002,10 @@ class OneBotApi:
                 result = await self.context.send_group_msg(group_id=int(group_id), message=text)
                 mid = self._extract_message_id(result)
                 if mid:
-                    return mid
+                    return True, mid
                 if self._action_result_success(result):
                     logger.warning("[加群审核] context.send_group_msg 成功但未返回 message_id")
-                    return ""
+                    return True, ""
                 logger.warning(
                     f"[加群审核] context.send_group_msg 失败 group={group_id}: {result}")
         except Exception as e:
@@ -970,7 +1016,7 @@ class OneBotApi:
             logger.error(
                 f"[加群审核] 群 {group_id} 的通知所有发送通路均失败，"
                 f"请检查 bot 是否在目标群、协议端连接是否正常")
-        return ""
+        return sent, ""
 
     @staticmethod
     def _first_str_field(source: dict, keys) -> str:

@@ -114,10 +114,11 @@ class _WriteThenFailConfig(_FailingConfig):
 
 
 class _BypassWriteConfig(_FailingConfig):
-    """模拟业务层绕过 set_global_setting 直接往配置对象里写键。
+    """模拟框架在 save_config() 执行过程中往配置对象里注入键。
 
-    一个写 schema 声明的键（rank_top_n），一个写框架内部风格的键
-    （framework_helper_key），用来验证回滚只删前者。
+    一个注入 schema 声明过的键（rank_top_n），一个注入框架内部风格的键
+    （framework_helper_key）：两者都必须保留——回滚只删插件显式登记过的
+    新增键（PR #289 审查：overbroad-schema-rollback）。
     """
 
     def save_config(self):
@@ -804,16 +805,16 @@ class GroupOverrideTests(unittest.TestCase):
         writes = [v for k, v in config.writes if k == "whitelist_users"]
         self.assertEqual(writes, [["changed"], ["g1"]])
 
-    def test_unregistered_schema_key_is_removed_on_failure(self):
-        # 业务层绕过 set_global_setting 直接写配置时，回滚仍能收拾"schema 内的
-        # 新增键"，但不会误删框架注入的内部键
-        # （PR #289 审查：unregistered-global-write）。
+    def test_keys_injected_during_save_are_kept(self):
+        # 保存过程中才出现的键必然是框架自己注入的（业务层的写入发生在快照之前，
+        # 已随快照恢复），哪怕它在 _conf_schema.json 里有声明也不能删
+        # （PR #289 审查：overbroad-schema-rollback）。
         config = _BypassWriteConfig(whitelist_users=["g1"])
         config.fail = True
         store = self.make_store(config)
         with self.assertRaises(OSError):
             store.save_config()
-        self.assertNotIn("rank_top_n", config)
+        self.assertIn("rank_top_n", config)
         self.assertIn("framework_helper_key", config)
 
     def test_rollback_failure_raises_dedicated_error(self):

@@ -139,6 +139,26 @@ class GroupTagsReadTests(unittest.IsolatedAsyncioTestCase):
             await self.read({"status": "ok", "result": {"tags": ["A"]}}), (False, [])
         )
 
+    async def test_response_without_explicit_success_is_not_trusted(self):
+        # 查询类响应必须带显式成功信号（status=ok/async 或 retcode/code=0）：
+        # 只有 data 的字典无法区分"正常空列表"与"错误载荷"，一律按读取失败，
+        # 免得覆盖型回退拿它当基线把已有标签清空
+        # （PR #289 审查：misleading-empty-state）。
+        self.assertEqual(await self.read({"data": []}), (False, []))
+        self.assertEqual(await self.read({"data": {"tags": []}}), (False, []))
+
+    async def test_error_payload_is_not_trusted(self):
+        # 错误载荷可能也带 data/tags，绝不能读成"本群没有标签"
+        self.assertEqual(await self.read({"error": "internal error", "data": []}), (False, []))
+        self.assertEqual(await self.read({"code": 1, "data": []}), (False, []))
+        self.assertEqual(await self.read({"retcode": 100, "data": []}), (False, []))
+        self.assertEqual(await self.read({"success": False, "data": []}), (False, []))
+
+    async def test_explicit_zero_code_is_success(self):
+        # 没有 status 但 retcode/code 明确为 0：可以信任（含空列表）
+        self.assertEqual(await self.read({"retcode": 0, "data": []}), (True, []))
+        self.assertEqual(await self.read({"code": 0, "data": ["A"]}), (True, ["A"]))
+
     async def test_tags_are_deduplicated(self):
         self.assertEqual(
             await self.read(["A", "A", {"tag": "A"}]), (True, ["A"])

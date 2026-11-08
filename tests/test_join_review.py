@@ -89,6 +89,9 @@ class _Api:
         self.group_texts = []
         self.nickname_queries = []
         self.handled = []
+        # 群内提醒发送结果：默认"成功且拿到 message_id"
+        self.group_send_ok = True
+        self.group_send_mid = "msg-1"
 
     def _get_self_id(self, event, raw=None):
         return "999000111"
@@ -105,7 +108,9 @@ class _Api:
 
     async def _send_group_text(self, event, group_id, text):
         self.group_texts.append(text)
-        return "msg-1"
+        if not self.group_send_ok:
+            return False, ""
+        return True, self.group_send_mid
 
     async def _notify_admins(self, text, group_id=None):
         self.admin_texts.append(text)
@@ -207,6 +212,47 @@ class UnknownInviteeNotifyTests(unittest.IsolatedAsyncioTestCase):
         # 昵称拿不到时只显示 QQ 号，通知照常发出
         self.assertIn("777 申请加入群 100", api.admin_texts[0])
         self.assertNotIn("获取失败(777)（777）", api.admin_texts[0])
+
+
+class PendingRecordLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """待处理记录只在通知真的发出去后登记（PR #289 审查：stale-pending-request）。
+
+    旧实现无论发送成功与否都写 pending_join_requests：通知全部通路失败时群内
+    看不到任何消息，记录却一直挂着，管理员之后引用一条从未发出的通知，处理的是
+    早已失效的申请。
+    """
+
+    async def test_no_pending_record_when_group_notify_fails(self):
+        store = _Store({"join_request_notify_in_group": True})
+        api = _Api()
+        api.group_send_ok = False
+        raw = dict(_UNKNOWN_INVITE_RAW, user_id="777", sub_type="add")
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
+
+        self.assertEqual(store.runtime_map("pending_join_requests"), {})
+        # 私聊通知照发，但不能谎称"已在群内发送提醒"
+        self.assertEqual(len(api.admin_texts), 1)
+        self.assertNotIn("已在群内发送提醒", api.admin_texts[0])
+        self.assertIn("发送失败", api.admin_texts[0])
+
+    async def test_pending_record_uses_flag_when_message_id_missing(self):
+        store = _Store({"join_request_notify_in_group": True})
+        api = _Api()
+        api.group_send_mid = ""
+        raw = dict(_UNKNOWN_INVITE_RAW, user_id="777", sub_type="add")
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
+
+        pending = store.runtime_map("pending_join_requests")
+        self.assertEqual(list(pending), ["flag:flag-abc"])
+        self.assertIn("已在群内发送提醒", api.admin_texts[0])
+
+    async def test_pending_record_keyed_by_message_id_on_success(self):
+        store = _Store({"join_request_notify_in_group": True})
+        api = _Api()
+        raw = dict(_UNKNOWN_INVITE_RAW, user_id="777", sub_type="add")
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
+
+        self.assertEqual(list(store.runtime_map("pending_join_requests")), ["msg-1"])
 
 
 class _Event:
