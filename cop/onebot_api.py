@@ -799,11 +799,15 @@ class OneBotApi:
 
         返回 (是否成功, 最后一个原始响应, 原因)。原因取值：
         "" / "not_found"（调用前标签就不存在）/ "still_present"（读回时标签仍在，
-        删除没生效）/ "read_failed"（读回失败，无法确认）。
+        删除没生效）/ "read_failed"（读取失败，无法确认标签是否存在或删除是否生效）。
 
         PR #289 审查：所有候选失败后读回标签做副作用确认——但必须先确认
         标签在调用前确实存在，否则"本来就没有这个标签"会被误报成删除成功
         （false-success-delete）。
+
+        删除前读不出标签时直接放弃、不发删除请求：删除是有副作用的破坏性动作，
+        连"目标是否存在"都无法确认就执行，等于无的放矢
+        （PR #289 审查：unverified-destructive-delete）。
 
         成功判定同样以**读回**为准：明确成功响应只说明"请求被接受"，有些协议端
         删不掉也回 status=ok；读回确认标签确实不在才算删除成功，读回失败或标签
@@ -816,8 +820,13 @@ class OneBotApi:
         失败不重复执行（duplicate-side-effect）。
         """
         before_ok, before_tags = await self._group_tags_read(event, group_id)
-        tag_exists = before_ok and tag in before_tags
-        if before_ok and not tag_exists:
+        if not before_ok:
+            # 连当前标签都读不出来：无法确认目标是否存在，不发出删除请求
+            logger.warning(
+                f"[OneBot] 删除群标签前读取群标签失败，已放弃删除"
+                f"（群 {group_id} 标签 {tag}）")
+            return False, None, "read_failed"
+        if tag not in before_tags:
             # 删除前就不存在：不必发出任何删除请求
             return False, None, "not_found"
 
@@ -826,7 +835,7 @@ class OneBotApi:
             ("delete_group_tag", {"tags": [tag]}),
         )
         last = None
-        read_supported = before_ok
+        read_supported = True
         after_ok, after_tags = before_ok, before_tags
         still_present = False
         for index, (action, extra) in enumerate(candidates):

@@ -97,6 +97,17 @@ class DeleteGroupTagTests(unittest.IsolatedAsyncioTestCase):
         ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
         self.assertFalse(ok)
         self.assertEqual(reason, "read_failed")
+        # 删除前读不出标签就不发出删除请求：无法确认目标是否存在
+        # （PR #289 审查：unverified-destructive-delete）。
+        self.assertEqual(api.delete_calls, 0)
+
+    async def test_explicit_success_without_pre_read_is_not_issued(self):
+        # 即便协议端会回 status=ok，也不能在读不到标签时盲目执行删除
+        api = _TagApi(before=None, after=None, raw_result={"status": "ok", "retcode": 0})
+        ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "read_failed")
+        self.assertEqual(api.delete_calls, 0)
 
     async def test_tag_still_present_after_delete_is_failure(self):
         api = _TagApi(before=["老标签"], after=["老标签"], raw_result=_fail_payload())
@@ -128,13 +139,6 @@ class DeleteGroupTagTests(unittest.IsolatedAsyncioTestCase):
         ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
         self.assertFalse(ok)
         self.assertEqual(reason, "read_failed")
-
-    async def test_explicit_success_without_read_interface_is_trusted(self):
-        # 协议端压根不提供读接口：只能以 action 响应为唯一依据
-        api = _TagApi(before=None, after=None, raw_result={"status": "ok", "retcode": 0})
-        ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
-        self.assertTrue(ok)
-        self.assertEqual(reason, "")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import os
 import re
 import tempfile
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from astrbot.api import logger
@@ -180,7 +181,7 @@ class ConfigStore:
             # 框架配置对象也拍一份快照：save_config() 失败时进程内可能已经改了
             # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
             # （PR #289 审查：incomplete-persistence-rollback）。
-            prev_global = copy.deepcopy(dict(self.config)) if isinstance(self.config, dict) else None
+            prev_global = self._config_snapshot()
             prev_global_file = self._snapshot_framework_file()
             touched_keys = tuple(self._touched_keys)
             touched_prev = dict(self._touched_prev)
@@ -231,19 +232,38 @@ class ConfigStore:
         已恢复的旧值又覆盖成新值（PR #289 审查：double-rollback-corruption）。
         """
         with self._lock:
-            if isinstance(self.config, dict):
-                self._touched_prev = {key: (copy.deepcopy(self.config.get(key)), key in self.config)}
+            # 按 Mapping 协议而不是 isinstance(dict) 判定：UserDict 等非 dict
+            # 映射同样要能写入并建立快照；不支持 Mapping 的对象直接抛错，
+            # 不能"既不写也不报错"让调用方以为已保存
+            # （PR #289 审查：unsupported-config-type）。
+            if not isinstance(self.config, Mapping):
+                raise TypeError(
+                    f"配置对象类型 {type(self.config).__name__} 不支持 Mapping 协议，"
+                    "无法安全写入并回滚")
+            snapshot = self._config_snapshot()
+            if snapshot is not None and key in snapshot:
+                self._touched_prev = {key: (copy.deepcopy(snapshot[key]), True)}
             else:
-                self._touched_prev = {}
+                self._touched_prev = {key: (None, False)}
             self._touched_keys = (key,)
-            if isinstance(self.config, dict):
-                self.config[key] = value
             try:
+                self.config[key] = value
                 self.save_config()
             except Exception:
                 self._touched_keys = ()
                 self._touched_prev = {}
                 raise
+
+    def _config_snapshot(self):
+        """按 Mapping 协议取框架配置的全量键值快照；不支持时返回 None。"""
+        if not isinstance(self.config, Mapping):
+            return None
+        try:
+            return copy.deepcopy(dict(self.config))
+        except Exception as e:
+            logger.warning(
+                f"[群管插件] 备份框架配置内存值失败，回滚将只保证磁盘一致: {e}")
+            return None
 
     def _snapshot_framework_file(self):
         """备份框架配置文件原文（拿不到路径或读不到内容时返回 None）。"""
@@ -288,7 +308,7 @@ class ConfigStore:
         的快照是在调用方改完之后才拍的，必须用它把目标快照修正回真正的写前状态，
         否则回滚会把新值当成旧值留下来（PR #289 审查：double-rollback-corruption）。
         """
-        if prev_global is None or not isinstance(self.config, dict):
+        if prev_global is None or not isinstance(self.config, Mapping):
             return None
         target = dict(prev_global)
         for key, info in (touched_prev or {}).items():

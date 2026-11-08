@@ -2149,6 +2149,12 @@ class GroupAdminPlugin(Star):
                 f"删除群标签「{text}」未生效：读回时本群仍有该标签，"
                 "请确认机器人有群主权限，或到 QQ 客户端手动删除")
             return
+        if reason == "read_failed" and result is None:
+            # 删除前就读不出标签：本次没有发出任何删除请求
+            yield event.plain_result(
+                f"删除群标签「{text}」未执行：删除前读取群标签失败，"
+                "无法确认该标签是否存在；请稍后重试，或到 QQ 客户端手动删除")
+            return
         logger.warning(f"删除群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'delete_group_tag')
         if reason == "read_failed":

@@ -41,6 +41,7 @@ if "astrbot" not in sys.modules:
     sys.modules["astrbot.api"] = api
 
 from unittest.mock import patch  # noqa: E402
+from collections import UserDict  # noqa: E402
 
 from cop.config_store import ConfigRollbackError, ConfigStore  # noqa: E402
 
@@ -149,6 +150,23 @@ class _CountingRollbackConfig(_FailingConfig):
     def __setitem__(self, key, value):
         self.writes.append((key, copy.deepcopy(value)))
         super().__setitem__(key, value)
+
+
+class _MappingConfig(UserDict):
+    """非 dict 的 Mapping 配置桩：验证按 Mapping 协议写入与回滚。"""
+
+    fail = False
+
+    def save_config(self):
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
+class _NonMappingConfig:
+    """不支持 Mapping 协议的配置对象：写入必须显式报错，不能静默跳过。"""
+
+    def save_config(self):
+        pass
 
 
 class _JsonStore:
@@ -826,6 +844,24 @@ class GroupOverrideTests(unittest.TestCase):
             store.save_config()
         self.assertIn("rank_top_n", config)
         self.assertIn("framework_helper_key", config)
+
+    def test_mapping_config_write_and_rollback(self):
+        # 非 dict 的 Mapping（如 UserDict）同样要能写入、建快照并在失败后回滚
+        # （PR #289 审查：unsupported-config-type）。
+        config = _MappingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.set_global_setting("rank_top_n", 30)
+        self.assertEqual(config["rank_top_n"], 30)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.set_global_setting("whitelist_users", ["changed"])
+        self.assertEqual(config["whitelist_users"], ["g1"])
+
+    def test_non_mapping_config_raises_instead_of_silent_success(self):
+        config = _NonMappingConfig()
+        store = self.make_store(config)
+        with self.assertRaises(TypeError):
+            store.set_global_setting("rank_top_n", 30)
 
     def test_key_deleted_during_save_is_restored(self):
         # 框架保存过程中删掉一个原有键再抛错：回滚要在 config 里把缺的键补回来，
