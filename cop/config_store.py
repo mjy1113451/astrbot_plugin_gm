@@ -58,6 +58,10 @@ class ConfigStore:
         # 本次保存事务里由插件显式改写的全局配置键：回滚时只删这些键，
         # 不做"当前键集合 − 快照"的差集删除（PR #289 审查：overbroad-memory-rollback）。
         self._touched_keys: tuple = ()
+        # _conf_schema.json 声明的顶层键：回滚删除"本次新增键"时用来区分
+        # "schema 内的配置键"与"框架注入的内部键"（PR #289 审查：
+        # unregistered-global-write）。
+        self._schema_keys = self._load_schema_keys()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -261,10 +265,12 @@ class ConfigStore:
     def _restore_framework_config(self, prev_global, touched=None):
         """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
 
-        只做两件安全的事：把快照里存在的键改回原值；把 `touched` 里明确列出的
-        新增键删掉。**不能**用"当前键集合 − 快照"做差集删除——框架在保存过程中
-        可能往配置对象里注入自己的内部/辅助键，差集回滚会把它们一起删掉
-        （PR #289 审查：overbroad-memory-rollback）。
+        只做两件安全的事：把快照里存在的键改回原值；把"本次新增且可确认属于
+        插件"的键删掉——可确认 = 通过 set_global_setting 显式登记，或在
+        _conf_schema.json 里有声明（业务层直接改 `self.config` 绕过了登记时
+        仍然能收拾掉）。框架自己注入的内部键既不在 touched 里也没有 schema
+        声明，因此不会被误删（PR #289 审查：overbroad-memory-rollback /
+        unregistered-global-write）。
         """
         if prev_global is None or not isinstance(self.config, dict):
             return None
@@ -276,25 +282,38 @@ class ConfigStore:
                 self.config[key] = copy.deepcopy(value)
             except Exception as e:
                 failures.append(e)
-        for key in touched or ():
-            if key in prev_global:
-                continue
+        try:
+            new_keys = [k for k in self.config.keys() if k not in prev_global]
+        except Exception:
+            new_keys = []
+        removable = [
+            k for k in new_keys
+            if k in (touched or ()) or k in self._schema_keys
+        ]
+        for key in removable:
             try:
                 self.config.pop(key, None)
             except Exception as e:
                 failures.append(e)
-        try:
-            extra = [k for k in self.config.keys() if k not in prev_global]
-        except Exception:
-            extra = []
-        if extra:
-            # 不删：无法区分"我们的新增键"与"框架注入的内部键"，交给持有
-            # 明确键名的事务接口（set_global_setting）去收拾
-            logger.debug(f"[群管插件] 回滚后仍存在写前没有的配置键（保留未删）: {extra}")
+        kept = [k for k in new_keys if k not in removable]
+        if kept:
+            # 不删：无法区分"我们的新增键"与"框架注入的内部键"
+            logger.debug(f"[群管插件] 回滚后仍存在写前没有的配置键（保留未删）: {kept}")
         if failures:
             logger.error(f"[群管插件] 回滚框架配置内存值失败: {failures[0]}")
             return failures[0]
         return None
+
+    @staticmethod
+    def _load_schema_keys():
+        """读取 _conf_schema.json 的顶层键集合（读不到时返回空集合）。"""
+        schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            return frozenset(schema.keys()) if isinstance(schema, dict) else frozenset()
+        except Exception as e:
+            logger.warning(f"[群管插件] 读取 _conf_schema.json 键集合失败: {e}")
+            return frozenset()
 
     @staticmethod
     def _atomic_write_text(path: Path, text: str) -> None:
@@ -727,56 +746,49 @@ class ConfigStore:
         ops = self._list_ops(group_id, key)
         return bool(ops["added"] or ops["removed"])
 
-    def _adopt_snapshot(self, group_id: str, key: str, baseline: list, ops: dict) -> dict:
-        """首次变更旧版"普通列表快照"时，先把快照转成增量操作再叠加。
+    def _adopt_legacy_snapshot(self, group_id: str, key: str) -> bool:
+        """把旧版"普通列表快照"直接认作显式整体快照，返回是否认领成功。
 
         老版本直接在 group_overrides 里写完整列表、没有 __list_ops__ 记录。
-        若不做转换，第一次增删就会用"模板/全局基线 + 本次操作"覆盖掉快照，
-        本群原有的名单条目会静默消失（PR #289 审查：legacy-data-loss）。
+        若不做处理，第一次增删就会用"模板/全局基线 + 本次操作"覆盖掉快照，
+        本群原有的名单条目静默消失（PR #289 审查：legacy-data-loss）。
 
-        带 __list_snapshot__ 标记的显式整体赋值不走这里——那种键的基线就是
-        快照本身（见 _list_baseline），转换反而会把它挂回模板/全局
-        （PR #289 审查：explicit-snapshot-semantics-loss）。
+        做法是给这份旧值补上 __list_snapshot__ 标记，让它成为该键的基线
+        （与 set_group_override 的整体赋值同语义）：内容原样保留，后续增删在
+        这份快照上叠加，不再假装是"管理员显式新增"的项——否则那些"全局没有"
+        的历史项会被永久记成 added，全局以后删同名项时本群还留着
+        （PR #289 审查：legacy-snapshot-added-semantics）。
 
-        转换规则：快照里有、基线里没有的项记 added；基线里有、快照里没有的项
-        记 removed（来源记为基线，与手动删除同语义）。转换后合并结果与快照一致，
-        后续增删再在此基础上叠加。
+        这也是旧版本的真实行为：旧版读取就是原样返回这份完整列表，不跟随
+        模板/全局变化，认领成快照 = 保持升级前的表现。
         """
         overrides = self.runtime_map("group_overrides")
         gconf = overrides.get(str(group_id))
         if not isinstance(gconf, dict):
-            return ops
+            return False
         if self._is_explicit_snapshot(group_id, key):
-            return ops
-        snapshot = gconf.get(key)
-        if not isinstance(snapshot, list):
-            return ops
-        snap = self._as_str_list(snapshot)
-        added = [x for x in snap if x not in baseline]
-        removed = [x for x in baseline if x not in snap]
-        if not (added or removed):
-            return ops
+            return False
+        if not isinstance(gconf.get(key), list):
+            return False
+        self._mark_explicit_snapshot(group_id, key, True)
         logger.debug(
-            f"[群管插件] 群 {group_id} 的 {key} 是旧版列表快照，已转为增量操作"
-            f"（新增 {len(added)} 项、删除 {len(removed)} 项）"
+            f"[群管插件] 群 {group_id} 的 {key} 是旧版整体列表快照，"
+            f"已按显式快照保留（不跟随模板/全局变化）"
         )
-        return {
-            "added": added,
-            "removed": removed,
-            "removed_baseline": {x: True for x in removed},
-        }
+        return True
 
     def _apply_list_ops(self, group_id: str, key: str, add=(), remove=()) -> list:
         """记录一次增/删操作并物化生效列表（不做持久化，由调用方提交）。
 
-        第一次变更旧版普通列表快照时先把快照转成增量（见 _adopt_snapshot）。
+        第一次变更旧版普通列表快照时先把它认作显式快照（见
+        _adopt_legacy_snapshot），再在它的基础上叠加本次操作。
         """
         ops = self._list_ops(group_id, key)
+        explicit_snapshot = self._is_explicit_snapshot(group_id, key)
+        if not (ops["added"] or ops["removed"]) and not explicit_snapshot:
+            explicit_snapshot = self._adopt_legacy_snapshot(group_id, key)
         # 记录删除时的基线内容（显式快照 / 模板 / 全局），供后续区分"删的是谁的项"
         baseline = self._list_baseline(group_id, key)
-        explicit_snapshot = self._is_explicit_snapshot(group_id, key)
-        if not (ops["added"] or ops["removed"]):
-            ops = self._adopt_snapshot(group_id, key, baseline, ops)
         for item in add:
             item = str(item).strip()
             if not item:

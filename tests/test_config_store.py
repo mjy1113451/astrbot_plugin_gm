@@ -112,6 +112,21 @@ class _WriteThenFailConfig(_FailingConfig):
             raise OSError("config.json 写入失败（模拟）")
 
 
+class _BypassWriteConfig(_FailingConfig):
+    """模拟业务层绕过 set_global_setting 直接往配置对象里写键。
+
+    一个写 schema 声明的键（rank_top_n），一个写框架内部风格的键
+    （framework_helper_key），用来验证回滚只删前者。
+    """
+
+    def save_config(self):
+        self.saves += 1
+        self["rank_top_n"] = 99
+        self["framework_helper_key"] = "内部键"
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
 class _JsonStore:
     """最小 JSON 存储桩：可切换"写失败"，用来验证 strict 写入的传播。"""
 
@@ -598,7 +613,7 @@ class GroupOverrideTests(unittest.TestCase):
 
     def test_legacy_plain_snapshot_survives_first_add(self):
         # 升级前 runtime.json 里的普通列表快照（没有 __list_ops__）首次被增删时
-        # 必须转成增量继承下来，不能用"模板/全局基线 + 本次新增"把它覆盖掉
+        # 认作显式整体快照继承下来，不能用"模板/全局基线 + 本次新增"把它覆盖掉
         # （PR #289 审查：legacy-data-loss）。
         config = _Config(whitelist_users=["global1"])
         store = self.make_store(config)
@@ -611,11 +626,35 @@ class GroupOverrideTests(unittest.TestCase):
         ok, current = store.mutate_group_list("100", "whitelist_users", "add", "new1")
         self.assertTrue(ok)
         self.assertEqual(current, ["old1", "old2", "new1"])
-        # 旧快照里没有的全局项视为本群显式删除，不会随迁移冒出来
+        # 旧快照里没有的全局项不会随迁移冒出来
         self.assertNotIn("global1", current)
         ops = store._list_ops("100", "whitelist_users")
-        self.assertEqual(ops["added"], ["old1", "old2", "new1"])
-        self.assertEqual(ops["removed"], ["global1"])
+        # 历史项不算"管理员显式新增"，只有本次真正新增的才记 added
+        # （PR #289 审查：legacy-snapshot-added-semantics）
+        self.assertEqual(ops["added"], ["new1"])
+        self.assertEqual(ops["removed"], [])
+        self.assertTrue(store._is_explicit_snapshot("100", "whitelist_users"))
+
+    def test_legacy_snapshot_stays_independent_of_later_baseline(self):
+        # 迁移后的旧快照是"本群自己的完整列表"（旧版本行为）：全局以后删掉
+        # 同名项、或新增别的项，都不会改变本群这份列表
+        # （PR #289 审查：legacy-snapshot-added-semantics）。
+        config = _Config(whitelist_users=["global1", "shared"])
+        store = self.make_store(config)
+        store.runtime_map("group_overrides")["100"] = {
+            "whitelist_users": ["shared", "old1"]
+        }
+        store.mutate_group_list("100", "whitelist_users", "add", "new1")
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"),
+            ["shared", "old1", "new1"],
+        )
+        # 全局删掉 shared、新增 global2：本群列表原样不动
+        config["whitelist_users"] = ["global2"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"),
+            ["shared", "old1", "new1"],
+        )
 
     def test_legacy_plain_snapshot_survives_first_remove(self):
         config = _Config(whitelist_users=["global1", "global2"])
@@ -739,6 +778,18 @@ class GroupOverrideTests(unittest.TestCase):
         with self.assertRaises(OSError):
             store.set_global_setting("whitelist_users", ["changed"])
         self.assertEqual(config["whitelist_users"], ["g1"])
+
+    def test_unregistered_schema_key_is_removed_on_failure(self):
+        # 业务层绕过 set_global_setting 直接写配置时，回滚仍能收拾"schema 内的
+        # 新增键"，但不会误删框架注入的内部键
+        # （PR #289 审查：unregistered-global-write）。
+        config = _BypassWriteConfig(whitelist_users=["g1"])
+        config.fail = True
+        store = self.make_store(config)
+        with self.assertRaises(OSError):
+            store.save_config()
+        self.assertNotIn("rank_top_n", config)
+        self.assertIn("framework_helper_key", config)
 
     def test_rollback_failure_raises_dedicated_error(self):
         # 连回滚都失败时不能只记日志：调用方必须知道"配置可能不可信"
