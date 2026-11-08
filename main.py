@@ -2086,6 +2086,12 @@ class GroupAdminPlugin(Star):
                 "添加群标签结果未知：协议端未返回明确结果，且本群标签列表读不回来，"
                 "无法确认是否已添加，请到 QQ 客户端核对；如未生效可重试")
             return
+        if warn == "tags_altered":
+            # 覆盖型接口执行后出现了基线之外的标签：标签集合已偏离预期
+            yield event.plain_result(
+                "添加群标签失败：协议端执行覆盖型标签接口后，本群出现了预期之外的标签，"
+                "请到 QQ 客户端核对并手动清理")
+            return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'add_group_tag')
         # #249：群标签接口并非 OneBot v11 标准 action，go-cqhttp / Lagrange 均未

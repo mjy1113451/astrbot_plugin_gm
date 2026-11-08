@@ -558,6 +558,8 @@ class OneBotApi:
 
         告警码："" 正常；"tags_may_be_lost" 表示覆盖型接口执行后本群原有标签
         可能已丢失（补回失败），调用方必须提示管理员人工核对，不能当普通成功/失败处理；
+        "tags_altered" 表示覆盖型接口执行后出现了基线之外的标签（语义已偏离），
+        需提示管理员核对清理；
         "unverified" 表示读接口不可用、响应又只是含糊成功，无法确认标签到底加没加上，
         调用方应提示管理员到客户端核对，而不是回执"添加失败"或"已添加"。
 
@@ -608,6 +610,7 @@ class OneBotApi:
             ])
         last = None
         action_unsupported = False
+        explicit_ok_absent = False
         for index, (action, extra) in enumerate(candidates):
             if action == "set_group_tag":
                 # 覆盖型接口只是"协议端没有纯新增 action"时的兼容回退：读接口
@@ -630,6 +633,11 @@ class OneBotApi:
                         f"[OneBot] 覆盖型群标签接口执行后本群原有标签可能已丢失，"
                         f"已停止后续回退（群 {group_id}）")
                     return False, last, "tags_may_be_lost"
+                if state == "unexpected_tags":
+                    logger.error(
+                        f"[OneBot] 覆盖型群标签接口执行后出现预期之外的标签，"
+                        f"请人工核对（群 {group_id}）")
+                    return False, last, "tags_altered"
                 if state == "target_missing":
                     logger.error(
                         f"[OneBot] 覆盖型群标签接口执行后目标标签仍未加入，"
@@ -649,22 +657,26 @@ class OneBotApi:
                         return True, last, ""
                     confirmed_absent = True
                     if self._action_result_explicit_success(last):
-                        # 明确成功却读不回来：重复执行同一个有副作用的 action
-                        # 只会多做一次无效改写，直接按"未生效"上报
-                        # （PR #289 审查：unnecessary-side-effect-retry）
-                        logger.warning(
-                            f"[OneBot] add_group_tag 回报成功但读回仍无该标签，"
-                            f"不再重复调用（群 {group_id} 标签 {tag}）")
-                        return False, last, ""
+                        # 明确成功却读不回该标签：不能直接断言失败（读回可能
+                        # 滞后、操作其实已生效），但也绝不因此进入覆盖型接口；
+                        # 最多在纯新增变体之间再试一次
+                        # （PR #289 审查：unnecessary-side-effect-retry /
+                        # premature-failure-after-explicit-success）
+                        explicit_ok_absent = True
                 else:
                     read_supported = False
             if index + 1 >= len(candidates):
+                break
+            # 明确成功过就只在纯新增变体之间再试一次，绝不进入覆盖型接口
+            # （PR #289 审查：premature-failure-after-explicit-success）
+            if explicit_ok_absent and candidates[index + 1][0] != "add_group_tag":
                 break
             # 读回确认"确实没加上"时可以安全换变体（add 是纯新增语义）；
             # 读不回来时只有"action/参数不被接受"才换，含糊响应一律停手，
             # 避免重复执行有副作用的 action
             if not self._failure_invites_retry(
-                    last, action, ambiguous_retry=confirmed_absent):
+                    last, action,
+                    ambiguous_retry=confirmed_absent or explicit_ok_absent):
                 break
         if not read_supported and last is not None:
             if self._action_result_explicit_success(last):
@@ -678,6 +690,10 @@ class OneBotApi:
                 # 含糊成功 + 读不回来：既不能报成功（可能压根没加上），也不能
                 # 断言失败（可能已经加上了），交管理员到客户端核对
                 return False, last, "unverified"
+        if explicit_ok_absent:
+            # 协议端明确成功、读回却始终没有该标签：读回可能滞后，也不能断言
+            # 失败（PR #289 审查：premature-failure-after-explicit-success）
+            return False, last, "unverified"
         return False, last, ""
 
     async def _verify_and_restore_tags(self, event: AstrMessageEvent, group_id: str,
@@ -685,15 +701,21 @@ class OneBotApi:
         """覆盖型调用后确认"目标标签已加上"且"旧标签没被挤掉"，缺什么补什么。
 
         返回状态：
-        - "verified"：目标标签在、基线完整，不需要任何补救；
+        - "verified"：目标标签在、基线完整、没有多余标签，不需要任何补救；
         - "restored"：目标标签或旧标签有缺失，但都已补回并用读回确认过；
         - "target_missing"：旧标签完整，但目标标签始终没加上（本次添加未生效）；
+        - "unexpected_tags"：出现了基线之外、且不是目标标签的标签，语义已偏离
+          "基线 + 目标"，需要人工核对；
         - "restore_failed"：有旧标签补不回来或无法确认，原标签可能已丢失
           （读不回标签集合时也按这个状态处理，宁可让管理员核对）。
 
         只补旧标签是不够的：覆盖型接口可能"保留旧标签但没把目标标签加上"，
         那样会回执"已添加"却查不到目标标签（PR #289 审查：incomplete-tag-restoration）。
         所以目标标签缺失时先用纯新增 action 补加，再恢复基线，最后统一读回确认。
+
+        预期集合按"基线 ∪ 目标标签"校验：覆盖型接口的语义就是整体改写，多出来的
+        标签既不是基线也不是目标，说明协议端行为偏离预期，不能默默接受
+        （PR #289 审查：incomplete-overwrite-verification）。
 
         补加的每个 action 结果都要看：只要有一个没被协议端接受，就不能对外声称
         "已恢复"（PR #289 审查：ignored-side-effect-failure）。
@@ -703,6 +725,12 @@ class OneBotApi:
             logger.warning(
                 f"[OneBot] set_group_tag 后无法读取群标签，改写成败未知（群 {group_id}）")
             return "restore_failed"
+        expected = set(baseline_tags) | {tag}
+        extra = [t for t in tags if t not in expected]
+        if extra:
+            logger.error(
+                f"[OneBot] 覆盖型群标签接口执行后出现预期之外的标签: {extra}（群 {group_id}）")
+            return "unexpected_tags"
         missing = [t for t in baseline_tags if t not in tags and t != tag]
         target_ok = tag in tags
         if target_ok and not missing:
@@ -710,17 +738,28 @@ class OneBotApi:
         if not target_ok:
             logger.warning(
                 f"[OneBot] 覆盖型群标签接口未加入目标标签，正在补加: {tag}（群 {group_id}）")
-            await self._add_tag_quietly(event, group_id, tag)
+            if not await self._add_tag_quietly(event, group_id, tag):
+                logger.error(
+                    f"[OneBot] 目标标签 {tag} 补加未被协议端接受，以最终读回结果为准"
+                    f"（群 {group_id}）")
         if missing:
             logger.warning(
                 f"[OneBot] set_group_tag 覆盖了本群原有群标签，正在补回: {missing}（群 {group_id}）")
             for old_tag in missing:
-                await self._add_tag_quietly(event, group_id, old_tag)
+                if not await self._add_tag_quietly(event, group_id, old_tag):
+                    logger.error(
+                        f"[OneBot] 旧标签 {old_tag} 补加未被协议端接受，以最终读回结果为准"
+                        f"（群 {group_id}）")
         # 读回最终确认：目标标签与旧标签都要真的在，不能只看 action 有没有抛错
         final_ok, final_tags = await self._group_tags_read(event, group_id)
         if not final_ok:
             logger.error(f"[OneBot] 补回群标签后无法读回确认（群 {group_id}）")
             return "restore_failed"
+        extra = [t for t in final_tags if t not in expected]
+        if extra:
+            logger.error(
+                f"[OneBot] 群标签恢复后出现了预期之外的标签: {extra}（群 {group_id}）")
+            return "unexpected_tags"
         still_missing = [t for t in baseline_tags if t not in final_tags and t != tag]
         if still_missing:
             logger.error(

@@ -255,14 +255,24 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.action_calls), 1)
         self.assertEqual(self.read_calls, 2)
 
-    async def test_explicit_success_without_tag_added_stops_immediately(self):
-        # 明确成功但读回仍没有该标签：不再换参数变体重复执行有副作用的调用
-        # （PR #289 审查：unnecessary-side-effect-retry）。
+    async def test_explicit_success_without_tag_added_retries_pure_add_once(self):
+        # 明确成功但读回仍没有该标签：最多在纯新增变体之间再试一次，之后报
+        # "结果未知"（读回可能滞后，不能直接断言失败），且绝不进入覆盖型接口
+        # （PR #289 审查：unnecessary-side-effect-retry /
+        # premature-failure-after-explicit-success）。
         api = self.make_api([], {"status": "ok"})
         ok, _, warn = await api._add_group_tag(None, "100", "标签B")
         self.assertFalse(ok)
+        self.assertEqual(warn, "unverified")
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
+
+    async def test_explicit_success_with_delayed_readback_is_success(self):
+        # 首次读回还没看到标签、第二次读回才出现（读回滞后）：按成功处理
+        api = self.make_api([], {"status": "ok"}, read_after=[[], ["标签B"]])
+        ok, _, warn = await api._add_group_tag(None, "100", "标签B")
+        self.assertTrue(ok)
         self.assertEqual(warn, "")
-        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"])
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
 
     async def test_ambiguous_failure_with_confirmed_absence_tries_variant(self):
         # 响应含糊 + 读回确认目标确实不在：换参数变体是安全的（上一次没生效）
@@ -382,7 +392,8 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
     没加入目标标签"的假成功被当成"已添加"。
     """
 
-    def make_api(self, baseline, overwrite_keeps_target=False, add_target_after_overwrite=False):
+    def make_api(self, baseline, overwrite_keeps_target=False, add_target_after_overwrite=False,
+                 overwrite_adds_extra=None):
         api = OneBotApi.__new__(OneBotApi)
         self.baseline = list(baseline)
         self.tags = list(baseline)
@@ -390,6 +401,8 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
         self.overwritten = False
         self.overwrite_keeps_target = overwrite_keeps_target
         self.add_target_after_overwrite = add_target_after_overwrite
+        # 覆盖型接口额外塞进来的标签（模拟协议端行为偏离预期）
+        self.overwrite_adds_extra = overwrite_adds_extra
 
         async def fake_get_tags(event, group_id):
             return list(self.tags)
@@ -398,11 +411,13 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append((action, params))
             tag = params.get("tag") or (params.get("tags") or [""])[0]
             if action == "set_group_tag":
-                # 覆盖语义：新的标签集合 = 目标标签（可选）+ 原有标签
+                # 覆盖语义：新的标签集合 = 目标标签（可选）+ 原有标签 + 意外标签
                 self.overwritten = True
                 self.tags[:] = list(self.baseline)
                 if self.overwrite_keeps_target and tag not in self.tags:
                     self.tags.append(tag)
+                if self.overwrite_adds_extra:
+                    self.tags.append(self.overwrite_adds_extra)
                 return {"status": "ok"}
             if action == "add_group_tag":
                 if tag in self.baseline:
@@ -447,6 +462,15 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(warn, "")
         self.assertEqual(sorted(self.tags), sorted(["旧标签", "新标签"]))
+
+    async def test_unexpected_extra_tag_is_reported(self):
+        # 覆盖型接口执行后出现了既不在基线、也不是目标标签的标签：语义已偏离
+        # "基线 + 目标"，不能默默接受（PR #289 审查：incomplete-overwrite-verification）
+        api = self.make_api(["旧标签"], overwrite_keeps_target=True,
+                            overwrite_adds_extra="意外标签")
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "tags_altered")
 
     async def test_permission_failure_never_reaches_overwrite(self):
         # 权限不足/标签预置限制这类失败不降级到覆盖型接口
