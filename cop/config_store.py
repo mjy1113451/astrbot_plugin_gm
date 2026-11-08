@@ -11,6 +11,8 @@
 
 import json
 
+import re
+
 from pathlib import Path
 
 from astrbot.api import logger
@@ -138,7 +140,7 @@ class ConfigStore:
         返回 (ok, 当前列表拷贝)。
         """
         with self._lock:
-            lst = self.get_group_override_list(group_id, key)
+            lst = self.get_group_override_list(group_id, key, for_update=True)
             if op == "add":
                 if any(str(x) == value for x in lst):
                     return False, list(lst)
@@ -200,6 +202,10 @@ class ConfigStore:
            显式覆盖——字段保持默认值意味着"未覆盖、回退全局"，这样管理员
            只需要填写真正想改的字段，也不用担心模板默认值冻结全局配置；
         3. 全局配置 / 默认值。
+
+        默认值判定拿不到"字段是否被显式填写"的信息，所以模板条目里另有
+        explicit_override_fields 用来声明"即使等于默认值也按覆盖处理"的字段
+        （例如本群要用空列表清空全局名单），命中时第 2 步直接采用该值。
         """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if key in overrides:
@@ -207,7 +213,9 @@ class ConfigStore:
         entry = self._template_group_entry(group_id)
         if entry is not None and key in self._template_field_defaults:
             value = entry.get(key, self._template_field_defaults[key])
-            if value != self._template_field_defaults[key]:
+            if value != self._template_field_defaults[key] or self._is_explicit_override(
+                entry, key
+            ):
                 return value
         return self.config.get(key, default)
 
@@ -261,19 +269,74 @@ class ConfigStore:
                 merged[k] = v
         return merged
 
+    def _is_explicit_override(self, entry: dict, key: str) -> bool:
+        """模板条目是否显式声明要覆盖 key（即使填写值等于模板默认值）。
+
+        explicit_override_fields 支持列表或逗号/空格分隔的字符串两种写法，
+        用于"本群要用空列表清空全局名单"这类无法靠默认值比较表达的意图。
+        """
+        raw = entry.get("explicit_override_fields")
+        if isinstance(raw, (list, tuple)):
+            names = [str(x) for x in raw]
+        else:
+            names = re.split(r"[,，;；\s]+", str(raw or ""))
+        return key in {n.strip() for n in names if n and n.strip()}
+
     # ===================== 按群覆盖读写 =====================
 
-    def get_group_override_list(self, group_id: str, key: str) -> list:
-        # review#192 race-condition：setdefault 首次创建也加锁，
+    def _effective_list(self, group_id: str, key: str) -> list:
+        """当前生效的列表值（运行时 → 模板 → 全局），返回可安全改动的新列表。"""
+        current = self.get_group_setting(group_id, key, [])
+        if isinstance(current, (list, tuple)):
+            return [str(x).strip() for x in current if str(x).strip()]
+        if isinstance(current, str):
+            return self.normalize_qq_list_value(current)
+        return [] if current is None else [current]
+
+    def get_group_override_list(
+        self, group_id: str, key: str, for_update: bool = False
+    ) -> list:
+        """取本群覆盖列表。
+
+        - for_update=False（只读）：本群已有运行时覆盖时返回其本体，否则返回
+          当前生效值（模板/全局）的拷贝——不创建运行时条目，避免"看一眼就
+          把模板值冻结成本群快照"。
+        - for_update=True（写入）：本群还没有运行时覆盖时，以当前生效值为基线
+          创建条目，增删操作在其上增量进行，不会整体遮蔽 WebUI 按群模板里的
+          列表（PR #289 审查：config-override-data-loss）。
+        """
+        # review#192 race-condition：首次创建也加锁，
         # 避免并发首建同 (group_id,key) 产生多个空 list 互相覆盖；RLock 可重入
         with self._lock:
             overrides = self.runtime_map("group_overrides")
+            gconf = overrides.get(str(group_id))
+            value = gconf.get(key) if isinstance(gconf, dict) else None
+            if isinstance(value, list):
+                return value
+            if not for_update:
+                if value is None:
+                    return self._effective_list(group_id, key)
+                return [value] if value else []
+            baseline = self._effective_list(group_id, key) if value is None else (
+                [value] if value else []
+            )
             gconf = overrides.setdefault(str(group_id), {})
-            value = gconf.setdefault(key, [])
-            if not isinstance(value, list):
-                value = [value] if value else []
-                gconf[key] = value
+            gconf[key] = baseline
+            return baseline
+
+    def runtime_group_list(self, group_id: str, key: str) -> list:
+        """只取本群运行时覆盖列表（没有则空列表，不回退模板/全局）。
+
+        用于「本群 XXX + 全局 XXX」同时展示的命令，避免本群段落把全局值
+        再显示一遍。
+        """
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        value = overrides.get(key) if isinstance(overrides, dict) else None
+        if isinstance(value, list):
             return value
+        if value is None:
+            return []
+        return [value] if value else []
 
     def set_group_override(self, group_id: str, key: str, value) -> None:
         """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。"""
@@ -284,7 +347,7 @@ class ConfigStore:
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
-            admins = self.get_group_override_list(group_id, key)
+            admins = self.get_group_override_list(group_id, key, for_update=True)
             added = []
             for qq in qq_list:
                 qq = str(qq)
@@ -297,7 +360,7 @@ class ConfigStore:
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
-            admins = self.get_group_override_list(group_id, key)
+            admins = self.get_group_override_list(group_id, key, for_update=True)
             removed = []
             for qq in qq_list:
                 qq = str(qq)

@@ -376,7 +376,9 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "join_approve_keywords")
+        kws = self._store.get_group_override_list(
+            group_id, "join_approve_keywords", for_update=True
+        )
         if keyword in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
@@ -397,7 +399,9 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "join_approve_keywords")
+        kws = self._store.get_group_override_list(
+            group_id, "join_approve_keywords", for_update=True
+        )
         if keyword not in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
@@ -493,7 +497,9 @@ class GroupAdminPlugin(Star):
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self._store.get_group_override_list(group_id, "whitelist_users")
+        wl = self._store.get_group_override_list(
+            group_id, "whitelist_users", for_update=True
+        )
         if user_id in [str(x) for x in wl]:
             yield event.plain_result(f"[错误] 用户 {user_id} 已在本群白名单中")
             return
@@ -513,7 +519,9 @@ class GroupAdminPlugin(Star):
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self._store.get_group_override_list(group_id, "whitelist_users")
+        wl = self._store.get_group_override_list(
+            group_id, "whitelist_users", for_update=True
+        )
         if user_id not in [str(x) for x in wl]:
             yield event.plain_result(f"[错误] 用户 {user_id} 不在本群白名单中")
             return
@@ -584,7 +592,9 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "ad_keywords")
+        kws = self._store.get_group_override_list(
+            group_id, "ad_keywords", for_update=True
+        )
         if keyword in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
@@ -604,7 +614,9 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "ad_keywords")
+        kws = self._store.get_group_override_list(
+            group_id, "ad_keywords", for_update=True
+        )
         if keyword not in kws:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
@@ -663,7 +675,9 @@ class GroupAdminPlugin(Star):
         if not domain:
             yield event.plain_result("[错误] 请提供域名，例如：example.com")
             return
-        wl = self._store.get_group_override_list(group_id, "link_whitelist")
+        wl = self._store.get_group_override_list(
+            group_id, "link_whitelist", for_update=True
+        )
         if domain in [str(x).lower().split("/")[0].lstrip("www.") for x in wl]:
             yield event.plain_result(f"[错误] 域名 '{domain}' 已在本群白名单中")
             return
@@ -683,7 +697,9 @@ class GroupAdminPlugin(Star):
         if not domain:
             yield event.plain_result("[错误] 请提供域名")
             return
-        wl = self._store.get_group_override_list(group_id, "link_whitelist")
+        wl = self._store.get_group_override_list(
+            group_id, "link_whitelist", for_update=True
+        )
         norm = [str(x).lower().split("/")[0].lstrip("www.") for x in wl]
         if domain not in norm:
             yield event.plain_result(f"[错误] 域名 '{domain}' 不在本群白名单中")
@@ -2191,7 +2207,9 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("下载图片失败，无法计算 MD5")
             return
         # 写入本群覆盖（统一走 _get_group_override_list）
-        banned = self._store.get_group_override_list(group_id, "banned_images")
+        banned = self._store.get_group_override_list(
+            group_id, "banned_images", for_update=True
+        )
         if md5 in banned:
             yield event.plain_result("该图片已在本群违禁列表中")
             return
@@ -2223,7 +2241,9 @@ class GroupAdminPlugin(Star):
         if not re.fullmatch(r"[0-9a-f]{4,32}", md5_prefix):
             yield event.plain_result("MD5 前缀必须为 4-32 位 hex 字符（0-9a-f），例如 /删除违禁图片 1a2b3c4d")
             return
-        gconf = self._store.get_group_override_list(group_id, "banned_images")
+        gconf = self._store.get_group_override_list(
+            group_id, "banned_images", for_update=True
+        )
         banned = list(gconf)
         if not banned:
             yield event.plain_result("本群无违禁图片")
@@ -2236,12 +2256,12 @@ class GroupAdminPlugin(Star):
             yield event.plain_result(f"匹配到多张（{len(matches)}），请用更长的前缀：\n" + "\n".join(matches))
             return
         target = matches[0]
-        self._store.get_group_override_list(group_id, "banned_images").remove(target)
+        gconf.remove(target)
         try:
             self._store.save_config()
         except Exception as e:
             # 持久化失败时回滚内存态
-            self._store.get_group_override_list(group_id, "banned_images").append(target)
+            gconf.append(target)
             logger.error(f"保存违禁图片配置失败: {e}")
             yield event.plain_result("保存失败，未删除该违禁图片")
             return
@@ -2259,7 +2279,8 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("只有群管理员或群主可执行此操作")
             return
         group_id = str(raw.get("group_id"))
-        banned = self._store.get_group_override_list(group_id, "banned_images")
+        # 本群段落只展示运行时覆盖，全局值单独成段，避免重复展示同一批 MD5。
+        banned = self._store.runtime_group_list(group_id, "banned_images")
         global_banned = self.config.get("banned_images", [])
         lines = []
         if banned:
@@ -2353,7 +2374,7 @@ class GroupAdminPlugin(Star):
         raw = self._mp._get_raw_message(event)
         qq_list = self._mp._extract_at_qqs(raw if isinstance(raw, dict) else {}) or _parse_qq_list(target)
         if not qq_list: yield event.plain_result("请通过 @某人 或QQ号指定目标"); return
-        lst = self._store.get_group_override_list(gid, key)
+        lst = self._store.get_group_override_list(gid, key, for_update=True)
         if add:
             changed = [q for q in qq_list if q not in [str(x) for x in lst] and (lst.append(q) or True)]
         else:
