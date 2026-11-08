@@ -199,7 +199,7 @@ class JoinReviewService:
         # #194：黑名单用户直接拒绝（无需检查关键词/门禁）
         # #270：invite 场景黑名单针对被邀请人 B，不针对邀请人 A
         bl_list = self._store.get_group_setting(group_id, "blacklisted_users", [])
-        if bl_list and str(applicant_id) in [str(x) for x in bl_list]:
+        if applicant_id and bl_list and str(applicant_id) in [str(x) for x in bl_list]:
             handled = await self._api._handle_group_request(
                 event, flag, False, "黑名单用户", sub_type=sub_type)
             yield event.plain_result(
