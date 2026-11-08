@@ -97,6 +97,21 @@ class _BrokenRollbackConfig(_MutatingFailingConfig):
         super().__setitem__(key, value)
 
 
+class _WriteThenFailConfig(_FailingConfig):
+    """模拟框架 save_config 已经把配置写脏再抛错（落盘/fsync 阶段失败）。"""
+
+    def __init__(self, *args, **kwargs):
+        self.config_path = kwargs.pop("config_path", None)
+        super().__init__(*args, **kwargs)
+
+    def save_config(self):
+        self.saves += 1
+        if self.config_path:
+            Path(self.config_path).write_text('{"whitelist_users": ["dirty"]}', encoding="utf-8")
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
 class _JsonStore:
     """最小 JSON 存储桩：可切换"写失败"，用来验证 strict 写入的传播。"""
 
@@ -714,6 +729,47 @@ class GroupOverrideTests(unittest.TestCase):
         store = self.make_store(config)
         with self.assertRaises(ConfigRollbackError):
             store.save_config()
+
+    def test_set_group_override_rolls_back_on_save_failure(self):
+        # 整体赋值写入后保存失败：内存里的运行时覆盖必须回滚，本群新建的条目
+        # 也要删掉，否则命令报错但进程内配置已经变了
+        # （PR #289 审查：missing-rollback）。
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.set_group_override("100", "whitelist_users", ["s1"])
+        self.assertNotIn("100", store.runtime_map("group_overrides"))
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g1"]
+        )
+
+    def test_drop_group_override_rolls_back_on_save_failure(self):
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.set_group_override("100", "whitelist_users", ["s1"])
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.drop_group_override("100", "whitelist_users")
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["s1"]
+        )
+
+    def test_framework_config_file_restored_after_partial_write(self):
+        # 框架 save_config 可能已经把文件写脏再抛错：只恢复内存不算完，
+        # 磁盘上的框架配置也要按原文写回
+        # （PR #289 审查：incomplete-persistence-rollback）。
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        original = '{"whitelist_users": ["g1"]}'
+        path.write_text(original, encoding="utf-8")
+        config = _WriteThenFailConfig(whitelist_users=["g1"], config_path=path)
+        config.fail = True
+        store = self.make_store(config)
+        with self.assertRaises(OSError):
+            store.save_config()
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_later_declaration_without_value_drops_declaration(self):
         # 后条声明了字段却没给值：字段值与声明都要去掉，条目不再声称覆盖它

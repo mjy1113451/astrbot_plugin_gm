@@ -153,6 +153,12 @@ class ConfigStore:
         整体重写（后者中途报错会留下部分状态），且任何一步回滚失败都改抛
         ConfigRollbackError 说明配置可能不可信，不再让调用方以为只是一次普通的
         保存失败（PR #289 审查：incomplete-memory-rollback）。
+
+        框架配置文件本身也做备份：save_config() 有可能"已经把文件写脏再抛错"
+        （例如写完 flush/fsync 阶段失败），只恢复内存和 runtime.json 时磁盘上
+        仍是一份坏配置。能拿到 config_path 时按原文原子写回；拿不到（自定义配置
+        对象没有该属性）就只能保证内存与 runtime.json 一致，此时若框架已写盘，
+        以框架文件为准需要管理员核对（PR #289 审查：incomplete-persistence-rollback）。
         """
         with self._lock:
             # 用哨兵区分"文件本来就不存在"（回滚时删除）与"读到了内容"（回滚时写回）。
@@ -168,11 +174,13 @@ class ConfigStore:
             # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
             # （PR #289 审查：incomplete-persistence-rollback）。
             prev_global = copy.deepcopy(dict(self.config)) if isinstance(self.config, dict) else None
+            prev_global_file = self._snapshot_framework_file()
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
                 self.config.save_config()
             except Exception as exc:
                 failure = self._restore_framework_config(prev_global)
+                failure = failure or self._restore_framework_file(prev_global_file)
                 try:
                     if prev_runtime is missing:
                         self.runtime_path.unlink(missing_ok=True)
@@ -184,14 +192,38 @@ class ConfigStore:
                     logger.error(
                         f"[群管插件] 保存框架配置失败后回滚 runtime.json 也失败，"
                         f"磁盘运行时数据可能领先于配置: {e}")
-                    if failure is None:
-                        failure = e
+                    failure = failure or e
                 if failure is not None:
                     raise ConfigRollbackError(
                         f"保存配置失败且回滚不完整（{failure}），"
                         f"当前进程的配置可能不可信，请重启插件或到 WebUI 核对后重试"
                     ) from exc
                 raise
+
+    def _snapshot_framework_file(self):
+        """备份框架配置文件原文（拿不到路径或读不到内容时返回 None）。"""
+        path = getattr(self.config, "config_path", None)
+        if not path:
+            return None
+        try:
+            path = Path(path)
+            return path, path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"[群管插件] 备份框架配置文件失败，回滚时无法恢复磁盘内容: {e}")
+            return None
+
+    def _restore_framework_file(self, snapshot):
+        """把框架配置文件恢复成写前原文；返回恢复失败的异常，全部成功返回 None。"""
+        if not snapshot:
+            return None
+        path, text = snapshot
+        try:
+            if not path.exists() or path.read_text(encoding="utf-8") != text:
+                self._atomic_write_text(path, text)
+        except OSError as e:
+            logger.error(f"[群管插件] 回滚框架配置文件失败: {e}")
+            return e
+        return None
 
     def _restore_framework_config(self, prev_global):
         """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
@@ -745,41 +777,43 @@ class ConfigStore:
                 overrides.pop(str(group_id), None)
         return merged
 
+    def _commit_runtime_change(self, group_id: str, apply) -> None:
+        """在锁内执行一次运行时覆盖变更并落盘；保存失败整体回滚本群覆盖。
+
+        回滚按"整群深拷贝快照"进行：值、增量记录（__list_ops__）、整体快照标记
+        （__list_snapshot__）一次全恢复，本群原先不存在就把本轮创建的条目删掉。
+        列表增删、整体赋值、清除覆盖三条写路径共用同一套失败处理，避免各写一份
+        回滚逻辑时漏掉某个痕迹（PR #289 审查：missing-rollback）。
+        """
+        with self._lock:
+            overrides = self.runtime_map("group_overrides")
+            gid = str(group_id)
+            prev_group = copy.deepcopy(overrides.get(gid)) if gid in overrides else None
+            try:
+                apply()
+                self.save_config()
+            except Exception:
+                if prev_group is None:
+                    overrides.pop(gid, None)
+                else:
+                    overrides[gid] = prev_group
+                raise
+
     def _commit_list_change(self, group_id: str, key: str, add=(), remove=()) -> list:
         """执行列表增删并落盘；保存失败时回滚运行时对象再抛出。
 
         回滚直接改运行时覆盖本体（值 + 增量记录），不是改读出来的副本
-        （PR #289 审查：rollback-not-persisted）。
+        （PR #289 审查：rollback-not-persisted）；具体回滚由
+        _commit_runtime_change 统一负责。
         """
-        with self._lock:
-            overrides = self.runtime_map("group_overrides")
-            had_group = str(group_id) in overrides
-            gconf = overrides.get(str(group_id))
-            prev_value = copy.deepcopy(gconf.get(key)) if isinstance(gconf, dict) else None
-            prev_ops = copy.deepcopy(gconf.get(self._LIST_OPS)) if isinstance(gconf, dict) else None
-            prev_marks = copy.deepcopy(gconf.get(self._LIST_SNAPSHOT)) if isinstance(gconf, dict) else None
+        merged = []
+
+        def apply():
+            nonlocal merged
             merged = self._apply_list_ops(group_id, key, add, remove)
-            try:
-                self.save_config()
-            except Exception:
-                gconf = overrides.get(str(group_id)) or {}
-                if prev_value is None:
-                    gconf.pop(key, None)
-                else:
-                    gconf[key] = prev_value
-                if prev_ops is None:
-                    gconf.pop(self._LIST_OPS, None)
-                else:
-                    gconf[self._LIST_OPS] = prev_ops
-                if prev_marks is None:
-                    gconf.pop(self._LIST_SNAPSHOT, None)
-                else:
-                    gconf[self._LIST_SNAPSHOT] = prev_marks
-                # 本次写入前本群没有任何覆盖时，回滚后不留空字典
-                if not gconf and not had_group:
-                    overrides.pop(str(group_id), None)
-                raise
-            return merged
+
+        self._commit_runtime_change(group_id, apply)
+        return merged
 
     def _effective_list(self, group_id: str, key: str) -> list:
         """当前生效的列表值（运行时 → 模板 → 全局），返回可安全改动的新列表。"""
@@ -836,19 +870,26 @@ class ConfigStore:
         返回是否确实删掉了东西。三个痕迹要一起清：只删值会留下 __list_ops__
         反向"复活"本群配置，只删 ops 会留下 __list_snapshot__ 让后续读取
         继续把这份值当基线（PR #289 审查：explicit-snapshot-semantics-loss）。
+        保存失败时整群覆盖回滚，本群条目不会被删掉一半。
         """
         with self._lock:
             overrides = self.runtime_map("group_overrides")
             gconf = overrides.get(str(group_id))
             if not isinstance(gconf, dict) or key not in gconf:
                 return False
-            del gconf[key]
+
+        def apply():
+            gconf = overrides.get(str(group_id))
+            if not isinstance(gconf, dict):
+                return
+            gconf.pop(key, None)
             self.drop_list_ops(group_id, key)
             self._mark_explicit_snapshot(group_id, key, False)
             if not gconf:
                 overrides.pop(str(group_id), None)
-            self.save_config()
-            return True
+
+        self._commit_runtime_change(group_id, apply)
+        return True
 
     def set_group_override(self, group_id: str, key: str, value) -> None:
         """按群覆盖写入单个配置项并持久化（#192 owner：管理指令直接按群生效）。
@@ -857,13 +898,17 @@ class ConfigStore:
         此后以这份快照为基线（不随模板/全局变化）。标记与"旧版残留列表"区分开，
         后者在首次增删时才转成增量操作
         （PR #289 审查：explicit-snapshot-semantics-loss）。
+
+        保存失败时整群覆盖回滚到写前状态（含本轮新建的本群条目），不会留下
+        "内存里改了、磁盘上没改"的残留配置（PR #289 审查：missing-rollback）。
         """
-        with self._lock:
+        def apply():
             overrides = self.runtime_map("group_overrides")
             overrides.setdefault(str(group_id), {})[key] = value
             self.drop_list_ops(group_id, key)
             self._mark_explicit_snapshot(group_id, key, isinstance(value, list))
-            self.save_config()
+
+        self._commit_runtime_change(group_id, apply)
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
         with self._lock:
