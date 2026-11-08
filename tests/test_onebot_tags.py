@@ -132,5 +132,90 @@ class GroupTagsReadTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
+    """添加群标签时的读回预算（PR #289 审查：duplicate-side-effect）。
+
+    读接口不可用时不能每个候选都重查一遍，否则一次添加会打出 4 次无效请求。
+    """
+
+    def make_api(self, read_raw, action_result):
+        api = OneBotApi.__new__(OneBotApi)
+        self.read_calls = 0
+        self.action_calls = []
+
+        async def fake_get_tags(event, group_id):
+            self.read_calls += 1
+            return read_raw
+
+        async def fake_call(event, action, **params):
+            self.action_calls.append((action, params))
+            return action_result
+
+        api._get_group_tags = fake_get_tags
+        api._call_onebot_raw = fake_call
+        return api
+
+    async def test_read_unsupported_does_not_requery_per_candidate(self):
+        api = self.make_api(None, {"status": "failed", "retcode": -1})
+        ok, _ = await api._add_group_tag(None, "100", "标签A")
+        self.assertFalse(ok)
+        # 只探一次读能力，其余 4 个候选都不再读回
+        self.assertEqual(self.read_calls, 1)
+        self.assertEqual(len(self.action_calls), 4)
+
+    async def test_preexisting_tag_skips_side_effect(self):
+        api = self.make_api(["标签A"], {"status": "ok"})
+        ok, result = await api._add_group_tag(None, "100", "标签A")
+        self.assertTrue(ok)
+        self.assertIsNone(result)
+        self.assertEqual(self.action_calls, [])
+        self.assertEqual(self.read_calls, 1)
+
+    async def test_success_response_without_status_returns_early(self):
+        api = self.make_api([], {"data": None})
+        ok, _ = await api._add_group_tag(None, "100", "标签B")
+        self.assertTrue(ok)
+        # 首个候选即成功，不再尝试其余变体
+        self.assertEqual(len(self.action_calls), 1)
+
+    async def test_missing_tag_after_all_candidates_fails(self):
+        api = self.make_api([], {"status": "failed", "retcode": -1})
+        ok, _ = await api._add_group_tag(None, "100", "标签C")
+        self.assertFalse(ok)
+        self.assertEqual(len(self.action_calls), 4)
+
+
+class JoinRequestCollectionTests(unittest.TestCase):
+    """申请查询结果解析（PR #289 审查：misleading-diagnostic-output）。"""
+
+    def test_system_msg_only_join_requests_count(self):
+        # get_group_system_msg 里其它字段是系统消息，不能算申请
+        data = {
+            "join_requests": [{"group_id": "100", "flag": "f1", "sub_type": "add"}],
+            "invited_requests": [{"group_id": "100", "invitor_uin": "1"}],
+            "system_msg": [{"type": "member_increase"}],
+        }
+        requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=True)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(others, 2)
+
+    def test_request_interface_counts_all_list_items(self):
+        data = [{"user_id": "777", "flag": "f1"}, {"user_id": "888"}]
+        requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=False)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(others, 0)
+
+    def test_other_group_requests_are_skipped(self):
+        data = {"join_requests": [{"group_id": "999", "flag": "f1"}]}
+        requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=True)
+        self.assertEqual(requests, [])
+        self.assertEqual(others, 0)
+
+    def test_plain_system_entries_are_not_requests(self):
+        self.assertFalse(OneBotApi.looks_like_join_request({"type": "member_increase"}))
+        self.assertTrue(OneBotApi.looks_like_join_request({"request_type": "add"}))
+        self.assertTrue(OneBotApi.looks_like_join_request({"comment": "想进群"}))
+
+
 if __name__ == "__main__":
     unittest.main()

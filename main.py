@@ -1818,24 +1818,12 @@ class GroupAdminPlugin(Star):
                 continue
             probed_ok = True
             data = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
-            raw_list = data.get("join_requests") if isinstance(data, dict) else data
-            if not isinstance(raw_list, list):
-                raw_list = []
-            requests, others = [], 0
-            for a in raw_list:
-                if not isinstance(a, dict):
-                    others += 1
-                    continue
-                # 申请判定不依赖 user_id：部分协议端条目缺少该字段，但有
-                # flag / sub_type 就说明是请求类记录，应计入并按"未知"展示
-                # （PR #289 审查：misleading-diagnostic-output）。
-                if not (a.get("flag") or a.get("sub_type")):
-                    others += 1  # 无法识别为申请的条目（系统消息等）
-                    continue
-                item_gid = str(a.get("group_id", "") or "")
-                if item_gid and item_gid != group_id:
-                    continue  # 其他群的申请不计入本群展示
-                requests.append(a)
+            # 按接口类型分别解析：get_group_system_msg 只认 join_requests 字段；
+            # 被过滤/被忽略申请接口整个列表都是请求列表。申请判定还要求带
+            # flag/sub_type/request_type/comment 等请求专属字段
+            # （PR #289 审查：misleading-diagnostic-output）。
+            requests, others = self._api.collect_join_requests(
+                data, group_id, system_msg=(action == "get_group_system_msg"))
             summary = f"   - {action}（{label}）：申请记录 {len(requests)} 条"
             if others:
                 summary += f"，非申请条目 {others} 条（系统消息等，不展示）"
@@ -1843,9 +1831,10 @@ class GroupAdminPlugin(Star):
             for a in requests[:20]:
                 uid = str(a.get("user_id") or a.get("request_uin")
                           or a.get("requester_uin") or "").strip() or "未知"
-                sub = str(a.get("sub_type") or "?")
+                sub = str(a.get("sub_type") or a.get("request_type") or "?")
                 checked = bool(a.get("checked"))
-                lines.append(f"     · QQ {uid} | sub_type={sub} | 已处理={checked}")
+                lines.append(
+                    f"     · QQ {uid} | sub_type={sub} | 已处理={checked} | 来源 {action}")
         if not probed_ok:
             lines.append(
                 "   （所有候选接口均不可用，无法从协议端侧核对申请状态）")

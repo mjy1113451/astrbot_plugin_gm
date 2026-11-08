@@ -390,6 +390,61 @@ class OneBotApi:
                 tags.append(t)
         return tags
 
+    @staticmethod
+    def looks_like_join_request(item) -> bool:
+        """条目是否带加群申请专属字段（flag / sub_type / request_type / comment）。
+
+        群系统消息里的普通条目（成员变动通知等）没有这些字段，用它来区分
+        「真申请」与「系统消息」，避免诊断输出把系统消息误标成申请记录
+        （PR #289 审查：misleading-diagnostic-output）。
+        """
+        if not isinstance(item, dict):
+            return False
+        return bool(
+            item.get("flag")
+            or item.get("sub_type")
+            or item.get("request_type")
+            or item.get("comment")
+        )
+
+    @classmethod
+    def collect_join_requests(cls, data, group_id: str, system_msg: bool = False):
+        """从申请查询接口的响应里挑出加群申请，返回 (申请列表, 非申请条目数)。
+
+        - system_msg=True（get_group_system_msg）：只有 ``join_requests`` 字段里的
+          条目才归为申请，其它字段（如邀请记录、系统通知）一律计入非申请条目；
+        - system_msg=False（get_group_filtered_requests / get_group_ignore_add_request）：
+          这类接口整个列表就是请求列表，列表内条目都算申请；
+        - 两种情况都只统计 group_id 与本群一致（或未提供群号）的条目。
+        """
+        requests, others = [], 0
+
+        def _belongs(item) -> bool:
+            gid = str(item.get("group_id", "") or "")
+            return not gid or gid == str(group_id)
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if not isinstance(value, list):
+                    continue
+                for item in value:
+                    is_req = (not system_msg) or key == "join_requests" \
+                        or cls.looks_like_join_request(item)
+                    if is_req:
+                        if isinstance(item, dict) and _belongs(item):
+                            requests.append(item)
+                    else:
+                        others += 1
+        elif isinstance(data, list):
+            for item in data:
+                is_req = (not system_msg) or cls.looks_like_join_request(item)
+                if is_req:
+                    if isinstance(item, dict) and _belongs(item):
+                        requests.append(item)
+                else:
+                    others += 1
+        return requests, others
+
     async def _group_tags_read(self, event: AstrMessageEvent, group_id: str):
         """读取当前群标签，返回 (读取是否成功, 标签列表)。
 
@@ -419,9 +474,19 @@ class OneBotApi:
         尝试（tag= / tags=）。返回 (是否成功, 最后一个原始响应)。
 
         PR #289 审查（duplicate-side-effect）：add 是有副作用的 action，且部分
-        协议端的成功响应缺 status/retcode 会被误判为失败；重试下一组候选前先
+        协议端的成功响应缺 status/retcode 会被误判为失败；重试下一个候选前先
         读回标签确认——已存在即幂等成功，避免同一标签被重复添加。
+
+        读回只在"读得通"时才做，且每个候选最多读一次：协议端压根不支持
+        get_group_tags 时首轮就读失败，后续候选不再重复查询，避免一次添加
+        打出 4 次无效请求（PR #289 审查：duplicate-side-effect）。
         """
+        # 读接口能力先探一次：探不通就彻底不做读回，只按 action 结果判定
+        baseline_ok, baseline_tags = await self._group_tags_read(event, group_id)
+        if baseline_ok and tag in baseline_tags:
+            # 标签本来就在：幂等成功，不再调用有副作用的 action
+            return True, None
+        read_supported = baseline_ok
         last = None
         for action, extra in (
             ("add_group_tag", {"tag": tag}),
@@ -434,9 +499,14 @@ class OneBotApi:
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
                 return True, last
+            if not read_supported:
+                continue
             read_ok, tags = await self._group_tags_read(event, group_id)
             if read_ok and tag in tags:
                 return True, last
+            if not read_ok:
+                # 中途读不通了：后续候选不再重复查询
+                read_supported = False
         return False, last
 
     async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
