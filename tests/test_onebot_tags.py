@@ -256,13 +256,20 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.read_calls, 2)
 
     async def test_success_response_without_tag_added_tries_other_variant(self):
-        # 动作回成功但读回一直没有该标签：确认没生效，可以安全换参数变体
-        # （读得通时连覆盖型变体也可以试，最终仍以读回为准判失败）
+        # 动作回成功但读回一直没有该标签：确认没生效，可以安全换参数变体（纯新增）
         api = self.make_api([], {"status": "ok"})
         ok, _, warn = await api._add_group_tag(None, "100", "标签B")
         self.assertFalse(ok)
         self.assertEqual(warn, "")
-        self.assertEqual(len(self.action_calls), 4)
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
+
+    async def test_no_overwrite_fallback_without_action_name_failure(self):
+        # 明确失败（非"action 名不支持"）时只试纯新增变体，绝不降级到覆盖型接口
+        # （PR #289 审查：unsafe-overwrite-fallback）。
+        api = self.make_api([], {"status": "failed", "retcode": -1})
+        ok, _, _warn = await api._add_group_tag(None, "100", "标签C")
+        self.assertFalse(ok)
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
 
     async def test_no_retry_on_unavailable_path(self):
         # 读接口不可用 + 首个 action 明确失败：不再换变体重复执行有副作用的调用
@@ -279,10 +286,16 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(OneBotApi._failure_invites_retry(None, "add_group_tag"))
 
     async def test_missing_tag_after_all_candidates_fails(self):
-        api = self.make_api([], {"status": "failed", "retcode": -1})
-        ok, _, _warn = await api._add_group_tag(None, "100", "标签C")
+        # 明确"action 名字不支持"才会走到覆盖型兼容接口；覆盖型也没能加入目标
+        # 标签时，最后还会再用纯新增接口补加一次，仍失败才判失败
+        api = self.make_api([], {"status": "failed", "wording": "unknown action"})
+        ok, _, warn = await api._add_group_tag(None, "100", "标签C")
         self.assertFalse(ok)
-        self.assertEqual(len(self.action_calls), 4)
+        self.assertEqual(warn, "")
+        self.assertEqual(
+            [c[0] for c in self.action_calls],
+            ["add_group_tag", "add_group_tag", "set_group_tag", "add_group_tag"],
+        )
 
 
 class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
@@ -351,6 +364,98 @@ class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(warn, "")
         self.assertEqual({a for a, _ in self.calls}, {"add_group_tag"})
+
+
+class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
+    """覆盖型回退后要同时确认"目标标签在"和"旧标签全在"。
+
+    PR #289 审查：incomplete-tag-restoration——只补旧标签会让"只保留旧标签、
+    没加入目标标签"的假成功被当成"已添加"。
+    """
+
+    def make_api(self, baseline, overwrite_keeps_target=False, add_target_after_overwrite=False):
+        api = OneBotApi.__new__(OneBotApi)
+        self.baseline = list(baseline)
+        self.tags = list(baseline)
+        self.calls = []
+        self.overwritten = False
+        self.overwrite_keeps_target = overwrite_keeps_target
+        self.add_target_after_overwrite = add_target_after_overwrite
+
+        async def fake_get_tags(event, group_id):
+            return list(self.tags)
+
+        async def fake_call(event, action, **params):
+            self.calls.append((action, params))
+            tag = params.get("tag") or (params.get("tags") or [""])[0]
+            if action == "set_group_tag":
+                # 覆盖语义：新的标签集合 = 目标标签（可选）+ 原有标签
+                self.overwritten = True
+                self.tags[:] = list(self.baseline)
+                if self.overwrite_keeps_target and tag not in self.tags:
+                    self.tags.append(tag)
+                return {"status": "ok"}
+            if action == "add_group_tag":
+                if tag in self.baseline:
+                    if tag not in self.tags:
+                        self.tags.append(tag)
+                    return {"status": "ok"}
+                # 纯新增接口：覆盖型接口执行前一律"不认识这个 action"，
+                # 借此走到覆盖型兼容回退；之后按开关决定目标标签能否补加
+                if self.overwritten and self.add_target_after_overwrite:
+                    if tag not in self.tags:
+                        self.tags.append(tag)
+                    return {"status": "ok"}
+                return {"status": "failed", "wording": "unknown action"}
+            return {"status": "failed", "wording": "unknown action"}
+
+        api._get_group_tags = fake_get_tags
+        api._call_onebot_raw = fake_call
+        return api
+
+    async def test_target_missing_after_overwrite_is_failure(self):
+        # 覆盖型接口"成功"但只保留旧标签、没加入目标标签，纯新增也补不上：
+        # 不能回执"已添加"
+        api = self.make_api(["旧标签"], overwrite_keeps_target=False)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "")
+        self.assertIn("set_group_tag", [a for a, _ in self.calls])
+        self.assertNotIn("新标签", self.tags)
+
+    async def test_target_added_after_overwrite_is_success(self):
+        # 覆盖型接口没带上目标标签，但随后用纯新增接口补加成功：可以回执已添加
+        api = self.make_api(["旧标签"], overwrite_keeps_target=False,
+                            add_target_after_overwrite=True)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertTrue(ok)
+        self.assertEqual(warn, "")
+        self.assertEqual(sorted(self.tags), sorted(["旧标签", "新标签"]))
+
+    async def test_overwrite_keeping_target_is_verified(self):
+        api = self.make_api(["旧标签"], overwrite_keeps_target=True)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertTrue(ok)
+        self.assertEqual(warn, "")
+        self.assertEqual(sorted(self.tags), sorted(["旧标签", "新标签"]))
+
+    async def test_permission_failure_never_reaches_overwrite(self):
+        # 权限不足/标签预置限制这类失败不降级到覆盖型接口
+        api = OneBotApi.__new__(OneBotApi)
+        self.calls = []
+
+        async def fake_get_tags(event, group_id):
+            return []
+
+        async def fake_call(event, action, **params):
+            self.calls.append(action)
+            return {"status": "failed", "wording": "权限不足"}
+
+        api._get_group_tags = fake_get_tags
+        api._call_onebot_raw = fake_call
+        ok, _, _warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, ["add_group_tag"])
 
 
 class JoinRequestCollectionTests(unittest.TestCase):
