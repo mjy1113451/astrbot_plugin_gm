@@ -331,15 +331,20 @@ class JoinReviewService:
         if self._store.get_group_setting(group_id, "join_request_notify_in_group", False):
             # #284：申请人的昵称/等级查询失败只影响展示，不能让整个通知流程挂掉——
             # 旧实现若此处抛出未捕获异常，该群的「新人加群」通知就静默消失。
-            try:
-                nickname = await self._api._get_user_nickname(event, applicant_id or user_id)
-                # #189：补充 QQ 等级（协议端不支持时显示「未知」）
-                level = await self._api._get_stranger_level(event, applicant_id or user_id) or "未知"
-            except Exception as e:
-                logger.warning(f"[加群审核] 群 {group_id} 获取申请人昵称/等级失败: {e}")
-                nickname, level = "", "未知"
-            # #261：昵称获取失败时明确标注，避免管理员误以为昵称就是 QQ 号
-            nickname_display = nickname or f"获取失败({applicant_id or user_id})"
+            # #283：被邀请人未知时没有申请人可查，不能拿邀请人 A 的身份充数
+            # （否则等级/昵称都是邀请人的，展示会误导管理员）。
+            if applicant_id:
+                try:
+                    nickname = await self._api._get_user_nickname(event, applicant_id)
+                    # #189：补充 QQ 等级（协议端不支持时显示「未知」）
+                    level = await self._api._get_stranger_level(event, applicant_id) or "未知"
+                except Exception as e:
+                    logger.warning(f"[加群审核] 群 {group_id} 获取申请人昵称/等级失败: {e}")
+                    nickname, level = "", "未知"
+                # #261：昵称获取失败时明确标注，避免管理员误以为昵称就是 QQ 号
+                nickname_display = nickname or f"获取失败({applicant_id})"
+            else:
+                nickname, level, nickname_display = "", "未知", ""
             # #270/#283：邀请入群时分行展示邀请人与被邀请人，
             # 不再把邀请人 A 的 QQ 标成「申请人」；协议端未提供被邀请人时明确标注未知
             invite_lines = ""
@@ -405,13 +410,25 @@ class JoinReviewService:
                                "待处理记录改按 flag 暂存，引用回复时按内容兜底定位")
             self._store.save_config()
             # #229：原 join_request_notify_enabled（#205）全局开关已移除，通知改为始终发送
-            invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
-            await self._api._notify_admins(
-                f"[加群请求] {applicant_id} 申请加入群 {group_id}\n"
-                f"{invite_note}"
-                f"已在群内发送提醒，请管理员引用回复同意/拒绝",
-                group_id=group_id,
-            )
+            # #283/PR#289：被邀请人未知的邀请入群请求，管理员通知沿用 invite 专用文案，
+            # 不能拼成「[加群请求]  申请加入群 X」这种申请人为空的普通申请通知
+            if sub_type == "invite" and not applicant_id:
+                admin_text = (
+                    f"[加群请求] 收到群 {group_id} 的邀请入群请求\n"
+                    f"类型：邀请入群\n"
+                    f"邀请人QQ: {inviter_id}\n"
+                    f"被邀请人：未知（协议端未提供，标准语义下为本 bot）\n"
+                    f"申请标识：{flag}\n"
+                    f"已在群内发送提醒，请管理员引用回复同意/拒绝"
+                )
+            else:
+                invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
+                admin_text = (
+                    f"[加群请求] {applicant_id} 申请加入群 {group_id}\n"
+                    f"{invite_note}"
+                    f"已在群内发送提醒，请管理员引用回复同意/拒绝"
+                )
+            await self._api._notify_admins(admin_text, group_id=group_id)
         else:
             # #226：未开启群内提醒时也必须通知管理员，否则普通加群申请不会有任何通知。
             # #229：随 join_request_notify_enabled 去重移除，这里不再有全局开关判定。
@@ -422,6 +439,7 @@ class JoinReviewService:
                     f"类型：邀请入群\n"
                     f"邀请人QQ: {inviter_id}\n"
                     f"被邀请人：未知（协议端未提供，标准语义下为本 bot）\n"
+                    f"申请标识：{flag}\n"
                     f"验证消息: {comment or '无'}\n"
                     f"可用 /加群申请待处理 查看，或在群内开启提醒后引用回复同意/拒绝",
                     group_id=group_id,

@@ -242,6 +242,59 @@ class GroupOverrideTests(unittest.TestCase):
         )
         self.assertTrue(store.get_group_setting("200", "mute_notice", True))
 
+    def test_multi_entry_merge_does_not_overwrite_with_defaults(self):
+        # 同一群拆两条模板记录、字段互不重叠：后一条仍是默认值的字段
+        # 不能把前一条已配置的值抹回默认（PR #289 审查：
+        # template-merge-default-overwrite）。
+        store = self.make_store(
+            _Config(
+                blacklisted_users=["global_black"],
+                ad_keywords=["global_ad"],
+                group_overrides_templates=[
+                    _template_entry("100", blacklisted_users=["tpl_black"]),
+                    _template_entry(
+                        "100",
+                        blacklisted_users=[],  # 仍是模板默认值 → 视为未覆盖
+                        ad_keywords=["tpl_ad"],
+                    ),
+                ],
+            )
+        )
+        self.assertEqual(
+            store.get_group_setting("100", "blacklisted_users"), ["tpl_black"]
+        )
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["tpl_ad"])
+
+    def test_multi_entry_merge_keeps_explicit_override(self):
+        # 前一条用 explicit_override_fields 声明的空列表意图，不能被后一条
+        # 记录里的默认值/explicit_override_fields 冲掉。
+        store = self.make_store(
+            _Config(
+                blacklisted_users=["global_black"],
+                group_overrides_templates=[
+                    _template_entry(
+                        "100",
+                        blacklisted_users=[],
+                        explicit_override_fields="blacklisted_users",
+                    ),
+                    _template_entry("100", ad_keywords=["tpl_ad"]),
+                ],
+            )
+        )
+        self.assertEqual(store.get_group_setting("100", "blacklisted_users"), [])
+
+    def test_multi_entry_merge_later_non_default_wins(self):
+        # 两条都真正改了同一字段时，取后一条（保持“后面的覆盖前面的”语义）。
+        store = self.make_store(
+            _Config(
+                group_overrides_templates=[
+                    _template_entry("100", ad_keywords=["first"]),
+                    _template_entry("100", ad_keywords=["second"]),
+                ]
+            )
+        )
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["second"])
+
 
 if __name__ == "__main__":
     unittest.main()

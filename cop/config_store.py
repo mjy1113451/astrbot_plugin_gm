@@ -255,8 +255,10 @@ class ConfigStore:
         """取本群在 WebUI 按群配置模板列表里的合并条目；无条目返回 None。
 
         template_list 保存后形如 [{"__template_key": "...", "group_id": "...", ...}]；
-        同一群号出现多条时按顺序合并（后面的字段覆盖前面的），便于管理员
-        拆多条配置同群的不同侧面。
+        同一群号出现多条时按顺序合并，便于管理员拆多条配置同群的不同侧面。
+        合并只让"真正改过的字段"生效：后一条记录里仍是模板默认值的字段视为
+        未覆盖，保留前一条已配置的值，否则拆多条配置时后一条会把前一条的
+        设置整体抹回默认（PR #289 审查：template-merge-default-overwrite）。
         """
         entries = self.config.get("group_overrides_templates")
         if not isinstance(entries, list):
@@ -264,6 +266,7 @@ class ConfigStore:
         gid = str(group_id).strip()
         if not gid:
             return None
+        defaults = self._template_field_defaults
         merged = None
         for entry in entries:
             if not isinstance(entry, dict):
@@ -275,7 +278,41 @@ class ConfigStore:
             for k, v in entry.items():
                 if k == "__template_key":
                     continue
+                if k == "explicit_override_fields":
+                    # 多条记录的显式覆盖声明要累加，不能被后一条覆盖掉。
+                    merged[k] = self._merge_explicit_fields(merged.get(k), v)
+                    continue
+                if (
+                    k in defaults
+                    and v == defaults[k]
+                    and not self._is_explicit_override(entry, k)
+                ):
+                    # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。
+                    continue
                 merged[k] = v
+        return merged
+
+    @staticmethod
+    def _explicit_field_names(raw) -> list:
+        """把 explicit_override_fields 的两种写法（列表 / 分隔字符串）拆成名字列表。"""
+        if isinstance(raw, (list, tuple)):
+            names = [str(x) for x in raw]
+        else:
+            names = re.split(r"[,，;；\s]+", str(raw or ""))
+        result = []
+        for name in names:
+            name = name.strip()
+            if name and name not in result:
+                result.append(name)
+        return result
+
+    @classmethod
+    def _merge_explicit_fields(cls, prev, new) -> list:
+        """合并多条模板记录的 explicit_override_fields（并集，保持出现顺序）。"""
+        merged = cls._explicit_field_names(prev)
+        for name in cls._explicit_field_names(new):
+            if name not in merged:
+                merged.append(name)
         return merged
 
     def _is_explicit_override(self, entry: dict, key: str) -> bool:
@@ -284,12 +321,7 @@ class ConfigStore:
         explicit_override_fields 支持列表或逗号/空格分隔的字符串两种写法，
         用于"本群要用空列表清空全局名单"这类无法靠默认值比较表达的意图。
         """
-        raw = entry.get("explicit_override_fields")
-        if isinstance(raw, (list, tuple)):
-            names = [str(x) for x in raw]
-        else:
-            names = re.split(r"[,，;；\s]+", str(raw or ""))
-        return key in {n.strip() for n in names if n and n.strip()}
+        return key in self._explicit_field_names(entry.get("explicit_override_fields"))
 
     # ===================== 按群覆盖读写 =====================
 
