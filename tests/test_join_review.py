@@ -189,6 +189,25 @@ class UnknownInviteeNotifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("777 申请加入群 100", admin_text)
         self.assertNotIn("类型：邀请入群", admin_text)
 
+    async def test_private_notify_survives_profile_query_failure(self):
+        # 未开启群内提醒时的私聊通知也要做异常隔离：协议端查询昵称/等级抛异常
+        # 时，通知不能整条消失（PR #289 审查：missing-error-handling）。
+        store = _Store({"join_request_notify_in_group": False})
+        api = _Api()
+
+        async def _boom(event, user_id):
+            raise RuntimeError("协议端不支持 get_stranger_info")
+
+        api._get_user_nickname = _boom
+        api._get_stranger_level = _boom
+        raw = dict(_UNKNOWN_INVITE_RAW, user_id="777", sub_type="add")
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
+
+        self.assertEqual(len(api.admin_texts), 1)
+        # 昵称拿不到时只显示 QQ 号，通知照常发出
+        self.assertIn("777 申请加入群 100", api.admin_texts[0])
+        self.assertNotIn("获取失败(777)（777）", api.admin_texts[0])
+
 
 class _Event:
     """最小事件桩：只提供 plain_result。"""

@@ -412,7 +412,9 @@ class OneBotApi:
         """从申请查询接口的响应里挑出加群申请，返回 (申请列表, 非申请条目数)。
 
         - system_msg=True（get_group_system_msg）：只有 ``join_requests`` 字段里的
-          条目才归为申请，其它字段（如邀请记录、系统通知）一律计入非申请条目；
+          条目才归为申请，其它字段（如邀请记录、系统通知）一律计入非申请条目
+          ——即使系统条目碰巧带了 flag/sub_type 字段也不算，避免诊断输出把
+          系统消息误报成加群申请（PR #289 审查：misleading-diagnostic-output）；
         - system_msg=False（get_group_filtered_requests / get_group_ignore_add_request）：
           这类接口整个列表就是请求列表，列表内条目都算申请；
         - 两种情况都只统计 group_id 与本群一致（或未提供群号）的条目。
@@ -428,8 +430,11 @@ class OneBotApi:
                 if not isinstance(value, list):
                     continue
                 for item in value:
-                    is_req = (not system_msg) or key == "join_requests" \
-                        or cls.looks_like_join_request(item)
+                    if system_msg:
+                        # 系统消息接口只认 join_requests 这一个字段
+                        is_req = key == "join_requests"
+                    else:
+                        is_req = True
                     if is_req:
                         if isinstance(item, dict) and _belongs(item):
                             requests.append(item)
@@ -661,9 +666,14 @@ class OneBotApi:
         ambiguous_retry 控制"响应结构含糊（无 status/retcode 也没有错误文案）"
         是否算可重试：删除有读回兜底，可以再试一次变体；添加在读接口不可用时
         无法确认上一次到底生效没有，必须停手。
+
+        result 为 None（无可用调用通路）时同样不可重试：那条通路本身就已经
+        走不通，换 action 名也还是同一批通路；更重要的是无法确认上一次调用
+        是否已经落到协议端，继续试就有重复执行副作用的可能
+        （PR #289 审查：unsafe-action-fallback）。
         """
         if result is None:
-            return True   # 无可用调用通路：可能别的 action 名可用
+            return False
         text = str(result).lower() if not isinstance(result, dict) else " ".join(
             str(result.get(k, "")) for k in ("message", "msg", "wording", "error", "errmsg")
         ).lower()

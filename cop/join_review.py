@@ -353,13 +353,8 @@ class JoinReviewService:
             # #283：被邀请人未知时没有申请人可查，不能拿邀请人 A 的身份充数
             # （否则等级/昵称都是邀请人的，展示会误导管理员）。
             if applicant_id:
-                try:
-                    nickname = await self._api._get_user_nickname(event, applicant_id)
-                    # #189：补充 QQ 等级（协议端不支持时显示「未知」）
-                    level = await self._api._get_stranger_level(event, applicant_id) or "未知"
-                except Exception as e:
-                    logger.warning(f"[加群审核] 群 {group_id} 获取申请人昵称/等级失败: {e}")
-                    nickname, level = "", "未知"
+                nickname, level = await self._safe_applicant_profile(
+                    event, applicant_id, group_id)
                 # #261：昵称获取失败时明确标注，避免管理员误以为昵称就是 QQ 号
                 nickname_display = nickname or f"获取失败({applicant_id})"
             else:
@@ -464,15 +459,41 @@ class JoinReviewService:
                     group_id=group_id,
                 )
             else:
-                nickname = await self._api._get_user_nickname(event, applicant_id)
+                nickname, _level = await self._safe_applicant_profile(
+                    event, applicant_id, group_id)
+                # 昵称拿不到时只显示 QQ 号，不要拼成「获取失败(777)（777）」
+                applicant_display = (
+                    f"{nickname}（{applicant_id}）" if nickname else str(applicant_id)
+                )
                 invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
                 await self._api._notify_admins(
-                    f"[加群请求] {nickname}（{applicant_id}）申请加入群 {group_id}\n"
+                    f"[加群请求] {applicant_display} 申请加入群 {group_id}\n"
                     f"{invite_note}"
                     f"验证消息: {comment or '无'}\n"
                     f"可用 /加群申请待处理 查看，或在群内开启提醒后引用回复同意/拒绝",
                     group_id=group_id,
                 )
+
+    async def _safe_applicant_profile(self, event, applicant_id: str, group_id: str):
+        """查询申请人昵称与 QQ 等级；任何失败只降级展示，不中断通知流程。
+
+        群内提醒与「未开启群内提醒时的私聊通知」两条分支共用这一个入口：
+        以前私聊分支单独调接口、没有异常隔离，协议端一抛异常整条管理员通知
+        就静默消失（PR #289 审查：missing-error-handling）。#189：等级取不到
+        显示「未知」；#261：昵称取不到由调用方标注「获取失败(QQ)」。
+        """
+        nickname, level = "", "未知"
+        if not applicant_id:
+            return nickname, level
+        try:
+            nickname = await self._api._get_user_nickname(event, applicant_id)
+        except Exception as e:
+            logger.warning(f"[加群审核] 群 {group_id} 获取申请人昵称失败: {e}")
+        try:
+            level = await self._api._get_stranger_level(event, applicant_id) or "未知"
+        except Exception as e:
+            logger.warning(f"[加群审核] 群 {group_id} 获取申请人等级失败: {e}")
+        return nickname, level
 
     async def _handle_group_request_reply(self, event, raw: dict, group_id: str, user_id: str, reply_id):
         """加群申请引用回复处理（#57，原 on_group_message 尾部代码块）。

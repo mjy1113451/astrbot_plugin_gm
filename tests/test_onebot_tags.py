@@ -200,6 +200,20 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         # 首个候选即成功，不再尝试其余变体
         self.assertEqual(len(self.action_calls), 1)
 
+    async def test_no_retry_on_unavailable_path(self):
+        # 读接口不可用 + 首个 action 明确失败：不再换变体重复执行有副作用的调用
+        # （PR #289 审查：unsafe-action-fallback）。
+        api = self.make_api(None, {"status": "failed", "wording": "权限不足"})
+        ok, _, warn = await api._add_group_tag(None, "100", "标签D")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "")
+        self.assertEqual(len(self.action_calls), 1)
+
+    def test_none_result_does_not_invite_retry(self):
+        # 无可用调用通路（None）不能当作"可以换变体重试"：通路本身走不通，
+        # 也无法确认上一次是否已经落到协议端
+        self.assertFalse(OneBotApi._failure_invites_retry(None, "add_group_tag"))
+
     async def test_missing_tag_after_all_candidates_fails(self):
         api = self.make_api([], {"status": "failed", "retcode": -1})
         ok, _, _warn = await api._add_group_tag(None, "100", "标签C")
@@ -306,6 +320,21 @@ class JoinRequestCollectionTests(unittest.TestCase):
         self.assertTrue(OneBotApi.looks_like_join_request({"request_type": "add"}))
         # comment 系统消息也可能带，不能作为申请判据
         self.assertFalse(OneBotApi.looks_like_join_request({"comment": "想进群"}))
+
+    def test_system_entries_with_request_fields_still_not_counted(self):
+        # 系统消息条目即使带 flag/sub_type 也不算申请：get_group_system_msg
+        # 只认 join_requests 这一个字段，否则诊断输出仍会误报
+        # （PR #289 审查：misleading-diagnostic-output）。
+        data = {
+            "join_requests": [{"group_id": "100", "flag": "f1"}],
+            "system_msg": [
+                {"group_id": "100", "flag": "f2", "sub_type": "invite"},
+                {"group_id": "100", "request_type": "add"},
+            ],
+        }
+        requests, others = OneBotApi.collect_join_requests(data, "100", system_msg=True)
+        self.assertEqual(requests, [{"group_id": "100", "flag": "f1"}])
+        self.assertEqual(others, 2)
 
 
 if __name__ == "__main__":
