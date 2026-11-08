@@ -168,5 +168,92 @@ class UnknownInviteeNotifyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("类型：邀请入群", admin_text)
 
 
+class _Event:
+    """最小事件桩：只提供 plain_result。"""
+
+    def plain_result(self, text):
+        return ("text", text)
+
+
+class _Perms:
+    def _is_authorized(self, raw, user_id):
+        return True
+
+
+class _Parser:
+    def __init__(self, text="同意"):
+        self.text = text
+
+    def _extract_text(self, raw):
+        return self.text
+
+
+class UnknownInviteeReplyTests(unittest.IsolatedAsyncioTestCase):
+    """被邀请人未知的邀请请求不能被引用回复直接同意/拒绝（unsafe-invite-approval）。"""
+
+    def _service(self, record, text="同意"):
+        store = _Store()
+        store.runtime_map("pending_join_requests")["mid-1"] = record
+        api = _Api()
+        api.handled = []
+
+        async def _handle(event, flag, approve, reason, sub_type=None):
+            api.handled.append((flag, approve, reason))
+            return True
+
+        api._handle_group_request = _handle
+        svc = JoinReviewService(
+            config_store=store,
+            onebot_api=api,
+            runtime=SimpleNamespace(_join_request_seen={}),
+            permissions=_Perms(),
+            message_parse=_Parser(text),
+        )
+        return svc, api
+
+    async def test_unknown_applicant_is_not_approved(self):
+        record = {
+            "flag": "f-unknown",
+            "group_id": "100",
+            "user_id": "",
+            "inviter_user_id": "555",
+            "sub_type": "invite",
+            "ts": 1,
+        }
+        svc, api = self._service(record, "同意")
+        out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+        self.assertEqual(api.handled, [])
+        self.assertEqual(len(out), 1)
+        self.assertIn("人工处理", out[0][1] if isinstance(out[0], tuple) else str(out[0]))
+        self.assertIn("555", str(out[0]))
+
+    async def test_unknown_applicant_blacklist_also_blocked(self):
+        record = {
+            "flag": "f-unknown",
+            "group_id": "100",
+            "user_id": "",
+            "inviter_user_id": "555",
+            "sub_type": "invite",
+            "ts": 1,
+        }
+        svc, api = self._service(record, "拉黑")
+        await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+        self.assertEqual(api.handled, [])
+
+    async def test_known_applicant_still_handled(self):
+        record = {
+            "flag": "f-1",
+            "group_id": "100",
+            "user_id": "777",
+            "inviter_user_id": "",
+            "sub_type": "add",
+            "ts": 1,
+        }
+        svc, api = self._service(record, "同意")
+        out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+        self.assertEqual(len(api.handled), 1)
+        self.assertIn("已同意", str(out[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

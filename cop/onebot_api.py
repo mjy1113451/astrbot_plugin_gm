@@ -441,11 +441,17 @@ class OneBotApi:
 
     async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """删除群标签。#285：统一命名 delete_group_tag；参数名逐候选尝试。
-        返回 (是否成功, 最后一个原始响应)。
 
-        PR #289 审查：所有候选失败后读回标签做副作用确认——目标已不在列表
-        即视为删除成功（幂等）；读取本身失败时不判定，保持原失败语义。
+        返回 (是否成功, 最后一个原始响应, 原因)。原因取值：
+        "" / "not_found"（调用前标签就不存在）/ "read_failed"（读回失败，无法确认）。
+
+        PR #289 审查：所有候选失败后读回标签做副作用确认——但必须先确认
+        标签在调用前确实存在，否则"本来就没有这个标签"会被误报成删除成功
+        （false-success-delete）。
         """
+        before_ok, before_tags = await self._group_tags_read(event, group_id)
+        tag_exists = before_ok and tag in before_tags
+
         last = None
         for action, extra in (
             ("delete_group_tag", {"tag": tag}),
@@ -455,11 +461,19 @@ class OneBotApi:
             p.update(extra)
             last = await self._call_onebot_raw(event, action, **p)
             if self._action_result_success(last):
-                return True, last
-        read_ok, tags = await self._group_tags_read(event, group_id)
-        if read_ok and tag not in tags:
-            return True, last
-        return False, last
+                return True, last, ""
+        after_ok, after_tags = await self._group_tags_read(event, group_id)
+        if tag in after_tags:
+            # 读回仍存在：删除确实没生效（可能是权限不足或参数不被接受）
+            return False, last, ""
+        if not before_ok or not after_ok:
+            # 前后任一侧读不到标签列表，就无法确认"原本存在、现在消失"，
+            # 保持失败语义，交给管理员人工核对
+            return False, last, "read_failed"
+        if not tag_exists:
+            # 删除前就不存在——响应含糊不能当成删除成功
+            return False, last, "not_found"
+        return True, last, ""
 
     async def _get_group_tags(self, event: AstrMessageEvent, group_id: str):
         """查询群标签。#285：统一命名 get_group_tags，返回原始响应由调用方解析。"""

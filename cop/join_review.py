@@ -478,6 +478,14 @@ class JoinReviewService:
         blacklist = "拉黑" in msg_text
         if not (approve or deny or blacklist):
             return
+        if not info.get("user_id"):
+            # #283/PR#289：被邀请人未知的邀请入群请求没有明确处理对象，
+            # 同意/拒绝都可能作用到邀请人身上，禁止自动审批，交管理员人工处理
+            # （unsafe-invite-approval）。
+            yield event.plain_result(
+                "这条邀请入群请求未提供被邀请人信息，无法自动同意/拒绝；"
+                "请在 QQ 客户端人工处理（邀请人：" + str(info.get("inviter_user_id") or "未知") + "）")
+            return
         # #129: 拒绝时支持自定义理由；#194: 拉黑 = 拒绝 + 加入群黑名单
         reject_reason = "管理员审核"
         if blacklist:

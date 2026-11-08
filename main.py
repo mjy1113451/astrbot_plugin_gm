@@ -458,9 +458,7 @@ class GroupAdminPlugin(Star):
         if act in ("查看", "list", ""):
             # #229：本群覆盖用运行时原始值判断（不经 get_group_setting 回退），
             # 以便区分「本群列表」与「全局列表」并说明实际生效来源
-            override = self._store.runtime_map("group_overrides").get(str(group_id), {})
-            group_kws = override.get("join_reject_keywords")
-            group_kws = group_kws if isinstance(group_kws, list) else []
+            group_kws = self._store.runtime_group_list(str(group_id), "join_reject_keywords")
             global_kws = self.config.get("join_reject_keywords", [])
             global_kws = global_kws if isinstance(global_kws, list) else []
             lines = []
@@ -2142,12 +2140,18 @@ class GroupAdminPlugin(Star):
                 yield event.plain_result(
                     "本群没有可删除的群标签（或当前协议端不支持 get_group_tags）")
             return
-        ok, result = await self._api._delete_group_tag(event, group_id, text)
+        ok, result, reason = await self._api._delete_group_tag(event, group_id, text)
         if ok:
             yield event.plain_result(f"已删除群标签「{text}」")
             return
+        if reason == "not_found":
+            yield event.plain_result(
+                f"本群没有「{text}」这个群标签，无需删除（可用 /删群标签 查看当前标签）")
+            return
         logger.warning(f"删除群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'delete_group_tag')
+        if reason == "read_failed":
+            detail += "（读回标签列表失败，无法确认删除是否生效，请在 QQ 客户端核对）"
         if ("不支持" in detail) or ("无可用调用通路" in detail):
             detail += ("。delete_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
                        "（如 NapCat）提供，当前协议端不支持；"
@@ -2590,7 +2594,16 @@ class GroupAdminPlugin(Star):
         if not gconf:
             yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
             return
-        lines = [f"{k}: {v}" for k, v in gconf.items()]
+        lines = []
+        for k, v in gconf.items():
+            if str(k).startswith("__"):
+                # 内部元数据（如列表派生基线）不展示
+                continue
+            shown = self._store.get_group_setting(group_id, k) if isinstance(v, list) else v
+            lines.append(f"{k}: {shown}")
+        if not lines:
+            yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
+            return
         yield event.plain_result(f"本群覆盖配置：\n" + "\n".join(lines))
 
     @filter.command("清除群配置", "清除本群所有覆盖")
@@ -2609,6 +2622,7 @@ class GroupAdminPlugin(Star):
                 yield event.plain_result(f"本群未设置 {key}")
                 return
             del gconf[key]
+            self._store.drop_list_baseline(group_id, key)
             self._store.save_config()
             yield event.plain_result(f"已清除本群 {key} 覆盖")
         else:

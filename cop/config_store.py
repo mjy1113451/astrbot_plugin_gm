@@ -159,6 +159,7 @@ class ConfigStore:
                 if target is None:
                     return False, list(lst)
                 lst.remove(target)
+            self._refresh_after_list_write(group_id, key)
             self.save_config()
             return True, list(lst)
 
@@ -206,6 +207,9 @@ class ConfigStore:
 
         优先级（PR #290）：
         1. 指令写入的运行时覆盖 group_overrides[群号][key]（绝对优先，语义明确）；
+           列表项若记录了派生基线，会与最新的模板/全局值重新合并，避免"某次
+           增删之后 WebUI 模板改动再也不生效"（PR #289 审查：
+           config-override-precedence-loss）；
         2. WebUI 按群配置模板（_conf_schema.json 的 group_overrides_templates，
            AstrBot template_list）：本群条目里该字段的值 ≠ 模板默认值时视为
            显式覆盖——字段保持默认值意味着"未覆盖、回退全局"，这样管理员
@@ -217,15 +221,38 @@ class ConfigStore:
         （例如本群要用空列表清空全局名单），命中时第 2 步直接采用该值。
         """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
-        if key in overrides:
-            return overrides[key]
+        if isinstance(overrides, dict) and key in overrides:
+            value = overrides[key]
+            if isinstance(value, list):
+                return self._merge_runtime_list(group_id, key, value)
+            return value
+        return self._template_or_global_setting(group_id, key, default)
+
+    def _template_or_global_setting(self, group_id: str, key: str, default=None):
+        """模板层 → 全局层 的配置值（不含运行时覆盖）。
+
+        get_group_setting 与列表基线重算共用这一个入口，保证两条路径
+        对"模板条目算不算覆盖"的判定完全一致。
+        """
         entry = self._template_group_entry(group_id)
         if entry is not None and key in self._template_field_defaults:
-            value = entry.get(key, self._template_field_defaults[key])
-            if value != self._template_field_defaults[key] or self._is_explicit_override(
-                entry, key
-            ):
-                return value
+            default = self._template_field_defaults[key]
+            if key in entry:
+                value = entry[key]
+                if value != default or self._is_explicit_override(entry, key):
+                    return value
+            elif key in (entry.get("__present_fields__") or []):
+                # 条目里写过这个字段，但值仍等于模板默认值、也没写进显式覆盖字段
+                # → 按「未覆盖、回退全局」处理（PR #289 审查：template-default-fallback）。
+                logger.debug(
+                    f"[群管插件] 群 {group_id} 的模板条目填写了 {key}，但值等于模板默认值，"
+                    f"按未覆盖处理并回退全局配置；如需强制覆盖，请把 {key} 写入"
+                    f" explicit_override_fields"
+                )
+            else:
+                logger.debug(
+                    f"[群管插件] 群 {group_id} 的模板条目未填写 {key}，按未覆盖处理并回退全局配置"
+                )
         return self.config.get(key, default)
 
     # ===================== WebUI 按群配置模板（PR #290） =====================
@@ -268,6 +295,7 @@ class ConfigStore:
             return None
         defaults = self._template_field_defaults
         merged = None
+        present_fields = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -278,6 +306,8 @@ class ConfigStore:
             for k, v in entry.items():
                 if k == "__template_key":
                     continue
+                if k not in present_fields:
+                    present_fields.append(k)
                 if k == "explicit_override_fields":
                     # 多条记录的显式覆盖声明要累加，不能被后一条覆盖掉。
                     merged[k] = self._merge_explicit_fields(merged.get(k), v)
@@ -290,6 +320,11 @@ class ConfigStore:
                     # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。
                     continue
                 merged[k] = v
+        if merged is not None:
+            # 记录"条目里到底写过哪些字段"，用于区分「字段没写」与「写了但仍是
+            # 默认值」两种都按未覆盖处理的情况，排查模板不生效时看 debug 日志
+            # （PR #289 审查：template-default-fallback）。
+            merged["__present_fields__"] = present_fields
         return merged
 
     @staticmethod
@@ -325,6 +360,74 @@ class ConfigStore:
 
     # ===================== 按群覆盖读写 =====================
 
+    # 运行时列表快照的基线记录：group_overrides[群号][__list_baseline__][key]
+    # = {"value": [...创建快照时的模板/全局值...]}，用于在模板/全局变化后
+    # 重新合并，而不是让一次性快照永久遮蔽 WebUI 配置。
+    _LIST_BASELINE = "__list_baseline__"
+
+    @staticmethod
+    def _as_str_list(value) -> list:
+        """把任意配置值规整成去空白的字符串列表。"""
+        if isinstance(value, (list, tuple)):
+            return [str(x).strip() for x in value if str(x).strip()]
+        if isinstance(value, str):
+            return [x for x in re.split(r"[,，;；\s]+", value) if x]
+        return [] if value is None else [str(value).strip()]
+
+    def _list_baseline_meta(self, group_id: str, key: str):
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        meta = overrides.get(self._LIST_BASELINE) if isinstance(overrides, dict) else None
+        info = meta.get(key) if isinstance(meta, dict) else None
+        return info if isinstance(info, dict) else None
+
+    def _merge_runtime_list(self, group_id: str, key: str, stored: list) -> list:
+        """把运行时列表快照与最新的模板/全局基线重新合并。
+
+        快照 = 创建时的基线 + 后续增删。这里反推出"加了哪些、删了哪些"，
+        再套到当前基线之上——WebUI 模板/全局列表后来新增的项不会因为
+        本群曾经执行过一次 /添加白名单 就永久失效
+        （PR #289 审查：config-override-precedence-loss）。
+        """
+        info = self._list_baseline_meta(group_id, key)
+        if not info:
+            return self._as_str_list(stored)
+        old_base = self._as_str_list(info.get("value"))
+        current = self._as_str_list(stored)
+        added = [x for x in current if x not in old_base]
+        removed = {x for x in old_base if x not in current}
+        new_base = self._as_str_list(self._template_or_global_setting(group_id, key, []))
+        merged = [x for x in new_base if x not in removed]
+        for item in added:
+            if item not in merged:
+                merged.append(item)
+        return merged
+
+    def _record_list_baseline(self, group_id: str, key: str) -> None:
+        """按当前模板/全局值记录基线，作为后续重算的锚点。"""
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.get(str(group_id))
+        if not isinstance(gconf, dict):
+            return
+        meta = gconf.get(self._LIST_BASELINE)
+        if not isinstance(meta, dict):
+            meta = {}
+            gconf[self._LIST_BASELINE] = meta
+        meta[key] = {"value": self._as_str_list(self._template_or_global_setting(group_id, key, []))}
+
+    def drop_list_baseline(self, group_id: str, key: str) -> None:
+        """公开入口：丢弃某 key 的列表派生基线（清除按群覆盖时调用）。"""
+        self._drop_list_baseline(group_id, key)
+
+    def _drop_list_baseline(self, group_id: str, key: str) -> None:
+        """丢弃基线记录：此后的运行时列表视为完整快照（显式整体设置）。"""
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.get(str(group_id))
+        meta = gconf.get(self._LIST_BASELINE) if isinstance(gconf, dict) else None
+        if isinstance(meta, dict):
+            meta.pop(key, None)
+            if not meta:
+                gconf.pop(self._LIST_BASELINE, None)
+
     def _effective_list(self, group_id: str, key: str) -> list:
         """当前生效的列表值（运行时 → 模板 → 全局），返回可安全改动的新列表。"""
         current = self.get_group_setting(group_id, key, [])
@@ -339,12 +442,12 @@ class ConfigStore:
     ) -> list:
         """取本群覆盖列表。
 
-        - for_update=False（只读）：本群已有运行时覆盖时返回其本体，否则返回
-          当前生效值（模板/全局）的拷贝——不创建运行时条目，避免"看一眼就
-          把模板值冻结成本群快照"。
+        - for_update=False（只读）：本群已有运行时覆盖时返回其"与最新模板/全局
+          合并后"的拷贝，否则返回当前生效值（模板/全局）的拷贝——不创建运行时
+          条目，避免"看一眼就把模板值冻结成本群快照"。
         - for_update=True（写入）：本群还没有运行时覆盖时，以当前生效值为基线
-          创建条目，增删操作在其上增量进行，不会整体遮蔽 WebUI 按群模板里的
-          列表（PR #289 审查：config-override-data-loss）。
+          创建条目并记录基线，增删操作在其上增量进行，不会整体遮蔽 WebUI 按群
+          模板里的列表（PR #289 审查：config-override-data-loss）。
         """
         # review#192 race-condition：首次创建也加锁，
         # 避免并发首建同 (group_id,key) 产生多个空 list 互相覆盖；RLock 可重入
@@ -353,7 +456,9 @@ class ConfigStore:
             gconf = overrides.get(str(group_id))
             value = gconf.get(key) if isinstance(gconf, dict) else None
             if isinstance(value, list):
-                return value
+                if for_update:
+                    return value
+                return self._merge_runtime_list(group_id, key, value)
             if not for_update:
                 if value is None:
                     return self._effective_list(group_id, key)
@@ -363,18 +468,25 @@ class ConfigStore:
             )
             gconf = overrides.setdefault(str(group_id), {})
             gconf[key] = baseline
+            # 先记录基线再返回本体：调用方增删后由 _refresh_after_list_write
+            # 更新基线，等价于"基线 + 增量操作"。
+            self._record_list_baseline(group_id, key)
             return baseline
+
+    def _refresh_after_list_write(self, group_id: str, key: str) -> None:
+        """列表写入落盘后刷新基线，保证下次重算的差集仍然正确。"""
+        self._record_list_baseline(group_id, key)
 
     def runtime_group_list(self, group_id: str, key: str) -> list:
         """只取本群运行时覆盖列表（没有则空列表，不回退模板/全局）。
 
         用于「本群 XXX + 全局 XXX」同时展示的命令，避免本群段落把全局值
-        再显示一遍。
+        再显示一遍；若有派生基线，则展示与最新模板/全局合并后的结果。
         """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         value = overrides.get(key) if isinstance(overrides, dict) else None
         if isinstance(value, list):
-            return value
+            return self._merge_runtime_list(group_id, key, value)
         if value is None:
             return []
         return [value] if value else []
@@ -384,6 +496,8 @@ class ConfigStore:
         with self._lock:
             overrides = self.runtime_map("group_overrides")
             overrides.setdefault(str(group_id), {})[key] = value
+            # 整体赋值是显式快照语义，不再与模板/全局重算。
+            self._drop_list_baseline(group_id, key)
             self.save_config()
 
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
@@ -400,6 +514,7 @@ class ConfigStore:
             admins = self.get_group_override_list(group_id, key, for_update=True)
             for qq in pending:
                 admins.append(qq)
+            self._refresh_after_list_write(group_id, key)
             self.save_config()
             return pending
 
@@ -419,6 +534,7 @@ class ConfigStore:
                         removed.append(qq)
                         break
             if removed:
+                self._refresh_after_list_write(group_id, key)
                 self.save_config()
             return removed
 

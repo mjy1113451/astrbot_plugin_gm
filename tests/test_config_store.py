@@ -295,6 +295,61 @@ class GroupOverrideTests(unittest.TestCase):
         )
         self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["second"])
 
+    def test_merged_entry_tracks_present_fields(self):
+        # 合并结果要能区分「条目里没写这个字段」与「写了但仍是默认值」
+        store = self.make_store(
+            _Config(
+                group_overrides_templates=[
+                    _template_entry("100", ad_keywords=["a"], mute_notice=True)
+                ]
+            )
+        )
+        entry = store._template_group_entry("100")
+        self.assertIn("ad_keywords", entry)
+        self.assertNotIn("mute_notice", entry)  # 等于默认值 → 不参与覆盖
+        self.assertIn("mute_notice", entry["__present_fields__"])
+        self.assertNotIn("blacklisted_users", entry["__present_fields__"])
+
+    def test_runtime_list_follows_later_template_change(self):
+        # 指令增删过一次之后，WebUI 模板后来的改动仍要生效
+        # （PR #289 审查：config-override-precedence-loss）。
+        config = _Config(
+            whitelist_users=["g1"],
+            group_overrides_templates=[_template_entry("100", whitelist_users=["t1"])],
+        )
+        store = self.make_store(config)
+        ok, current = store.mutate_group_list("100", "whitelist_users", "add", "u1")
+        self.assertTrue(ok)
+        self.assertEqual(current, ["t1", "u1"])
+        config["group_overrides_templates"] = [
+            _template_entry("100", whitelist_users=["t1", "t2"])
+        ]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["t1", "t2", "u1"]
+        )
+        self.assertEqual(
+            store.runtime_group_list("100", "whitelist_users"), ["t1", "t2", "u1"]
+        )
+
+    def test_runtime_list_removal_survives_template_change(self):
+        config = _Config(whitelist_users=["g1", "g2"])
+        store = self.make_store(config)
+        ok, current = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
+        self.assertTrue(ok)
+        self.assertEqual(current, ["g2"])
+        # 全局后来加了 g3：本群仍应保留删除意图，同时拿到新加的 g3
+        config["whitelist_users"] = ["g1", "g2", "g3"]
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g2", "g3"]
+        )
+
+    def test_explicit_set_is_authoritative_snapshot(self):
+        config = _Config(whitelist_users=["g1"])
+        store = self.make_store(config)
+        store.set_group_override("100", "whitelist_users", ["x"])
+        config["whitelist_users"] = ["g1", "g2"]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["x"])
+
 
 if __name__ == "__main__":
     unittest.main()
