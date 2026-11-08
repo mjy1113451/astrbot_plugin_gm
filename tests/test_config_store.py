@@ -41,7 +41,7 @@ if "astrbot" not in sys.modules:
 
 from unittest.mock import patch  # noqa: E402
 
-from cop.config_store import ConfigStore  # noqa: E402
+from cop.config_store import ConfigRollbackError, ConfigStore  # noqa: E402
 
 
 class _Config(dict):
@@ -64,6 +64,37 @@ class _FailingConfig(_Config):
         self.saves += 1
         if self.fail:
             raise OSError("config.json 写入失败（模拟）")
+
+
+class _MutatingFailingConfig(_FailingConfig):
+    """保存时先改内存值再抛错：模拟框架 save_config 半途失败留下的脏配置。"""
+
+    def save_config(self):
+        self.saves += 1
+        self["dirty_key"] = "new"
+        self["whitelist_users"] = ["corrupted"]
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
+class _BrokenRollbackConfig(_MutatingFailingConfig):
+    """失败后连赋值都写不进去：用来验证"回滚也失败"走独立异常。"""
+
+    readonly = False
+
+    def save_config(self):
+        self["dirty_key"] = "new"
+        self["whitelist_users"] = ["corrupted"]
+        self.saves += 1
+        # 先改脏内存，再变成不可写，最后抛错：回滚必然失败
+        self.readonly = True
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+    def __setitem__(self, key, value):
+        if self.readonly and self.fail:
+            raise RuntimeError("config 对象已不可写（模拟）")
+        super().__setitem__(key, value)
 
 
 class _JsonStore:
@@ -337,6 +368,31 @@ class GroupOverrideTests(unittest.TestCase):
             )
         )
         self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["third"])
+
+    def test_declaration_scope_is_per_record(self):
+        # 声明的作用域是"单条记录级"：它只保护自己这条记录里的值。
+        # 前条给值 → 中间只声明不给值（清掉前条、回退全局）→ 后条给默认值
+        # （没声明，按未覆盖处理）仍回退全局，不会被中间那条的声明"粘"成覆盖
+        # （PR #289 审查：template-declaration-scope-loss）。
+        # 用 whitelist_users 做样本：它的模板默认值就是空列表，便于验证
+        # "写了但等于默认值 → 仍算未覆盖"这条规则。
+        store = self.make_store(
+            _Config(
+                whitelist_users=["global1"],
+                group_overrides_templates=[
+                    _template_entry("100", whitelist_users=["first"]),
+                    _template_entry("100", explicit_override_fields="whitelist_users"),
+                    _template_entry("100", whitelist_users=[]),
+                ],
+            )
+        )
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["global1"]
+        )
+        # 最终确实没覆盖这个字段，声明也不该留在合并结果里对外声称覆盖了
+        entry = store._template_group_entry("100")
+        self.assertNotIn("whitelist_users", entry)
+        self.assertNotIn("explicit_override_fields", entry)
 
     def test_present_fields_excludes_meta_keys(self):
         # 内部元数据不能混进"写过哪些字段"的记录里
@@ -637,6 +693,27 @@ class GroupOverrideTests(unittest.TestCase):
         ok, _ = store.mutate_group_list("100", "whitelist_users", "remove", "g1")
         self.assertTrue(ok)
         self.assertIn("100", store.runtime_path.read_text(encoding="utf-8"))
+
+    def test_framework_config_memory_is_restored_key_by_key(self):
+        # 框架 save_config 半途改了内存值再抛错：回滚要把被改的键恢复、把新增的
+        # 键删掉，进程内不能继续用这份脏配置
+        # （PR #289 审查：incomplete-memory-rollback）。
+        config = _MutatingFailingConfig(whitelist_users=["g1"])
+        config.fail = True
+        store = self.make_store(config)
+        with self.assertRaises(OSError):
+            store.save_config()
+        self.assertEqual(config["whitelist_users"], ["g1"])
+        self.assertNotIn("dirty_key", config)
+
+    def test_rollback_failure_raises_dedicated_error(self):
+        # 连回滚都失败时不能只记日志：调用方必须知道"配置可能不可信"
+        # （PR #289 审查：incomplete-memory-rollback）。
+        config = _BrokenRollbackConfig(whitelist_users=["g1"])
+        config.fail = True
+        store = self.make_store(config)
+        with self.assertRaises(ConfigRollbackError):
+            store.save_config()
 
     def test_later_declaration_without_value_drops_declaration(self):
         # 后条声明了字段却没给值：字段值与声明都要去掉，条目不再声称覆盖它

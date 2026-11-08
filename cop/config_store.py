@@ -11,8 +11,9 @@
 
 import copy
 import json
-
+import os
 import re
+import tempfile
 
 from pathlib import Path
 
@@ -20,6 +21,10 @@ from astrbot.api import logger
 
 from .constants import _RUNTIME_MAP_KEYS
 from .text_utils import _parse_qq_list
+
+
+class ConfigRollbackError(RuntimeError):
+    """保存失败后回滚不完整：当前进程的配置可能不可信，需要核对/重载。"""
 
 
 class ConfigStore:
@@ -141,8 +146,13 @@ class ConfigStore:
         写前内容，保证磁盘与内存一致（PR #289 审查：non-atomic-persistence）。
 
         runtime.json 本身用 strict 模式写：底层 save_json 默认只记日志不抛出，
-        那样"运行时写失败"会被当成成功，命令回执已生效、重启后却丢数据
+        那样"运行时写失败"会被当成成功、命令回执已生效、重启后却丢数据
         （PR #289 审查：missing-error-handling）。
+
+        回滚本身也可能失败：内存按"逐键比对后恢复"而不是 clear()+update()
+        整体重写（后者中途报错会留下部分状态），且任何一步回滚失败都改抛
+        ConfigRollbackError 说明配置可能不可信，不再让调用方以为只是一次普通的
+        保存失败（PR #289 审查：incomplete-memory-rollback）。
         """
         with self._lock:
             # 用哨兵区分"文件本来就不存在"（回滚时删除）与"读到了内容"（回滚时写回）。
@@ -161,23 +171,79 @@ class ConfigStore:
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
                 self.config.save_config()
-            except Exception:
-                if prev_global is not None:
-                    try:
-                        self.config.clear()
-                        self.config.update(prev_global)
-                    except Exception as e:
-                        logger.error(f"[群管插件] 回滚框架配置内存值失败: {e}")
+            except Exception as exc:
+                failure = self._restore_framework_config(prev_global)
                 try:
                     if prev_runtime is missing:
                         self.runtime_path.unlink(missing_ok=True)
                     else:
-                        self.runtime_path.write_text(prev_runtime, encoding="utf-8")
+                        # 原子写回：临时文件 + os.replace，避免恢复过程中断电/异常
+                        # 把备份内容再写坏一半
+                        self._atomic_write_text(self.runtime_path, prev_runtime)
                 except OSError as e:
                     logger.error(
                         f"[群管插件] 保存框架配置失败后回滚 runtime.json 也失败，"
                         f"磁盘运行时数据可能领先于配置: {e}")
+                    if failure is None:
+                        failure = e
+                if failure is not None:
+                    raise ConfigRollbackError(
+                        f"保存配置失败且回滚不完整（{failure}），"
+                        f"当前进程的配置可能不可信，请重启插件或到 WebUI 核对后重试"
+                    ) from exc
                 raise
+
+    def _restore_framework_config(self, prev_global):
+        """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
+
+        逐键比对后只改真正变化的键：整体 clear()+update() 一旦在中途抛错就会
+        留下"删了但没补回"的半截状态，且会把无关键也重写一遍
+        （PR #289 审查：incomplete-memory-rollback）。
+        """
+        if prev_global is None or not isinstance(self.config, dict):
+            return None
+        try:
+            current_keys = list(self.config.keys())
+        except Exception as e:
+            return e
+        failures = []
+        for key in current_keys:
+            if key in prev_global:
+                continue
+            try:
+                del self.config[key]
+            except Exception as e:
+                failures.append(e)
+        for key, value in prev_global.items():
+            try:
+                if key in self.config and self.config[key] == value:
+                    continue
+                self.config[key] = copy.deepcopy(value)
+            except Exception as e:
+                failures.append(e)
+        if failures:
+            logger.error(f"[群管插件] 回滚框架配置内存值失败: {failures[0]}")
+            return failures[0]
+        return None
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        """原子写文本：同目录临时文件写完 fsync 后 os.replace。"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def mutate_group_list(self, group_id: str, key: str, op: str, value: str) -> tuple:
         """群 list 配置的原子读-改-写（review#192 race-condition）。
@@ -379,6 +445,10 @@ class ConfigStore:
             # 本条显式声明要覆盖的字段：即使本条没给值，也代表"以后条为准"，
             # 必须清掉前面条目留下的值，让它回退全局
             # （PR #289 审查：template-explicit-override-lost）。
+            # 作用域是单条记录级：声明只保护本条给出的值；同群后面另有一条
+            # 记录给出非默认值时，按那条记录自己的规则判定（见
+            # test_declaration_scope_is_per_record），不要理解成"声明会粘住
+            # 后续所有记录"（PR #289 审查：template-declaration-scope-loss）。
             declared = self._explicit_field_names(entry.get("explicit_override_fields"))
             for k, v in entry.items():
                 if k == "__template_key":
