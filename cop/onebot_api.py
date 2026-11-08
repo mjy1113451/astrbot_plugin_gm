@@ -532,18 +532,28 @@ class OneBotApi:
         # #270：invite 通知同时含「邀请人QQ」行，必须优先匹配「被邀请人QQ」
         # （待处理记录 user_id 存的是被邀请人/申请人），普通申请仍匹配「用户qq号」
         m = re.search(r"(?:被邀请人QQ|用户qq号)[:：]\s*(\d{5,12})", qtext)
-        if not m:
-            return {}
-        uid = m.group(1)
-        matched = {}
-        for rec in pending.values():
-            if (isinstance(rec, dict) and str(rec.get("group_id")) == str(group_id)
-                    and str(rec.get("user_id")) == uid):
-                matched = rec
-        if matched:
-            logger.info(f"[加群审核] 引用消息 {reply_id} 不在待处理表，"
-                        f"已按通知内容定位到用户 {uid} 的待处理申请")
-        return matched
+        if m:
+            uid = m.group(1)
+            matched = {}
+            for rec in pending.values():
+                if (isinstance(rec, dict) and str(rec.get("group_id")) == str(group_id)
+                        and str(rec.get("user_id")) == uid):
+                    matched = rec
+            if matched:
+                logger.info(f"[加群审核] 引用消息 {reply_id} 不在待处理表，"
+                            f"已按通知内容定位到用户 {uid} 的待处理申请")
+            return matched
+        # PR #289 审查：被邀请人未知的邀请通知没有 QQ 号行，通知文本改为携带
+        # 「申请标识：{flag}」；协议端发送成功但未返回 message_id 时待处理记录
+        # 以 flag:<flag> 为键暂存，这里按该标识回查。绝不把邀请人 QQ 当申请人。
+        m_flag = re.search(r"申请标识[:：]\s*([^\s，。；;]+)", qtext)
+        if m_flag:
+            rec = pending.get(f"flag:{m_flag.group(1)}")
+            if (isinstance(rec, dict) and str(rec.get("group_id")) == str(group_id)):
+                logger.info(f"[加群审核] 引用消息 {reply_id} 不在待处理表，"
+                            f"已按申请标识定位被邀请人未知的邀请入群待处理记录")
+                return rec
+        return {}
 
     # ---------- 消息收发辅助 ----------
 

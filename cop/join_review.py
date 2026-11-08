@@ -360,12 +360,18 @@ class JoinReviewService:
                     f"用户qq昵称：{nickname_display}\n"
                     f"用户qq号：{applicant_id}\n"
                 )
+                identifier_lines = ""
             else:
                 applicant_lines = ""
+                # PR #289 审查：被邀请人未知时没有「用户qq号」行可供兜底匹配，
+                # 补一行稳定唯一的申请标识（即请求 flag），管理员引用回复时
+                # 即便通知 message_id 缺失也能按标识定位待处理记录
+                identifier_lines = f"申请标识：{flag}\n"
             notify_text = (
                 f"【新人加群】通知\n"
                 f"{invite_lines}"
                 f"{applicant_lines}"
+                f"{identifier_lines}"
                 f"qq等级：{level}\n"
                 f"加群验证消息：{comment or '无'}\n"
                 f"回复 /同意 或 /拒绝 或 /拉黑（引用本消息）"
