@@ -31,8 +31,16 @@ class RuntimeState:
         # #196：重复表情包检测的近期 _seen 缓存（内存态，不持久化）
         # key 为 (群号, 发送者QQ)，#239 起按发送者隔离，避免跨用户误撤回
         self._dup_face_seen: dict = {}
-        # #238：每个群最近处理过的 message_id，用于丢弃重复投递的同一消息
+        # #238：每个群最近处理过的 message_id（旧实现单值缓存，#282 起改为
+        # 每群一个 deque，见 conversational._DUP_FACE_MID_CACHE；保留旧字段
+        # 名以兼容既有引用，新逻辑使用 _dup_face_mid_cache）
         self._dup_face_last_mid: dict = {}
+        # #282：每个群最近处理过的 message_id 缓存（deque(maxlen=N)），防非相邻重复投递误判
+        self._dup_face_mid_cache: dict = {}
+
+        # #288：每个群最近一次收到加群请求事件的时间戳（内存态，不持久化），
+        # 供 /加群申请通路检查 判断「请求事件是否到达过插件」
+        self._join_request_seen: dict = {}
 
         # 群违规检测运行时状态（#109 PR #1）：spam_records[(group_id, user_id)] -> [timestamp, ...]
         # 仅内存，进程重启清空（与参考插件行为一致）

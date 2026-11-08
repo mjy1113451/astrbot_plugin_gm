@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
@@ -52,6 +53,44 @@ if TYPE_CHECKING:
 _DUP_FACE_MAX_GAP = 2
 _DUP_FACE_WINDOW = 1800  # 指纹保留窗口（秒），沿用原 30 分钟
 _DUP_FACE_MAX_KEYS = 200  # 单发送者缓存指纹上限，沿用原上限
+_DUP_FACE_MID_CACHE = 50  # 每群最近处理过的 message_id 缓存条数（#282）
+
+# #282：内容哈希指纹识别。
+# - md5 字段：协议端直接给的图片内容哈希，最可靠；
+# - file 字段：多数实现是 "<32位hex>.image/.jpg"，但部分实现给的是与内容
+#   无关的序号文件名（如 "0.image"、"1.jpg"），拿它当指纹会让不同表情包
+#   互相"撞指纹"，用户只发一次表情也会被当成重复而误撤回；
+# - url 字段：QQ 图床 URL 路径里通常带 32 位文件哈希，可从中提取；
+# 三者都拿不到内容哈希时宁可放弃该段的判重，也不能拿无关值误判。
+_MD5_NAME_RE = re.compile(r"^([0-9a-fA-F]{32})(?:\.[A-Za-z0-9]+)?$")
+# URL 里的哈希不一定是独立路径段（QQ 图床形如 .../0-0-<hash>/0），
+# 因此按"前后都不是十六进制字符的 32 位 hex 串"匹配，而不是要求以 / 开头。
+_MD5_IN_URL_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])")
+_MD5_ONLY_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _image_fingerprint(data: dict) -> str:
+    """从 image 段提取内容哈希指纹；拿不到真实哈希时返回空串（不判重）。
+
+    md5 字段也要过 32 位十六进制校验：部分协议端在这个字段里塞的是序号或
+    短标识，直接当指纹会让不同图片撞在一起、把只发一次的表情误撤回
+    （PR #289 审查：weak-fingerprint-validation）。
+    """
+    md5 = str(data.get("md5") or "").strip().lower()
+    if md5 and _MD5_ONLY_RE.match(md5):
+        return md5
+    if md5:
+        logger.debug(f"[重复表情] md5 字段不是 32 位十六进制，已忽略: {md5[:40]}")
+    file_name = str(data.get("file") or "").strip()
+    m = _MD5_NAME_RE.match(file_name)
+    if m:
+        return m.group(1).lower()
+    url = str(data.get("url") or "").strip()
+    if url:
+        m = _MD5_IN_URL_RE.search(url)
+        if m:
+            return m.group(1).lower()
+    return ""
 
 
 class DupFaceService:
@@ -107,17 +146,23 @@ class DupFaceService:
             if st == "face" and d.get("id"):
                 keys.append(("face", str(d.get("id"))))
             elif st == "image":
-                fp = d.get("md5") or d.get("file") or d.get("url")
+                fp = _image_fingerprint(d)
                 if fp:
-                    keys.append(("image", str(fp)))
+                    keys.append(("image", fp))
         sender_id = str(raw.get("user_id", ""))
         mid = raw.get("message_id")
-        # #238：同一条消息只判定一次（重复投递不再被当成"重复表情包"）
+        # #238/#282：同一条消息只判定一次。旧实现只缓存「上一条 message_id」，
+        # 协议端对同一消息的非相邻重复投递（中间隔了其它事件）会绕过该守卫，
+        # 把"自己"当成重复导致仅发一次却被撤回；改为每群缓存最近 N 条已处理
+        # message_id，重复投递无论隔多远都不会再被判重。
         if mid is not None:
-            last_mid = self._runtime._dup_face_last_mid.get(group_id)
-            if str(last_mid) == str(mid):
+            mid_cache = self._runtime._dup_face_mid_cache.get(group_id)
+            if mid_cache is None:
+                mid_cache = deque(maxlen=_DUP_FACE_MID_CACHE)
+                self._runtime._dup_face_mid_cache[group_id] = mid_cache
+            if str(mid) in mid_cache:
                 return
-            self._runtime._dup_face_last_mid[group_id] = mid
+            mid_cache.append(str(mid))
         # seen：{指纹: [上次出现时间戳, 距上次出现后该发送者发的其它消息数]}
         seen = self._runtime._dup_face_seen.setdefault((group_id, sender_id), {})
         # 清理超过时间窗口的陈旧指纹

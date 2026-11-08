@@ -23,8 +23,12 @@ class JsonStore:
                 logger.error(f"加载 {path.name} 失败: {e}")
         return default
 
-    def save_json(self, path: Path, data):
-        """原子写入 JSON：先写同目录临时文件再 os.replace，避免中途异常写坏原文件。"""
+    def save_json(self, path: Path, data, strict: bool = False):
+        """原子写入 JSON：先写同目录临时文件再 os.replace，避免中途异常写坏原文件。
+
+        strict=True 时写入失败会抛出异常，供需要感知落盘结果的事务式保存使用；
+        默认 False 保持原有的"记日志后继续"语义（统计/报告等可丢的周期写入）。
+        """
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(
@@ -44,3 +48,5 @@ class JsonStore:
                 raise
         except Exception as e:
             logger.error(f"保存 {path.name} 失败: {e}")
+            if strict:
+                raise

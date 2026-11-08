@@ -101,7 +101,7 @@ def _runtime_prop(name):
     "group_admin",
     "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.7.0",
+    "2.8.0",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
@@ -266,6 +266,8 @@ class GroupAdminPlugin(Star):
     _msg_save_counter = _runtime_prop("_msg_save_counter")
     _dup_face_seen = _runtime_prop("_dup_face_seen")
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
+    _dup_face_mid_cache = _runtime_prop("_dup_face_mid_cache")
+    _join_request_seen = _runtime_prop("_join_request_seen")
     _banned_file_md5_cache = _runtime_prop("_banned_file_md5_cache")
 
     # ===================== 通用 IO（阶段1：委托 cop 存储层） =====================
@@ -342,8 +344,12 @@ class GroupAdminPlugin(Star):
         if minutes <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0")
             return
-        self.config["political_ban_duration"] = minutes
-        self._store.save_config()
+        try:
+            self._store.set_global_setting("political_ban_duration", minutes)
+        except Exception as e:
+            logger.error(f"设置涉政禁言时长失败: {e}")
+            yield event.plain_result("[错误] 保存失败，本次设置未生效，请稍后重试")
+            return
         yield event.plain_result(f"[成功] 涉政禁言时长已设置为 {minutes} 分钟")
 
     @filter.command("切换骂人检测模式", "切换 AI 检测 / 关键词检测（按群生效）")
@@ -374,12 +380,12 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "join_approve_keywords")
-        if keyword in kws:
+        ok, kws = self._store.mutate_group_list(
+            group_id, "join_approve_keywords", "add", keyword
+        )
+        if not ok:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
-        kws.append(keyword)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已添加加群审核通过关键词 '{keyword}'（本群当前 {len(kws)} 个）")
 
     @filter.command("删除加群审核通过关键词", "删除加群审核自动通过关键词（按群生效）")
@@ -395,12 +401,12 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "join_approve_keywords")
-        if keyword not in kws:
+        ok, kws = self._store.mutate_group_list(
+            group_id, "join_approve_keywords", "remove", keyword
+        )
+        if not ok:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
-        kws.remove(keyword)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已删除加群审核通过关键词 '{keyword}'（本群当前 {len(kws)} 个）")
 
     @filter.command("查看加群审核通过关键词", "查看加群审核自动通过关键词列表（本群）")
@@ -456,9 +462,7 @@ class GroupAdminPlugin(Star):
         if act in ("查看", "list", ""):
             # #229：本群覆盖用运行时原始值判断（不经 get_group_setting 回退），
             # 以便区分「本群列表」与「全局列表」并说明实际生效来源
-            override = self._store.runtime_map("group_overrides").get(str(group_id), {})
-            group_kws = override.get("join_reject_keywords")
-            group_kws = group_kws if isinstance(group_kws, list) else []
+            group_kws = self._store.runtime_group_list(str(group_id), "join_reject_keywords")
             global_kws = self.config.get("join_reject_keywords", [])
             global_kws = global_kws if isinstance(global_kws, list) else []
             lines = []
@@ -491,12 +495,12 @@ class GroupAdminPlugin(Star):
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self._store.get_group_override_list(group_id, "whitelist_users")
-        if user_id in [str(x) for x in wl]:
+        ok, wl = self._store.mutate_group_list(
+            group_id, "whitelist_users", "add", user_id
+        )
+        if not ok:
             yield event.plain_result(f"[错误] 用户 {user_id} 已在本群白名单中")
             return
-        wl.append(user_id)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已添加 {user_id} 到本群白名单（当前 {len(wl)} 人）")
 
     @filter.command("删除白名单用户", "从白名单移除用户（按群生效）")
@@ -511,12 +515,12 @@ class GroupAdminPlugin(Star):
         if not user_id:
             yield event.plain_result("[错误] 请提供QQ号")
             return
-        wl = self._store.get_group_override_list(group_id, "whitelist_users")
-        if user_id not in [str(x) for x in wl]:
+        ok, wl = self._store.mutate_group_list(
+            group_id, "whitelist_users", "remove", user_id
+        )
+        if not ok:
             yield event.plain_result(f"[错误] 用户 {user_id} 不在本群白名单中")
             return
-        wl.remove(user_id)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已从本群白名单移除 {user_id}（当前 {len(wl)} 人）")
 
     @filter.command("查看白名单", "查看白名单用户列表（本群+全局）")
@@ -582,12 +586,10 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "ad_keywords")
-        if keyword in kws:
+        ok, kws = self._store.mutate_group_list(group_id, "ad_keywords", "add", keyword)
+        if not ok:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 已存在")
             return
-        kws.append(keyword)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已添加本群广告关键词 '{keyword}'（当前 {len(kws)} 个）")
 
     @filter.command("删除广告关键词", "删除广告关键词（按群生效）")
@@ -602,12 +604,12 @@ class GroupAdminPlugin(Star):
         if not keyword:
             yield event.plain_result("[错误] 请提供关键词")
             return
-        kws = self._store.get_group_override_list(group_id, "ad_keywords")
-        if keyword not in kws:
+        ok, kws = self._store.mutate_group_list(
+            group_id, "ad_keywords", "remove", keyword
+        )
+        if not ok:
             yield event.plain_result(f"[错误] 关键词 '{keyword}' 不存在（本群当前 {len(kws)} 个）")
             return
-        kws.remove(keyword)
-        self._store.save_config()
         yield event.plain_result(f"[成功] 已删除本群广告关键词 '{keyword}'（当前 {len(kws)} 个）")
 
     @filter.command("查看广告关键词", "查看广告关键词列表（本群）")
@@ -661,12 +663,15 @@ class GroupAdminPlugin(Star):
         if not domain:
             yield event.plain_result("[错误] 请提供域名，例如：example.com")
             return
-        wl = self._store.get_group_override_list(group_id, "link_whitelist")
-        if domain in [str(x).lower().split("/")[0].lstrip("www.") for x in wl]:
+        # 只读判定先行，命中重复时不创建运行时覆盖。
+        current = self._store.get_group_override_list(group_id, "link_whitelist")
+        if domain in [str(x).lower().split("/")[0].lstrip("www.") for x in current]:
             yield event.plain_result(f"[错误] 域名 '{domain}' 已在本群白名单中")
             return
-        wl.append(domain)
-        self._store.save_config()
+        ok, wl = self._store.mutate_group_list(group_id, "link_whitelist", "add", domain)
+        if not ok:
+            yield event.plain_result(f"[错误] 域名 '{domain}' 已在本群白名单中")
+            return
         yield event.plain_result(f"[成功] 已添加本群链接白名单 '{domain}'（当前 {len(wl)} 个）")
 
     @filter.command("删除链接白名单", "从链接白名单移除域名（按群生效）")
@@ -681,13 +686,17 @@ class GroupAdminPlugin(Star):
         if not domain:
             yield event.plain_result("[错误] 请提供域名")
             return
-        wl = self._store.get_group_override_list(group_id, "link_whitelist")
-        norm = [str(x).lower().split("/")[0].lstrip("www.") for x in wl]
+        # 只读判定先行，域名不存在时不创建运行时覆盖。
+        current = self._store.get_group_override_list(group_id, "link_whitelist")
+        norm = [str(x).lower().split("/")[0].lstrip("www.") for x in current]
         if domain not in norm:
             yield event.plain_result(f"[错误] 域名 '{domain}' 不在本群白名单中")
             return
-        wl.remove(wl[norm.index(domain)])
-        self._store.save_config()
+        match = str(current[norm.index(domain)])
+        ok, wl = self._store.mutate_group_list(group_id, "link_whitelist", "remove", match)
+        if not ok:
+            yield event.plain_result(f"[错误] 域名 '{domain}' 不在本群白名单中")
+            return
         yield event.plain_result(f"[成功] 已从本群链接白名单移除 '{domain}'（当前 {len(wl)} 个）")
 
     @filter.command("查看链接白名单", "查看链接白名单（本群+全局）")
@@ -1769,6 +1778,80 @@ class GroupAdminPlugin(Star):
         text = f"待处理加群申请（{len(applies)} 条）：\n\n" + "\n\n".join(applies)
         yield event.plain_result(text)
 
+    # #288: /加群申请通路检查 — 诊断加群申请事件通路与被过滤申请（群管/群主）
+    @filter.command("加群申请通路检查", "诊断本群加群申请事件通路与被过滤申请")
+    async def join_request_path_check_cmd(self, event: AstrMessageEvent):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        sender_id = str(raw.get("user_id"))
+        if not self._perms._is_authorized(raw, sender_id):
+            yield event.plain_result("只有群管理员或群主可执行此操作")
+            return
+        group_id = str(raw.get("group_id"))
+        lines = [f"【加群申请通路检查（群 {group_id}）】"]
+
+        # 1) 请求事件是否到达过插件（#288：内存态记录，重启后归零）
+        last_ts = self._join_request_seen.get(group_id)
+        if last_ts:
+            lines.append(
+                "1. 插件最近收到本群加群请求事件："
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_ts))}（重启后归零）")
+        else:
+            lines.append(
+                "1. 插件进程内从未收到本群加群请求事件——若刚有人申请却显示这条，"
+                "说明申请在协议端/平台层就没有投递到插件（典型原因：申请被 QQ 放进了"
+                "「过滤申请」，或 bot 不是群管理员）")
+
+        # 2) 逐个探测协议端申请查询接口。PR #289 审查（misleading-diagnostic-output）：
+        #    get_group_system_msg 返回的是群系统消息，其元素未必是加群申请，不能
+        #    统称"申请记录"——只有明确带 user_id 且带 flag/sub_type 的条目才按
+        #    申请展示，其余归为"非申请条目"，避免空 QQ / sub_type=? 的误导输出。
+        candidates = (
+            ("get_group_system_msg", "标准群系统消息/申请接口"),
+            ("get_group_filtered_requests", "被过滤申请"),
+            ("get_group_ignore_add_request", "被忽略申请"),
+        )
+        probed_ok = False
+        lines.append("2. 协议端申请查询接口逐个探测：")
+        for action, label in candidates:
+            raw = await self._api._call_onebot_raw(event, action, group_id=group_id)
+            if not (isinstance(raw, dict) and self._api._action_result_success(raw)):
+                lines.append(f"   - {action}（{label}）：不支持或调用失败")
+                continue
+            probed_ok = True
+            data = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
+            # 按接口类型分别解析：get_group_system_msg 只认 join_requests 字段；
+            # 被过滤/被忽略申请接口整个列表都是请求列表。申请判定还要求带
+            # flag/sub_type/request_type/comment 等请求专属字段
+            # （PR #289 审查：misleading-diagnostic-output）。
+            requests, others = self._api.collect_join_requests(
+                data, group_id, system_msg=(action == "get_group_system_msg"))
+            summary = f"   - {action}（{label}）：申请记录 {len(requests)} 条"
+            if others:
+                summary += f"，非申请条目 {others} 条（系统消息等，不展示）"
+            lines.append(summary)
+            for a in requests[:20]:
+                uid = str(a.get("user_id") or a.get("request_uin")
+                          or a.get("requester_uin") or "").strip() or "未知"
+                sub = str(a.get("sub_type") or a.get("request_type") or "?")
+                checked = bool(a.get("checked"))
+                lines.append(
+                    f"     · QQ {uid} | sub_type={sub} | 已处理={checked} | 来源 {action}")
+        if not probed_ok:
+            lines.append(
+                "   （所有候选接口均不可用，无法从协议端侧核对申请状态）")
+
+        # 3) 结论与建议
+        lines.append(
+            "3. 说明：QQ 把风险账号的加群申请放进「过滤申请」时，该申请【不会】以标准 "
+            "request.group 事件投递给 bot，插件无法主动获取——这是平台侧行为，插件侧"
+            "无法根治。建议：①管理员在 QQ 客户端群管理的「过滤申请」里人工处理；"
+            "②让申请人解除账号风险状态后重新申请；③向所用协议端反馈，请求提供"
+            "查询被过滤申请的接口，插件会在接口可用后自动接入。")
+        yield event.plain_result("\n".join(lines))
+
     # #151: /群信息 — 查看本群资料（任何成员可用）
     @filter.command("群信息", "查看本群资料（名称/号/标签/人数）")
     async def group_info_cmd(self, event: AstrMessageEvent):
@@ -1793,41 +1876,21 @@ class GroupAdminPlugin(Star):
         # #276：群标签优先走 get_group_tags（NapCat 扩展接口，兼容 str/dict 混合列表）；
         # 接口失败时回退 get_group_info 响应里的 tags / group_tags 字段；
         # 接口成功但为空 → 「无」，失败且回退也为空 → 明确提示获取失败
-        tags_raw = await self._api._call_onebot_raw(event, "get_group_tags", group_id=group_id)
-        tags = self._parse_group_tags_result(tags_raw)
+        tags_ok, tags = await self._api._group_tags_read(event, group_id)
         if not tags:
             tags = info.get("tags") or info.get("group_tags") or []
         if tags:
             tags_str = ", ".join(str(t) for t in tags)
-        elif isinstance(tags_raw, dict) and self._api._action_result_success(tags_raw):
-            tags_str = "无"
-        else:
+        elif not tags_ok:
             tags_str = "获取失败（当前协议端可能不支持 get_group_tags）"
+        else:
+            tags_str = "无"
         text = f"群名称: {name}\n群号: {gid}\n群标签: {tags_str}\n成员数: {member_count}"
         yield event.plain_result(text)
 
-    def _parse_group_tags_result(self, result) -> list:
-        """#276：解析 get_group_tags 响应中的标签列表。
-
-        兼容 data 为字符串列表 / dict 列表（取 tag/name/title 字段）/
-        {"tags": [...]} 包裹三种形态；响应失败或结构异常返回空列表。
-        """
-        if not isinstance(result, dict) \
-                or not self._api._action_result_success(result):
-            return []
-        data = result.get("data")
-        if isinstance(data, dict):
-            data = data.get("tags") or data.get("group_tags")
-        if not isinstance(data, list):
-            return []
-        tags = []
-        for t in data:
-            if isinstance(t, dict):
-                t = t.get("tag") or t.get("name") or t.get("title") or ""
-            t = str(t).strip()
-            if t and t not in tags:
-                tags.append(t)
-        return tags
+    # 群标签读取统一走 OneBotApi._group_tags_read（同时返回"查询是否成功"
+    # 与"标签列表"），不再在插件层重复实现一份解析
+    # （PR #289 审查：misleading-empty-state）。
 
 # #164: /群相册 — 引用图片消息上传到群相册（群管/群主）
     @filter.command("群相册", "引用图片上传到群相册（/群相册 相册名）")
@@ -1969,7 +2032,7 @@ class GroupAdminPlugin(Star):
         if self._history._should_notify_group_name(group_id, ok):
             yield event.plain_result(f"已修改群名为「{text}」" if ok else "修改群名失败（当前 OneBot 实现可能不支持此 API，或机器人权限不足）")
 
-    # #163: /群标签 — 添加群标签（群管/群主）
+    # #163: /群标签 — 添加群标签（群管/群主）；#285：统一走 add_group_tag
     @filter.command("群标签", "添加群标签（/群标签 标签名）；不带参数查看本群群标签")
     async def set_group_tag_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)
@@ -1989,44 +2052,118 @@ class GroupAdminPlugin(Star):
         if not text:
             # #276：不带参数时改为查看本群群标签（get_group_tags，NapCat 扩展接口）；
             # 区分「接口成功但无标签」与「接口失败（协议端不支持）」
-            tags_raw = await self._api._call_onebot_raw(event, "get_group_tags", group_id=group_id)
-            tags = self._parse_group_tags_result(tags_raw)
+            tags_ok, tags = await self._api._group_tags_read(event, group_id)
             if tags:
                 yield event.plain_result(f"本群群标签：{', '.join(tags)}")
                 return
-            if isinstance(tags_raw, dict) and self._api._action_result_success(tags_raw):
+            if not tags_ok:
                 yield event.plain_result(
-                    "本群暂无群标签；如需添加请发送 /群标签 标签名，例如 /群标签 编程交流")
+                    "查看群标签失败（当前协议端可能不支持 get_group_tags），"
+                    "或请提供标签内容进行添加，例如 /群标签 编程交流")
                 return
             yield event.plain_result(
-                "查看群标签失败（当前协议端可能不支持 get_group_tags），"
-                "或请提供标签内容进行添加，例如 /群标签 编程交流")
+                "本群暂无群标签；如需添加请发送 /群标签 标签名，例如 /群标签 编程交流")
             return
         if len(text) > 20:
             yield event.plain_result("标签过长（最多20字符）")
             return
-        # #242: 不同 OneBot 实现的参数名不一致（tag= 或 tags=），先按 tag= 调用，
-        # 失败再用 tags=[text] 兼容重试，并拆分失败原因便于定位
-        result = await self._api._call_onebot_raw(event, "set_group_tag",
-                                             group_id=group_id, tag=text)
-        if not self._api._action_result_success(result):
-            retry = await self._api._call_onebot_raw(event, "set_group_tag",
-                                                group_id=group_id, tags=[text])
-            if self._api._action_result_success(retry):
-                result = retry
-        if self._api._action_result_success(result):
+        # #285：统一命名 add_group_tag（NapCat），旧扩展名 set_group_tag
+        # （LLOneBot 等）由封装内部回退，tag=/tags= 参数变体一并覆盖
+        ok, result, warn = await self._api._add_group_tag(event, group_id, text)
+        if ok:
             yield event.plain_result(f"已添加群标签「{text}」")
             return
+        if warn == "tags_may_be_lost":
+            # 覆盖型回退把本群原有标签弄丢又没补回来：必须让管理员人工核对，
+            # 不能当普通失败处理（否则原标签会静默消失）
+            yield event.plain_result(
+                "添加群标签失败：协议端执行覆盖型标签接口后，本群原有标签可能已丢失，"
+                "请到 QQ 客户端核对并手动恢复")
+            return
+        if warn == "unverified":
+            # 协议端响应含糊 + 读不回标签列表：既不能说成功也不能说失败
+            yield event.plain_result(
+                "添加群标签结果未知：协议端未返回明确结果，且本群标签列表读不回来，"
+                "无法确认是否已添加，请到 QQ 客户端核对；如未生效可重试")
+            return
+        if warn == "tags_altered":
+            # 覆盖型接口执行后出现了基线之外的标签：标签集合已偏离预期
+            yield event.plain_result(
+                "添加群标签失败：协议端执行覆盖型标签接口后，本群出现了预期之外的标签，"
+                "请到 QQ 客户端核对并手动清理")
+            return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
-        detail = self._api._describe_action_failure(result, 'set_group_tag')
-        # #249：set_group_tag 是 LLOneBot 等个别协议端的扩展接口，并非 OneBot v11
-        # 标准 action，go-cqhttp / NapCat / Lagrange 均未提供，无跨实现候选可回退；
-        # 失败时把这一点讲清楚，避免用户误以为是插件或权限问题
+        detail = self._api._describe_action_failure(result, 'add_group_tag')
+        # #249：群标签接口并非 OneBot v11 标准 action，go-cqhttp / Lagrange 均未
+        # 提供；失败时把这一点讲清楚，避免用户误以为是插件或权限问题
         if ("不支持" in detail) or ("无可用调用通路" in detail):
-            detail += ("。set_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
-                       "（如 LLOneBot）提供，当前协议端不支持且无替代接口；"
+            detail += ("。群标签接口并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 NapCat / LLOneBot）提供，当前协议端不支持且无替代接口；"
                        "请更换/升级协议端，或在 QQ 客户端手动设置群标签")
         yield event.plain_result(f"添加群标签失败：{detail}")
+
+    # #285: /删群标签 — 删除群标签（群管/群主），统一走 delete_group_tag
+    @filter.command("删群标签", "删除群标签（/删群标签 标签名）")
+    async def delete_group_tag_cmd(self, event: AstrMessageEvent):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        sender_id = str(raw.get("user_id"))
+        if not self._perms._is_authorized(raw, sender_id):
+            yield event.plain_result("只有群管理员或群主可执行此操作")
+            return
+        group_id = str(raw.get("group_id"))
+        text = self._mp._extract_text(raw).strip()
+        for prefix in ("/删群标签", "删群标签"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+        if not text:
+            # 不带参数时先展示当前标签，提示用法
+            tags_ok, tags = await self._api._group_tags_read(event, group_id)
+            if tags:
+                yield event.plain_result(
+                    f"本群群标签：{', '.join(tags)}\n"
+                    f"请发送 /删群标签 标签名 进行删除")
+            elif not tags_ok:
+                # 查不到 ≠ 没有：接口失败/不支持要说清楚，别让管理员以为标签被清空了
+                # （PR #289 审查：misleading-empty-state）
+                yield event.plain_result(
+                    "获取群标签失败（当前协议端可能不支持 get_group_tags），"
+                    "无法列出可删除的标签；可直接发送 /删群标签 标签名 尝试删除")
+            else:
+                yield event.plain_result("本群暂无群标签")
+            return
+        ok, result, reason = await self._api._delete_group_tag(event, group_id, text)
+        if ok:
+            yield event.plain_result(f"已删除群标签「{text}」")
+            return
+        if reason == "not_found":
+            yield event.plain_result(
+                f"本群没有「{text}」这个群标签，无需删除（可用 /删群标签 查看当前标签）")
+            return
+        if reason == "still_present":
+            # 协议端回报成功但读回标签仍在：不能回执"已删除"
+            yield event.plain_result(
+                f"删除群标签「{text}」未生效：读回时本群仍有该标签，"
+                "请确认机器人有群主权限，或到 QQ 客户端手动删除")
+            return
+        if reason == "read_failed" and result is None:
+            # 删除前就读不出标签：本次没有发出任何删除请求
+            yield event.plain_result(
+                f"删除群标签「{text}」未执行：删除前读取群标签失败，"
+                "无法确认该标签是否存在；请稍后重试，或到 QQ 客户端手动删除")
+            return
+        logger.warning(f"删除群标签失败: group={group_id} tag={text} result={result}")
+        detail = self._api._describe_action_failure(result, 'delete_group_tag')
+        if reason == "read_failed":
+            detail += "（读回标签列表失败，无法确认删除是否生效，请在 QQ 客户端核对）"
+        if ("不支持" in detail) or ("无可用调用通路" in detail):
+            detail += ("。delete_group_tag 并非 OneBot v11 标准接口，仅部分协议端"
+                       "（如 NapCat）提供，当前协议端不支持；"
+                       "请更换/升级协议端，或在 QQ 客户端手动删除群标签")
+        yield event.plain_result(f"删除群标签失败：{detail}")
 
     # #162: /添加违禁图片 — 引用图片消息加入违禁图列表（群管/群主）
     @filter.command("添加违禁图片", "引用图片消息加入违禁图列表")
@@ -2070,19 +2207,21 @@ class GroupAdminPlugin(Star):
         if not md5:
             yield event.plain_result("下载图片失败，无法计算 MD5")
             return
-        # 写入本群覆盖（统一走 _get_group_override_list）
-        banned = self._store.get_group_override_list(group_id, "banned_images")
-        if md5 in banned:
+        # 只读判定先行；确认要写入时才创建本群运行时覆盖。
+        if md5 in self._store.get_group_override_list(group_id, "banned_images"):
             yield event.plain_result("该图片已在本群违禁列表中")
             return
-        banned.append(md5)
         try:
-            self._store.save_config()
+            ok, banned = self._store.mutate_group_list(
+                group_id, "banned_images", "add", md5
+            )
         except Exception as e:
-            # 持久化失败时回滚内存态，避免用户下次被提示『已存在』
-            banned.remove(md5)
+            # 持久化失败：ConfigStore 已回滚运行时覆盖本体，这里只记录并回复
             logger.error(f"保存违禁图片配置失败: {e}")
             yield event.plain_result("保存失败，未添加该违禁图片")
+            return
+        if not ok:
+            yield event.plain_result("该图片已在本群违禁列表中")
             return
         yield event.plain_result(f"已添加违禁图片（MD5: {md5[:8]}...），本群现有 {len(banned)} 张违禁图")
 
@@ -2103,8 +2242,7 @@ class GroupAdminPlugin(Star):
         if not re.fullmatch(r"[0-9a-f]{4,32}", md5_prefix):
             yield event.plain_result("MD5 前缀必须为 4-32 位 hex 字符（0-9a-f），例如 /删除违禁图片 1a2b3c4d")
             return
-        gconf = self._store.get_group_override_list(group_id, "banned_images")
-        banned = list(gconf)
+        banned = list(self._store.get_group_override_list(group_id, "banned_images"))
         if not banned:
             yield event.plain_result("本群无违禁图片")
             return
@@ -2116,16 +2254,19 @@ class GroupAdminPlugin(Star):
             yield event.plain_result(f"匹配到多张（{len(matches)}），请用更长的前缀：\n" + "\n".join(matches))
             return
         target = matches[0]
-        self._store.get_group_override_list(group_id, "banned_images").remove(target)
         try:
-            self._store.save_config()
+            ok, current = self._store.mutate_group_list(
+                group_id, "banned_images", "remove", target
+            )
         except Exception as e:
-            # 持久化失败时回滚内存态
-            self._store.get_group_override_list(group_id, "banned_images").append(target)
+            # 持久化失败：ConfigStore 已回滚运行时覆盖本体，这里只记录并回复
             logger.error(f"保存违禁图片配置失败: {e}")
             yield event.plain_result("保存失败，未删除该违禁图片")
             return
-        yield event.plain_result(f"已删除违禁图片 {target}，本群剩余 {len(banned) - 1} 张")
+        if not ok:
+            yield event.plain_result(f"未找到 MD5 前缀为 {md5_prefix} 的违禁图")
+            return
+        yield event.plain_result(f"已删除违禁图片 {target}，本群剩余 {len(current)} 张")
 
     # #162: /查看违禁图片 — 查看本群违禁图列表（群管/群主）
     @filter.command("查看违禁图片", "查看本群违禁图片列表")
@@ -2139,7 +2280,8 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("只有群管理员或群主可执行此操作")
             return
         group_id = str(raw.get("group_id"))
-        banned = self._store.get_group_override_list(group_id, "banned_images")
+        # 本群段落只展示运行时覆盖，全局值单独成段，避免重复展示同一批 MD5。
+        banned = self._store.runtime_group_list(group_id, "banned_images")
         global_banned = self.config.get("banned_images", [])
         lines = []
         if banned:
@@ -2233,13 +2375,25 @@ class GroupAdminPlugin(Star):
         raw = self._mp._get_raw_message(event)
         qq_list = self._mp._extract_at_qqs(raw if isinstance(raw, dict) else {}) or _parse_qq_list(target)
         if not qq_list: yield event.plain_result("请通过 @某人 或QQ号指定目标"); return
-        lst = self._store.get_group_override_list(gid, key)
+        current = [str(x) for x in self._store.get_group_override_list(gid, key)]
         if add:
-            changed = [q for q in qq_list if q not in [str(x) for x in lst] and (lst.append(q) or True)]
+            changed = [q for q in qq_list if q not in current]
         else:
-            changed = [q for q in qq_list if q in [str(x) for x in lst] and (lst.remove(q) or True)]
-        self._store.save_config()
-        yield event.plain_result(ok_tpl.format(n=len(changed), total=len(lst)) if changed else empty_msg)
+            changed = [q for q in qq_list if q in current]
+        if not changed:
+            yield event.plain_result(empty_msg)
+            return
+        # 一次性提交（单次落盘、失败整体回滚），避免逐项写入时中途失败留下
+        # "写了一半"的状态（PR #289 审查：partial-batch-persistence）。
+        try:
+            _changed, latest = self._store.mutate_group_list_batch(
+                gid, key, add=changed if add else (), remove=() if add else changed)
+        except Exception as e:
+            logger.error(f"批量变更本群配置 {key} 失败（群 {gid}）: {e}")
+            yield event.plain_result(
+                "[错误] 保存失败，本次变更未生效（已整体回滚），请稍后重试")
+            return
+        yield event.plain_result(ok_tpl.format(n=len(changed), total=len(latest)))
 
     # --- Bool 开关指令 ---
     @filter.command("开关撤回提示", "开关撤回消息提示（on/off，按群生效）")
@@ -2447,7 +2601,16 @@ class GroupAdminPlugin(Star):
         if not gconf:
             yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
             return
-        lines = [f"{k}: {v}" for k, v in gconf.items()]
+        lines = []
+        for k, v in gconf.items():
+            if str(k).startswith("__"):
+                # 内部元数据（如列表派生基线）不展示
+                continue
+            shown = self._store.get_group_setting(group_id, k) if isinstance(v, list) else v
+            lines.append(f"{k}: {shown}")
+        if not lines:
+            yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
+            return
         yield event.plain_result(f"本群覆盖配置：\n" + "\n".join(lines))
 
     @filter.command("清除群配置", "清除本群所有覆盖")
@@ -2465,14 +2628,25 @@ class GroupAdminPlugin(Star):
             if key not in gconf:
                 yield event.plain_result(f"本群未设置 {key}")
                 return
-            del gconf[key]
-            self._store.save_config()
+            # 值 + 增量操作 + 整体快照标记一起清，避免残留让本群配置"复活"
+            try:
+                self._store.drop_group_override(group_id, key)
+            except Exception as e:
+                logger.error(f"清除本群配置 {key} 失败（群 {group_id}）: {e}")
+                yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
+                return
             yield event.plain_result(f"已清除本群 {key} 覆盖")
         else:
-            overrides = self._store.runtime_map("group_overrides")
-            if group_id in overrides:
-                del overrides[group_id]
-                self._store.save_config()
+            # 整群清除同样走事务：保存失败要回滚，不能内存删了磁盘还在
+            try:
+                cleared = self._store.drop_group_overrides(group_id)
+            except Exception as e:
+                logger.error(f"清除本群全部配置失败（群 {group_id}）: {e}")
+                yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
+                return
+            if not cleared:
+                yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
+                return
             yield event.plain_result("已清除本群所有覆盖")
 
     @filter.command("status", "查看插件配置")
