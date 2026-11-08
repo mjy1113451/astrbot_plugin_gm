@@ -485,6 +485,11 @@ class OneBotApi:
         只有响应明确指出 action/参数不被接受才换下一个变体，权限不足、群号
         错误、响应结构含糊（读不回来也无法确认是否已生效）一律停手，避免对
         同一个有副作用的 action 反复执行（PR #289 审查：duplicate-side-effect）。
+
+        候选按副作用等级分开：`add_group_tag` 是纯新增语义，名称/参数变体都
+        可以放心回退；`set_group_tag` 是覆盖型（可能整体改写标签集合），只有在
+        读接口可用、能读回并恢复时才作为最后手段，且执行后要把被挤掉的旧标签
+        重新加回去（PR #289 审查：unsafe-action-fallback）。
         """
         # 读接口能力先探一次：探不通就彻底不做读回，只按 action 结果判定
         baseline_ok, baseline_tags = await self._group_tags_read(event, group_id)
@@ -492,17 +497,30 @@ class OneBotApi:
             # 标签本来就在：幂等成功，不再调用有副作用的 action
             return True, None
         read_supported = baseline_ok
-        candidates = (
+        candidates = [
             ("add_group_tag", {"tag": tag}),
             ("add_group_tag", {"tags": [tag]}),
-            ("set_group_tag", {"tag": tag}),
-            ("set_group_tag", {"tags": [tag]}),
-        )
+        ]
+        if read_supported:
+            # 只有能读回标签集合时，才允许降级到覆盖型 set_group_tag：
+            # 读不回来就无法发现"其它标签被覆盖没了"，也不能事后补回
+            candidates.extend([
+                ("set_group_tag", {"tag": tag}),
+                ("set_group_tag", {"tags": [tag]}),
+            ])
         last = None
         for index, (action, extra) in enumerate(candidates):
+            if action == "set_group_tag" and not read_supported:
+                # 中途读接口失效：剩余的覆盖型候选一律不用
+                break
             p = {"group_id": str(group_id)}
             p.update(extra)
             last = await self._call_onebot_raw(event, action, **p)
+            overwritten = False
+            if action == "set_group_tag":
+                # 覆盖型调用后先看有没有把别的标签挤掉，有就补回去
+                overwritten = await self._verify_and_restore_tags(
+                    event, group_id, baseline_tags, tag)
             if self._action_result_success(last):
                 return True, last
             # 读回是判断"到底生效没"的唯一依据：确认标签不在才能放心换变体重试
@@ -516,6 +534,11 @@ class OneBotApi:
                     read_supported = False
                 else:
                     confirmed_absent = True
+            if overwritten and not confirmed_absent:
+                # 覆盖型调用已经把旧标签弄丢又补不回来：停下来交给管理员
+                logger.warning(
+                    f"[OneBot] set_group_tag 覆盖后标签集合发生变化，已停止后续回退（群 {group_id}）")
+                break
             if index + 1 >= len(candidates):
                 break
             # 读不回来时无法确认上一次是否已生效，只有"action/参数不被接受"
@@ -524,6 +547,30 @@ class OneBotApi:
                     last, action, ambiguous_retry=confirmed_absent):
                 break
         return False, last
+
+    async def _verify_and_restore_tags(self, event: AstrMessageEvent, group_id: str,
+                                       baseline_tags: list, tag: str) -> bool:
+        """覆盖型调用后用读回确认旧标签没被挤掉，丢了就补回来。
+
+        返回是否检测到"标签集合被改写"（含已补回的情况）。
+        """
+        read_ok, tags = await self._group_tags_read(event, group_id)
+        if not read_ok:
+            logger.warning(
+                f"[OneBot] set_group_tag 后无法读取群标签，改写成败未知（群 {group_id}）")
+            return True
+        missing = [t for t in baseline_tags if t not in tags and t != tag]
+        if not missing:
+            return False
+        logger.warning(
+            f"[OneBot] set_group_tag 覆盖了本群原有群标签，正在补回: {missing}（群 {group_id}）")
+        for old_tag in missing:
+            try:
+                await self._call_onebot_raw(
+                    event, "add_group_tag", group_id=str(group_id), tag=old_tag)
+            except Exception as e:
+                logger.error(f"[OneBot] 补回群标签 {old_tag} 失败: {e}")
+        return True
 
     async def _delete_group_tag(self, event: AstrMessageEvent, group_id: str, tag: str):
         """删除群标签。#285：统一命名 delete_group_tag；参数名逐候选尝试。

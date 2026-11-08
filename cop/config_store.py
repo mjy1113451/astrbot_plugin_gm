@@ -55,6 +55,9 @@ class ConfigStore:
         # PR #290：WebUI 按群配置模板（template_list）的字段默认值缓存，
         # 用于区分"字段未动（回退全局）"与"显式覆盖"。
         self._template_field_defaults = self._load_template_field_defaults()
+        # 本次保存事务里由插件显式改写的全局配置键：回滚时只删这些键，
+        # 不做"当前键集合 − 快照"的差集删除（PR #289 审查：overbroad-memory-rollback）。
+        self._touched_keys: tuple = ()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -179,7 +182,8 @@ class ConfigStore:
             try:
                 self.config.save_config()
             except Exception as exc:
-                failure = self._restore_framework_config(prev_global)
+                failure = self._restore_framework_config(prev_global, self._touched_keys)
+                self._touched_keys = ()
                 failure = failure or self._restore_framework_file(prev_global_file)
                 try:
                     if prev_runtime is missing:
@@ -198,6 +202,35 @@ class ConfigStore:
                         f"保存配置失败且回滚不完整（{failure}），"
                         f"当前进程的配置可能不可信，请重启插件或到 WebUI 核对后重试"
                     ) from exc
+                raise
+            else:
+                self._touched_keys = ()
+
+    def set_global_setting(self, key: str, value) -> None:
+        """写入单个全局配置项并持久化；保存失败时只回滚这一个键。
+
+        命令层直接 `self.config[key] = value` 再 save 的话，落盘失败后进程内会
+        留下未落盘的新值；这里把"改了哪个键"显式登记下来，回滚只碰这一个键，
+        不会误删框架在保存过程中注入的内部键
+        （PR #289 审查：overbroad-memory-rollback）。
+        """
+        with self._lock:
+            had_key = isinstance(self.config, dict) and key in self.config
+            prev_value = copy.deepcopy(self.config.get(key)) if isinstance(self.config, dict) else None
+            self._touched_keys = (key,)
+            if isinstance(self.config, dict):
+                self.config[key] = value
+            try:
+                self.save_config()
+            except Exception:
+                try:
+                    if had_key:
+                        self.config[key] = prev_value
+                    else:
+                        self.config.pop(key, None)
+                except Exception as e:
+                    logger.error(f"[群管插件] 回滚全局配置项 {key} 失败: {e}")
+                self._touched_keys = ()
                 raise
 
     def _snapshot_framework_file(self):
@@ -225,27 +258,17 @@ class ConfigStore:
             return e
         return None
 
-    def _restore_framework_config(self, prev_global):
+    def _restore_framework_config(self, prev_global, touched=None):
         """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
 
-        逐键比对后只改真正变化的键：整体 clear()+update() 一旦在中途抛错就会
-        留下"删了但没补回"的半截状态，且会把无关键也重写一遍
-        （PR #289 审查：incomplete-memory-rollback）。
+        只做两件安全的事：把快照里存在的键改回原值；把 `touched` 里明确列出的
+        新增键删掉。**不能**用"当前键集合 − 快照"做差集删除——框架在保存过程中
+        可能往配置对象里注入自己的内部/辅助键，差集回滚会把它们一起删掉
+        （PR #289 审查：overbroad-memory-rollback）。
         """
         if prev_global is None or not isinstance(self.config, dict):
             return None
-        try:
-            current_keys = list(self.config.keys())
-        except Exception as e:
-            return e
         failures = []
-        for key in current_keys:
-            if key in prev_global:
-                continue
-            try:
-                del self.config[key]
-            except Exception as e:
-                failures.append(e)
         for key, value in prev_global.items():
             try:
                 if key in self.config and self.config[key] == value:
@@ -253,6 +276,21 @@ class ConfigStore:
                 self.config[key] = copy.deepcopy(value)
             except Exception as e:
                 failures.append(e)
+        for key in touched or ():
+            if key in prev_global:
+                continue
+            try:
+                self.config.pop(key, None)
+            except Exception as e:
+                failures.append(e)
+        try:
+            extra = [k for k in self.config.keys() if k not in prev_global]
+        except Exception:
+            extra = []
+        if extra:
+            # 不删：无法区分"我们的新增键"与"框架注入的内部键"，交给持有
+            # 明确键名的事务接口（set_global_setting）去收拾
+            logger.debug(f"[群管插件] 回滚后仍存在写前没有的配置键（保留未删）: {extra}")
         if failures:
             logger.error(f"[群管插件] 回滚框架配置内存值失败: {failures[0]}")
             return failures[0]

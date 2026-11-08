@@ -344,8 +344,12 @@ class GroupAdminPlugin(Star):
         if minutes <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0")
             return
-        self.config["political_ban_duration"] = minutes
-        self._store.save_config()
+        try:
+            self._store.set_global_setting("political_ban_duration", minutes)
+        except Exception as e:
+            logger.error(f"设置涉政禁言时长失败: {e}")
+            yield event.plain_result("[错误] 保存失败，本次设置未生效，请稍后重试")
+            return
         yield event.plain_result(f"[成功] 涉政禁言时长已设置为 {minutes} 分钟")
 
     @filter.command("切换骂人检测模式", "切换 AI 检测 / 关键词检测（按群生效）")

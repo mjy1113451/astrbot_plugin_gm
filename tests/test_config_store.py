@@ -710,16 +710,35 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertIn("100", store.runtime_path.read_text(encoding="utf-8"))
 
     def test_framework_config_memory_is_restored_key_by_key(self):
-        # 框架 save_config 半途改了内存值再抛错：回滚要把被改的键恢复、把新增的
-        # 键删掉，进程内不能继续用这份脏配置
-        # （PR #289 审查：incomplete-memory-rollback）。
+        # 框架 save_config 半途改了内存值再抛错：被改的键要恢复成写前值；
+        # 写前不存在的键不能盲删——它可能是框架自己注入的内部/辅助键
+        # （PR #289 审查：overbroad-memory-rollback）。
         config = _MutatingFailingConfig(whitelist_users=["g1"])
         config.fail = True
         store = self.make_store(config)
         with self.assertRaises(OSError):
             store.save_config()
         self.assertEqual(config["whitelist_users"], ["g1"])
-        self.assertNotIn("dirty_key", config)
+        self.assertIn("dirty_key", config)
+
+    def test_declared_new_key_is_removed_on_failure(self):
+        # 插件自己新增的键通过 set_global_setting 显式登记，失败时会被删掉，
+        # 不会留下"内存有、磁盘没有"的配置项
+        # （PR #289 审查：overbroad-memory-rollback）。
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.set_global_setting("brand_new_key", 5)
+        self.assertNotIn("brand_new_key", config)
+
+    def test_declared_existing_key_is_restored_on_failure(self):
+        config = _FailingConfig(whitelist_users=["g1"])
+        store = self.make_store(config)
+        config.fail = True
+        with self.assertRaises(OSError):
+            store.set_global_setting("whitelist_users", ["changed"])
+        self.assertEqual(config["whitelist_users"], ["g1"])
 
     def test_rollback_failure_raises_dedicated_error(self):
         # 连回滚都失败时不能只记日志：调用方必须知道"配置可能不可信"

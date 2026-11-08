@@ -166,14 +166,15 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.action_calls[0][0], "add_group_tag")
 
     async def test_unsupported_action_still_falls_back_when_read_unavailable(self):
-        # 明确"不认识这个 action"时换变体是安全的：上一次根本没被执行
+        # 明确"不认识这个 action"时换参数变体是安全的：上一次根本没被执行。
+        # 但不会降级到覆盖型 set_group_tag——读不回来就无法确认它有没有把
+        # 本群其它标签整体改写掉（PR #289 审查：unsafe-action-fallback）。
         api = self.make_api(None, {"status": "failed", "wording": "unknown action"})
         ok, _ = await api._add_group_tag(None, "100", "标签A")
         self.assertFalse(ok)
-        self.assertEqual(len(self.action_calls), 4)
         self.assertEqual(
             [c[0] for c in self.action_calls],
-            ["add_group_tag", "add_group_tag", "set_group_tag", "set_group_tag"],
+            ["add_group_tag", "add_group_tag"],
         )
 
     async def test_ambiguous_success_without_read_back_stops_after_one_call(self):
@@ -204,6 +205,57 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         ok, _ = await api._add_group_tag(None, "100", "标签C")
         self.assertFalse(ok)
         self.assertEqual(len(self.action_calls), 4)
+
+
+class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """覆盖型 set_group_tag 只能"读得通"时才用，且要补回被挤掉的旧标签。
+
+    PR #289 审查：unsafe-action-fallback——set_group_tag 可能整体改写标签集合，
+    读接口不可用时无法发现副作用，也不该自动降级过去。
+    """
+
+    def make_api(self, tags, read_ok=True):
+        api = OneBotApi.__new__(OneBotApi)
+        self.tags = list(tags)
+        self.calls = []
+        self.read_ok = read_ok
+
+        async def fake_get_tags(event, group_id):
+            if not self.read_ok:
+                return None
+            return list(self.tags)
+
+        async def fake_call(event, action, **params):
+            self.calls.append((action, params))
+            if action == "set_group_tag":
+                new_tag = params.get("tag") or (params.get("tags") or [""])[0]
+                # 覆盖语义：整体改写，原有标签全部丢失
+                self.tags[:] = [new_tag]
+                return {"status": "ok"}
+            if action == "add_group_tag":
+                # 模拟"协议端不认识这个 action"：没有任何副作用
+                return {"status": "failed", "wording": "unknown action"}
+            return {"status": "failed", "wording": "unknown action"}
+
+        api._get_group_tags = fake_get_tags
+        api._call_onebot_raw = fake_call
+        return api
+
+    async def test_overwrite_action_restores_displaced_tags(self):
+        api = self.make_api(["旧标签1", "旧标签2"])
+        ok, _ = await api._add_group_tag(None, "100", "新标签")
+        self.assertTrue(ok)
+        # 走的是覆盖型接口，且把被挤掉的两个旧标签补了回来
+        self.assertIn("set_group_tag", [a for a, _ in self.calls])
+        restored = [p.get("tag") for a, p in self.calls
+                    if a == "add_group_tag" and p.get("tag") in ("旧标签1", "旧标签2")]
+        self.assertEqual(sorted(restored), ["旧标签1", "旧标签2"])
+
+    async def test_overwrite_action_not_used_without_read(self):
+        api = self.make_api([], read_ok=False)
+        ok, _ = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual({a for a, _ in self.calls}, {"add_group_tag"})
 
 
 class JoinRequestCollectionTests(unittest.TestCase):
