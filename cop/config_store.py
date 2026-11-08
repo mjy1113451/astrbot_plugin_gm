@@ -44,6 +44,9 @@ class ConfigStore:
         self._json = json_store
         # 运行时动态映射（group_overrides / groups / pending_join_requests）
         self._runtime_maps: dict = self.load_runtime_maps()
+        # PR #290：WebUI 按群配置模板（template_list）的字段默认值缓存，
+        # 用于区分"字段未动（回退全局）"与"显式覆盖"。
+        self._template_field_defaults = self._load_template_field_defaults()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -188,11 +191,75 @@ class ConfigStore:
             )
 
     def get_group_setting(self, group_id: str, key: str, default=None):
-        """按群读取配置项，先查 group_overrides[群号][key]，否则用全局配置/默认值。"""
+        """按群读取配置项。
+
+        优先级（PR #290）：
+        1. 指令写入的运行时覆盖 group_overrides[群号][key]（绝对优先，语义明确）；
+        2. WebUI 按群配置模板（_conf_schema.json 的 group_overrides_templates，
+           AstrBot template_list）：本群条目里该字段的值 ≠ 模板默认值时视为
+           显式覆盖——字段保持默认值意味着"未覆盖、回退全局"，这样管理员
+           只需要填写真正想改的字段，也不用担心模板默认值冻结全局配置；
+        3. 全局配置 / 默认值。
+        """
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if key in overrides:
             return overrides[key]
+        entry = self._template_group_entry(group_id)
+        if entry is not None and key in self._template_field_defaults:
+            value = entry.get(key, self._template_field_defaults[key])
+            if value != self._template_field_defaults[key]:
+                return value
         return self.config.get(key, default)
+
+    # ===================== WebUI 按群配置模板（PR #290） =====================
+
+    def _load_template_field_defaults(self) -> dict:
+        """从 _conf_schema.json 读取 group_overrides_templates 模板字段的默认值。
+
+        以 schema 文件为唯一事实来源，避免代码里再维护一份默认值副本；
+        读取失败时返回空 dict（此时模板条目不参与覆盖判定，行为与旧版一致）。
+        """
+        schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
+        try:
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            field = schema.get("group_overrides_templates") or {}
+            template = (field.get("templates") or {}).get("group_config") or {}
+            items = template.get("items") or {}
+            return {
+                k: (v.get("default") if isinstance(v, dict) else None)
+                for k, v in items.items()
+                if k != "group_id"
+            }
+        except Exception as e:
+            logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
+            return {}
+
+    def _template_group_entry(self, group_id: str):
+        """取本群在 WebUI 按群配置模板列表里的合并条目；无条目返回 None。
+
+        template_list 保存后形如 [{"__template_key": "...", "group_id": "...", ...}]；
+        同一群号出现多条时按顺序合并（后面的字段覆盖前面的），便于管理员
+        拆多条配置同群的不同侧面。
+        """
+        entries = self.config.get("group_overrides_templates")
+        if not isinstance(entries, list):
+            return None
+        gid = str(group_id).strip()
+        if not gid:
+            return None
+        merged = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("group_id", "")).strip() != gid:
+                continue
+            if merged is None:
+                merged = {}
+            for k, v in entry.items():
+                if k == "__template_key":
+                    continue
+                merged[k] = v
+        return merged
 
     # ===================== 按群覆盖读写 =====================
 
