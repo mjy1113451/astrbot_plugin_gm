@@ -184,6 +184,10 @@ class ConfigStore:
             prev_global_file = self._snapshot_framework_file()
             touched_keys = tuple(self._touched_keys)
             touched_prev = dict(self._touched_prev)
+            # 这一步失败不需要回滚：JsonStore 用临时文件 + os.replace 原子写，
+            # 失败时磁盘上仍是写前内容，且框架配置此时还没开始写，没有第二个
+            # 目标需要恢复，因此直接向上抛出即可
+            # （PR #289 审查：transaction-boundary）。
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
                 self.config.save_config()

@@ -393,7 +393,7 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
     """
 
     def make_api(self, baseline, overwrite_keeps_target=False, add_target_after_overwrite=False,
-                 overwrite_adds_extra=None):
+                 overwrite_adds_extra=None, overwrite_drops=(), restore_baseline_works=True):
         api = OneBotApi.__new__(OneBotApi)
         self.baseline = list(baseline)
         self.tags = list(baseline)
@@ -403,6 +403,10 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
         self.add_target_after_overwrite = add_target_after_overwrite
         # 覆盖型接口额外塞进来的标签（模拟协议端行为偏离预期）
         self.overwrite_adds_extra = overwrite_adds_extra
+        # 覆盖型接口挤掉的基线标签
+        self.overwrite_drops = tuple(overwrite_drops)
+        # 补回基线标签时协议端是否接受
+        self.restore_baseline_works = restore_baseline_works
 
         async def fake_get_tags(event, group_id):
             return list(self.tags)
@@ -413,7 +417,7 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
             if action == "set_group_tag":
                 # 覆盖语义：新的标签集合 = 目标标签（可选）+ 原有标签 + 意外标签
                 self.overwritten = True
-                self.tags[:] = list(self.baseline)
+                self.tags[:] = [t for t in self.baseline if t not in self.overwrite_drops]
                 if self.overwrite_keeps_target and tag not in self.tags:
                     self.tags.append(tag)
                 if self.overwrite_adds_extra:
@@ -421,6 +425,8 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
                 return {"status": "ok"}
             if action == "add_group_tag":
                 if tag in self.baseline:
+                    if not self.restore_baseline_works:
+                        return {"status": "failed", "wording": "权限不足"}
                     if tag not in self.tags:
                         self.tags.append(tag)
                     return {"status": "ok"}
@@ -471,6 +477,19 @@ class AddGroupTagOverwriteVerifyTests(unittest.IsolatedAsyncioTestCase):
         ok, _, warn = await api._add_group_tag(None, "100", "新标签")
         self.assertFalse(ok)
         self.assertEqual(warn, "tags_altered")
+
+    async def test_missing_baseline_with_extra_tag_reports_restore_failed(self):
+        # 覆盖后旧标签缺失且出现额外标签：仍然先努力补回旧标签，补不回就按
+        # "原有标签可能已丢失"上报（旧标签缺失优先于额外标签）
+        # （PR #289 审查：incomplete-overwrite-recovery）。
+        api = self.make_api(["旧标签", "另一个"], overwrite_keeps_target=True,
+                            overwrite_adds_extra="意外标签",
+                            overwrite_drops=("旧标签",), restore_baseline_works=False)
+        ok, _, warn = await api._add_group_tag(None, "100", "新标签")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "tags_may_be_lost")
+        # 确实尝试过补回旧标签，而不是发现额外标签就立刻放弃
+        self.assertIn(("add_group_tag", {"group_id": "100", "tag": "旧标签"}), self.calls)
 
     async def test_permission_failure_never_reaches_overwrite(self):
         # 权限不足/标签预置限制这类失败不降级到覆盖型接口
