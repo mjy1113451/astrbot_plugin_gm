@@ -612,6 +612,11 @@ class OneBotApi:
         action_unsupported = False
         explicit_ok_absent = False
         for index, (action, extra) in enumerate(candidates):
+            if action == "add_group_tag" and action_unsupported:
+                # 已经确认这个 action 名整体不存在：换参数名也没有意义，直接跳
+                # 到覆盖型兼容候选，避免多打一次有副作用的无效调用
+                # （PR #289 审查：premature-overwrite-fallback）
+                continue
             if action == "set_group_tag":
                 # 覆盖型接口只是"协议端没有纯新增 action"时的兼容回退：读接口
                 # 可用**且确实**遇到 action 名不被接受才进来。权限不足、标签

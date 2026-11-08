@@ -302,6 +302,9 @@ class ConfigStore:
             try:
                 if key in self.config and self.config[key] == value:
                     continue
+                # 逐个键写回：值被改的恢复原值，被框架删掉的补齐（key 不在
+                # config 里时同样落到这一句），不依赖"缺键与否"的分支
+                # （PR #289 审查：incomplete-memory-rollback）。
                 self.config[key] = copy.deepcopy(value)
             except Exception as e:
                 failures.append(e)

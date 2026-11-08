@@ -78,6 +78,16 @@ class _MutatingFailingConfig(_FailingConfig):
             raise OSError("config.json 写入失败（模拟）")
 
 
+class _DropKeyFailingConfig(_FailingConfig):
+    """保存时先删掉一个原有键再抛错：验证回滚会把被删的键补回来。"""
+
+    def save_config(self):
+        self.saves += 1
+        self.pop("rank_top_n", None)
+        if self.fail:
+            raise OSError("config.json 写入失败（模拟）")
+
+
 class _BrokenRollbackConfig(_MutatingFailingConfig):
     """失败后连赋值都写不进去：用来验证"回滚也失败"走独立异常。"""
 
@@ -816,6 +826,19 @@ class GroupOverrideTests(unittest.TestCase):
             store.save_config()
         self.assertIn("rank_top_n", config)
         self.assertIn("framework_helper_key", config)
+
+    def test_key_deleted_during_save_is_restored(self):
+        # 框架保存过程中删掉一个原有键再抛错：回滚要在 config 里把缺的键补回来，
+        # 不能只恢复"还在但值变了"的键，否则内存里会少一个配置项
+        # （PR #289 审查：incomplete-memory-rollback）。
+        config = _DropKeyFailingConfig(whitelist_users=["g1"], rank_top_n=20)
+        config.fail = True
+        store = self.make_store(config)
+        with self.assertRaises(OSError):
+            store.save_config()
+        self.assertIn("rank_top_n", config)
+        self.assertEqual(config["rank_top_n"], 20)
+        self.assertEqual(config["whitelist_users"], ["g1"])
 
     def test_rollback_failure_raises_dedicated_error(self):
         # 连回滚都失败时不能只记日志：调用方必须知道"配置可能不可信"

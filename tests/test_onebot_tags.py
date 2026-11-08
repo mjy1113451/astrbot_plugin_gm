@@ -207,17 +207,14 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.action_calls), 1)
         self.assertEqual(self.action_calls[0][0], "add_group_tag")
 
-    async def test_unsupported_action_still_falls_back_when_read_unavailable(self):
-        # 明确"不认识这个 action"时换参数变体是安全的：上一次根本没被执行。
-        # 但不会降级到覆盖型 set_group_tag——读不回来就无法确认它有没有把
+    async def test_unsupported_action_is_not_retried_with_other_params(self):
+        # 明确"不认识这个 action 名"时，换参数名同样不会生效，直接停手；
+        # 也不会降级到覆盖型 set_group_tag——读不回来就无法确认它有没有把
         # 本群其它标签整体改写掉（PR #289 审查：unsafe-action-fallback）。
         api = self.make_api(None, {"status": "failed", "wording": "unknown action"})
         ok, _, _warn = await api._add_group_tag(None, "100", "标签A")
         self.assertFalse(ok)
-        self.assertEqual(
-            [c[0] for c in self.action_calls],
-            ["add_group_tag", "add_group_tag"],
-        )
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"])
 
     async def test_ambiguous_success_without_read_is_unverified(self):
         # 读接口不可用 + 响应含糊（有载荷但没有 status/retcode）：既不能报成功
@@ -305,16 +302,25 @@ class AddGroupTagReadBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(OneBotApi._failure_invites_retry(None, "add_group_tag"))
 
     async def test_missing_tag_after_all_candidates_fails(self):
-        # 明确"action 名字不支持"才会走到覆盖型兼容接口；覆盖型也没能加入目标
-        # 标签时，最后还会再用纯新增接口补加一次，仍失败才判失败
+        # 明确"action 名字不支持"时直接跳过同 action 的另一参数变体，只走覆盖型
+        # 兼容接口；覆盖型也没能加入目标标签时最后再用纯新增补一次，仍失败才判失败
+        # （PR #289 审查：premature-overwrite-fallback）
         api = self.make_api([], {"status": "failed", "wording": "unknown action"})
         ok, _, warn = await api._add_group_tag(None, "100", "标签C")
         self.assertFalse(ok)
         self.assertEqual(warn, "")
         self.assertEqual(
             [c[0] for c in self.action_calls],
-            ["add_group_tag", "add_group_tag", "set_group_tag", "add_group_tag"],
+            ["add_group_tag", "set_group_tag", "add_group_tag"],
         )
+
+    async def test_param_failure_tries_variant_but_not_overwrite(self):
+        # 失败明确指向参数名：只换参数变体，且不允许降级到覆盖型接口
+        api = self.make_api([], {"status": "failed", "wording": "参数错误"})
+        ok, _, warn = await api._add_group_tag(None, "100", "标签C")
+        self.assertFalse(ok)
+        self.assertEqual(warn, "")
+        self.assertEqual([c[0] for c in self.action_calls], ["add_group_tag"] * 2)
 
 
 class AddGroupTagOverwriteFallbackTests(unittest.IsolatedAsyncioTestCase):
