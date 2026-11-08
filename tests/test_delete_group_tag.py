@@ -102,12 +102,36 @@ class DeleteGroupTagTests(unittest.IsolatedAsyncioTestCase):
         api = _TagApi(before=["老标签"], after=["老标签"], raw_result=_fail_payload())
         ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
         self.assertFalse(ok)
-        self.assertEqual(reason, "")
+        self.assertEqual(reason, "still_present")
 
-    async def test_direct_success_skips_readback_decision(self):
+    async def test_explicit_success_but_tag_still_present_is_failure(self):
+        # 协议端回 status=ok 却根本没删掉：读回标签仍在，不能报"已删除"
+        # （PR #289 审查：unverified-delete-success）。
         api = _TagApi(
             before=["老标签"], after=["老标签"], raw_result={"status": "ok", "retcode": 0},
         )
+        ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "still_present")
+
+    async def test_explicit_success_is_confirmed_by_readback(self):
+        api = _TagApi(
+            before=["老标签"], after=[], raw_result={"status": "ok", "retcode": 0},
+        )
+        ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+
+    async def test_explicit_success_with_unreadable_tags_keeps_failure(self):
+        # 明确成功但读回失败：无法确认到底删没删，按失败/结果未知上报
+        api = _TagApi(before=["老标签"], after=None, raw_result={"status": "ok"})
+        ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "read_failed")
+
+    async def test_explicit_success_without_read_interface_is_trusted(self):
+        # 协议端压根不提供读接口：只能以 action 响应为唯一依据
+        api = _TagApi(before=None, after=None, raw_result={"status": "ok", "retcode": 0})
         ok, _, reason = await api._delete_group_tag(None, "100", "老标签")
         self.assertTrue(ok)
         self.assertEqual(reason, "")

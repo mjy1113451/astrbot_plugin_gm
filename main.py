@@ -2080,6 +2080,12 @@ class GroupAdminPlugin(Star):
                 "添加群标签失败：协议端执行覆盖型标签接口后，本群原有标签可能已丢失，"
                 "请到 QQ 客户端核对并手动恢复")
             return
+        if warn == "unverified":
+            # 协议端响应含糊 + 读不回标签列表：既不能说成功也不能说失败
+            yield event.plain_result(
+                "添加群标签结果未知：协议端未返回明确结果，且本群标签列表读不回来，"
+                "无法确认是否已添加，请到 QQ 客户端核对；如未生效可重试")
+            return
         logger.warning(f"添加群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'add_group_tag')
         # #249：群标签接口并非 OneBot v11 标准 action，go-cqhttp / Lagrange 均未
@@ -2130,6 +2136,12 @@ class GroupAdminPlugin(Star):
         if reason == "not_found":
             yield event.plain_result(
                 f"本群没有「{text}」这个群标签，无需删除（可用 /删群标签 查看当前标签）")
+            return
+        if reason == "still_present":
+            # 协议端回报成功但读回标签仍在：不能回执"已删除"
+            yield event.plain_result(
+                f"删除群标签「{text}」未生效：读回时本群仍有该标签，"
+                "请确认机器人有群主权限，或到 QQ 客户端手动删除")
             return
         logger.warning(f"删除群标签失败: group={group_id} tag={text} result={result}")
         detail = self._api._describe_action_failure(result, 'delete_group_tag')

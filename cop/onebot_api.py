@@ -88,6 +88,28 @@ class OneBotApi:
                 return False
         return bool(result)
 
+    def _action_result_explicit_success(self, result) -> bool:
+        """响应是否带**明确**的成功信号（status=ok/async/success 或 retcode/code=0）。
+
+        有副作用的 action 用宽松的 `_action_result_success` 判定就够了（含糊
+        响应按成功处理可以避免重复执行）；但"能不能对外声称已经成功"必须区分：
+        只有明确成功信号才能当作证据，含糊载荷（如 {"data": None}）只能算
+        结果未知（PR #289 审查：ambiguous-success-response）。
+        """
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, dict):
+            status = str(result.get("status", "")).strip().lower()
+            if status in {"ok", "async", "success", "succeeded"}:
+                return True
+            for key in ("retcode", "code"):
+                if key in result and result[key] is not None:
+                    try:
+                        return int(result[key]) == 0
+                    except (TypeError, ValueError):
+                        return False
+        return False
+
     def _describe_action_failure(self, result, action: str) -> str:
         """把 OneBot 失败响应解析为可读原因，区分未实现/未知 action/预置限制/权限不足/其他。"""
         if result is None:
@@ -535,10 +557,17 @@ class OneBotApi:
         """添加群标签。返回 (是否成功, 最后一个原始响应, 告警码)。
 
         告警码："" 正常；"tags_may_be_lost" 表示覆盖型接口执行后本群原有标签
-        可能已丢失（补回失败），调用方必须提示管理员人工核对，不能当普通成功/失败处理。
+        可能已丢失（补回失败），调用方必须提示管理员人工核对，不能当普通成功/失败处理；
+        "unverified" 表示读接口不可用、响应又只是含糊成功，无法确认标签到底加没加上，
+        调用方应提示管理员到客户端核对，而不是回执"添加失败"或"已添加"。
 
         #285：NapCat 等协议端统一命名为 add_group_tag，旧扩展名 set_group_tag
         （LLOneBot 等）保留为兼容回退；参数名逐候选尝试（tag= / tags=）。
+
+        成功判定以**读回**为准：读回来确实有该标签才返回成功。协议端的成功响应
+        只代表"请求被接受"，缺 status/retcode 的含糊载荷（如 {"data": None}）更
+        无从判断，读接口不可用时不能凭它对外声称已添加
+        （PR #289 审查：ambiguous-success-response）。
 
         PR #289 审查（duplicate-side-effect）：add 是有副作用的 action，且部分
         协议端的成功响应缺 status/retcode 会被误判为失败；重试下一个候选前先
@@ -593,26 +622,38 @@ class OneBotApi:
                         f"[OneBot] 覆盖型群标签接口执行后本群原有标签可能已丢失，"
                         f"已停止后续回退（群 {group_id}）")
                     return False, last, "tags_may_be_lost"
-            if self._action_result_success(last):
-                return True, last, ""
-            # 读回是判断"到底生效没"的唯一依据：确认标签不在才能放心换变体重试
             confirmed_absent = False
             if read_supported:
+                # 读回才是可信证据：协议端的成功响应只代表"请求被接受"，
+                # 缺 status/retcode 的含糊载荷更无从判断，读回来确实有该标签
+                # 才能对外声称已添加（PR #289 审查：ambiguous-success-response）
                 read_ok, tags = await self._group_tags_read(event, group_id)
-                if read_ok and tag in tags:
-                    return True, last, ""
-                if not read_ok:
-                    # 中途读不通了：后续候选不再重复查询
-                    read_supported = False
-                else:
+                if read_ok:
+                    if tag in tags:
+                        return True, last, ""
                     confirmed_absent = True
+                else:
+                    read_supported = False
             if index + 1 >= len(candidates):
                 break
-            # 读不回来时无法确认上一次是否已生效，只有"action/参数不被接受"
-            # 才换变体；含糊响应一律停手，避免重复执行有副作用的 action
+            # 读回确认"确实没加上"时可以安全换变体（add 是纯新增语义）；
+            # 读不回来时只有"action/参数不被接受"才换，含糊响应一律停手，
+            # 避免重复执行有副作用的 action
             if not self._failure_invites_retry(
                     last, action, ambiguous_retry=confirmed_absent):
                 break
+        if not read_supported and last is not None:
+            if self._action_result_explicit_success(last):
+                # 协议端明确回报成功、但读接口不可用：只能以 action 响应为唯一
+                # 依据，并在日志里说明未经读回确认
+                logger.warning(
+                    f"[OneBot] 无法读回群标签，add_group_tag 结果仅按 action 响应判定"
+                    f"（群 {group_id} 标签 {tag}）")
+                return True, last, ""
+            if self._action_result_success(last):
+                # 含糊成功 + 读不回来：既不能报成功（可能压根没加上），也不能
+                # 断言失败（可能已经加上了），交管理员到客户端核对
+                return False, last, "unverified"
         return False, last, ""
 
     async def _verify_and_restore_tags(self, event: AstrMessageEvent, group_id: str,
@@ -664,16 +705,22 @@ class OneBotApi:
         """删除群标签。#285：统一命名 delete_group_tag；参数名逐候选尝试。
 
         返回 (是否成功, 最后一个原始响应, 原因)。原因取值：
-        "" / "not_found"（调用前标签就不存在）/ "read_failed"（读回失败，无法确认）。
+        "" / "not_found"（调用前标签就不存在）/ "still_present"（读回时标签仍在，
+        删除没生效）/ "read_failed"（读回失败，无法确认）。
 
         PR #289 审查：所有候选失败后读回标签做副作用确认——但必须先确认
         标签在调用前确实存在，否则"本来就没有这个标签"会被误报成删除成功
         （false-success-delete）。
 
+        成功判定同样以**读回**为准：明确成功响应只说明"请求被接受"，有些协议端
+        删不掉也回 status=ok；读回确认标签确实不在才算删除成功，读回失败或标签
+        仍在都返回失败/结果未知，不能直接报"已删除"
+        （PR #289 审查：unverified-delete-success）。
+
         失败后换参数变体前同样先读回：标签已消失即视为成功立即返回；读不到
-        标签列表时不再重试有副作用的调用；只有"参数/action 不被接受"这类
-        失败才换下一个变体，权限不足等明确失败不重复执行
-        （duplicate-side-effect）。
+        标签列表时不再重试有副作用的调用；只有"参数/action 不被接受"或"读回
+        确认标签仍在（说明上一次根本没生效）"才换下一个变体，权限不足等明确
+        失败不重复执行（duplicate-side-effect）。
         """
         before_ok, before_tags = await self._group_tags_read(event, group_id)
         tag_exists = before_ok and tag in before_tags
@@ -688,30 +735,43 @@ class OneBotApi:
         last = None
         read_supported = before_ok
         after_ok, after_tags = before_ok, before_tags
+        still_present = False
         for index, (action, extra) in enumerate(candidates):
             p = {"group_id": str(group_id)}
             p.update(extra)
             last = await self._call_onebot_raw(event, action, **p)
-            if self._action_result_success(last):
-                return True, last, ""
+            still_present = False
             if read_supported:
                 after_ok, after_tags = await self._group_tags_read(event, group_id)
-                if after_ok and tag not in after_tags:
-                    # 读回确认已删除：部分协议端成功响应缺 status/retcode
-                    return True, last, ""
-                if not after_ok:
+                if after_ok:
+                    if tag not in after_tags:
+                        # 读回确认已删除（成功响应缺 status/retcode 的情况也覆盖）
+                        return True, last, ""
+                    # 标签还在：即便响应说成功也没真删掉
+                    still_present = True
+                else:
                     read_supported = False
+                    if self._action_result_explicit_success(last):
+                        logger.warning(
+                            f"[OneBot] delete_group_tag 回报成功但读回群标签失败，"
+                            f"删除结果未确认（群 {group_id} 标签 {tag}）")
+                        return False, last, "read_failed"
+            elif self._action_result_explicit_success(last):
+                # 协议端不支持可靠读接口：只能以 action 响应为唯一依据，并记录说明
+                logger.warning(
+                    f"[OneBot] 无法读回群标签，delete_group_tag 结果仅按 action 响应判定"
+                    f"（群 {group_id} 标签 {tag}）")
+                return True, last, ""
             if index + 1 >= len(candidates):
                 break
-            if not self._failure_invites_retry(last, action):
+            if not self._failure_invites_retry(
+                    last, action, ambiguous_retry=still_present):
                 break
-        if read_supported and after_ok and tag in after_tags:
-            # 读回仍存在：删除确实没生效（权限不足或参数不被接受）
-            return False, last, ""
-        if not before_ok or not (read_supported and after_ok):
-            # 两侧读不到标签列表，无法确认"原本存在、现在消失"，保持失败语义
-            return False, last, "read_failed"
-        return False, last, ""
+        if still_present:
+            # 读回确认标签仍在：删除确实没生效（权限不足 / 参数不被接受 / 协议端假成功）
+            return False, last, "still_present"
+        # 读不到标签列表，无法确认"原本存在、现在消失"，保持失败语义
+        return False, last, "read_failed"
 
     @staticmethod
     def _failure_invites_retry(result, action: str, ambiguous_retry: bool = True) -> bool:
