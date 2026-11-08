@@ -283,6 +283,53 @@ class GroupOverrideTests(unittest.TestCase):
         )
         self.assertEqual(store.get_group_setting("100", "blacklisted_users"), [])
 
+    def test_later_explicit_declaration_without_value_clears_earlier(self):
+        # 后一条只声明 explicit_override_fields、没给值时，代表"以后条为准"，
+        # 前一条的值必须作废并回退全局
+        # （PR #289 审查：template-explicit-override-lost）。
+        store = self.make_store(
+            _Config(
+                ad_keywords=["global_ad"],
+                group_overrides_templates=[
+                    _template_entry("100", ad_keywords=["first"]),
+                    _template_entry("100", explicit_override_fields="ad_keywords"),
+                ],
+            )
+        )
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["global_ad"])
+
+    def test_later_explicit_declaration_does_not_block_later_value(self):
+        # 声明后又有值：仍以最后一个带值的条目为准。
+        store = self.make_store(
+            _Config(
+                ad_keywords=["global_ad"],
+                group_overrides_templates=[
+                    _template_entry("100", ad_keywords=["first"]),
+                    _template_entry("100", explicit_override_fields="ad_keywords"),
+                    _template_entry("100", ad_keywords=["third"]),
+                ],
+            )
+        )
+        self.assertEqual(store.get_group_setting("100", "ad_keywords"), ["third"])
+
+    def test_present_fields_excludes_meta_keys(self):
+        # 内部元数据不能混进"写过哪些字段"的记录里
+        # （PR #289 审查：template-explicit-override-lost）。
+        store = self.make_store(
+            _Config(
+                group_overrides_templates=[
+                    _template_entry(
+                        "100", ad_keywords=["tpl_ad"], explicit_override_fields="ad_keywords"
+                    )
+                ],
+            )
+        )
+        entry = store._template_group_entry("100")
+        present = entry["__present_fields__"]
+        self.assertEqual(present, ["ad_keywords"])
+        for meta in ("group_id", "explicit_override_fields", "__template_key"):
+            self.assertNotIn(meta, present)
+
     def test_multi_entry_merge_later_non_default_wins(self):
         # 两条都真正改了同一字段时，取后一条（保持“后面的覆盖前面的”语义）。
         store = self.make_store(

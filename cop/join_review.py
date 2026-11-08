@@ -257,10 +257,10 @@ class JoinReviewService:
         if hit_keyword is not None:
             # 先落黑名单再拒绝：即便协议端拒绝失败（如 flag 过期），后续申请也会被黑名单拦住
             # #270：拉黑对象是申请人/被邀请人 B，不能误写邀请人 A
-            bl = self._store.get_group_override_list(group_id, "blacklisted_users")
-            if str(applicant_id) not in [str(x) for x in bl]:
-                bl.append(str(applicant_id))
-                self._store.save_config()
+            # PR#289 审查（blacklist-update-not-persisted）：get_group_override_list
+            # 返回的是拷贝，直接 append 不会落盘；统一走 mutate_group_list 原子写入
+            self._store.mutate_group_list(
+                group_id, "blacklisted_users", "add", str(applicant_id))
             detail_reason = f"您的加群申请含有本群禁止的词语，自动拒绝（{reject_reason}）"
             handled = await self._api._handle_group_request(
                 event, flag, False, detail_reason, sub_type=sub_type)
@@ -492,9 +492,10 @@ class JoinReviewService:
             reject_reason = "拉黑"
             # #283：被邀请人未知时没有可拉黑对象，只拒绝不写黑名单
             if info.get("user_id"):
-                bl_list = self._store.get_group_override_list(group_id, "blacklisted_users")
-                if info["user_id"] not in [str(x) for x in bl_list]:
-                    bl_list.append(info["user_id"])
+                # PR#289 审查（blacklist-update-not-persisted）：返回的是拷贝，
+                # 必须走 mutate_group_list 才会真正落盘
+                self._store.mutate_group_list(
+                    group_id, "blacklisted_users", "add", str(info["user_id"]))
         elif deny:
             parts = msg_text.split("拒绝", 1)
             custom = parts[1].strip() if len(parts) > 1 else ""

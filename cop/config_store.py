@@ -292,6 +292,10 @@ class ConfigStore:
         defaults = self._template_field_defaults
         merged = None
         present_fields = []
+        # 不属于群配置本身的键：模板标识与群号不参与"写过哪些字段"的记录，
+        # 否则 __present_fields__ 会把内部元数据混进真实配置字段里
+        # （PR #289 审查：template-explicit-override-lost）。
+        meta_keys = ("__template_key", "group_id", "explicit_override_fields", "__present_fields__")
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -299,10 +303,14 @@ class ConfigStore:
                 continue
             if merged is None:
                 merged = {}
+            # 本条显式声明要覆盖的字段：即使本条没给值，也代表"以后条为准"，
+            # 必须清掉前面条目留下的值，让它回退全局
+            # （PR #289 审查：template-explicit-override-lost）。
+            declared = self._explicit_field_names(entry.get("explicit_override_fields"))
             for k, v in entry.items():
                 if k == "__template_key":
                     continue
-                if k not in present_fields:
+                if k not in present_fields and k not in meta_keys:
                     present_fields.append(k)
                 if k == "explicit_override_fields":
                     # 多条记录的显式覆盖声明要累加，不能被后一条覆盖掉。
@@ -316,6 +324,11 @@ class ConfigStore:
                     # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。
                     continue
                 merged[k] = v
+            for name in declared:
+                if name in entry or name in meta_keys:
+                    continue
+                # 声明了却没给值 → 前一条的值作废，回退全局配置
+                merged.pop(name, None)
         if merged is not None:
             # 记录"条目里到底写过哪些字段"，用于区分「字段没写」与「写了但仍是
             # 默认值」两种都按未覆盖处理的情况，排查模板不生效时看 debug 日志

@@ -47,12 +47,29 @@ class _Store:
         self.settings = settings or {}
         self.config = {}
         self._maps = {}
+        self.mutations = []
 
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
 
     def get_group_override_list(self, group_id, key):
         return list(self.settings.get(key, []) or [])
+
+    def mutate_group_list(self, group_id, key, op, value):
+        """桩：模拟原子读写，记录调用并按 add/remove 真正改动 settings。"""
+        self.mutations.append((group_id, key, op, value))
+        current = [str(x) for x in (self.settings.get(key) or [])]
+        value = str(value)
+        if op == "add":
+            if value in current:
+                return False, current
+            current.append(value)
+        else:
+            if value not in current:
+                return False, current
+            current.remove(value)
+        self.settings[key] = current
+        return True, list(current)
 
     def runtime_map(self, name):
         return self._maps.setdefault(name, {})
@@ -161,7 +178,7 @@ class UnknownInviteeNotifyTests(unittest.IsolatedAsyncioTestCase):
         store = _Store({"join_request_notify_in_group": True})
         api = _Api()
         raw = dict(_UNKNOWN_INVITE_RAW, user_id="777", sub_type="add")
-        await _drain(_make_service(store, api)._handle_group_join_request(None, raw))
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
 
         admin_text = api.admin_texts[0]
         self.assertIn("777 申请加入群 100", admin_text)
@@ -253,6 +270,53 @@ class UnknownInviteeReplyTests(unittest.IsolatedAsyncioTestCase):
         out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
         self.assertEqual(len(api.handled), 1)
         self.assertIn("已同意", str(out[0]))
+
+
+class BlacklistPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """黑名单必须真正落盘（PR #289 审查：blacklist-update-not-persisted）。
+
+    get_group_override_list 返回的是拷贝，直接 append 改不到运行时覆盖，
+    所以代码必须走 mutate_group_list。
+    """
+
+    async def test_keyword_auto_reject_persists_blacklist(self):
+        store = _Store({"join_reject_keywords": ["广告"], "blacklisted_users": []})
+        api = _Api()
+        raw = {
+            "group_id": 100,
+            "user_id": "777",
+            "sub_type": "add",
+            "flag": "f-kw",
+            "comment": "低价广告推广",
+        }
+        await _drain(_make_service(store, api)._handle_group_join_request(_Event(), raw))
+
+        self.assertIn(("100", "blacklisted_users", "add", "777"), store.mutations)
+        self.assertEqual(store.settings["blacklisted_users"], ["777"])
+
+    async def test_quote_reply_blacklist_persists(self):
+        store = _Store()
+        record = {
+            "flag": "f-1",
+            "group_id": "100",
+            "user_id": "777",
+            "inviter_user_id": "",
+            "sub_type": "add",
+            "ts": 1,
+        }
+        store.runtime_map("pending_join_requests")["mid-1"] = record
+        api = _Api()
+        svc = JoinReviewService(
+            config_store=store,
+            onebot_api=api,
+            runtime=SimpleNamespace(_join_request_seen={}),
+            permissions=_Perms(),
+            message_parse=_Parser("拉黑"),
+        )
+        await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+
+        self.assertIn(("100", "blacklisted_users", "add", "777"), store.mutations)
+        self.assertEqual(store.settings["blacklisted_users"], ["777"])
 
 
 if __name__ == "__main__":
