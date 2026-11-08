@@ -56,8 +56,8 @@ class ConfigStore:
     def load_json(self, path: Path, default):
         return self._json.load_json(path, default)
 
-    def save_json(self, path: Path, data):
-        return self._json.save_json(path, data)
+    def save_json(self, path: Path, data, strict: bool = False):
+        return self._json.save_json(path, data, strict=strict)
 
     # ===================== 运行时映射 =====================
 
@@ -97,7 +97,13 @@ class ConfigStore:
             return self.extract_runtime_maps(self.load_json(self.runtime_path, {}), maps)
 
         maps = self.extract_runtime_maps(self.load_json(self.config_path, {}), maps)
-        self.save_json(self.runtime_path, maps)
+        try:
+            # 迁移是"读旧文件 → 写新文件 → 备份旧文件"，写不成功就不能动旧文件，
+            # 否则旧配置只剩 .bak、新配置又是空的（PR #289 审查：missing-error-handling）
+            self.save_json(self.runtime_path, maps, strict=True)
+        except Exception as e:
+            logger.error(f"[群管插件] 迁移运行时配置到 runtime.json 失败，保留旧配置文件: {e}")
+            return maps
         if self.config_path.exists():
             try:
                 self.config_path.rename(
@@ -133,6 +139,10 @@ class ConfigStore:
         两个目标分两步写，中间失败会留下"runtime.json 已更新、框架配置还是旧的"
         状态，因此这里先备份 runtime.json 原文：框架配置写入失败时把它恢复到
         写前内容，保证磁盘与内存一致（PR #289 审查：non-atomic-persistence）。
+
+        runtime.json 本身用 strict 模式写：底层 save_json 默认只记日志不抛出，
+        那样"运行时写失败"会被当成成功，命令回执已生效、重启后却丢数据
+        （PR #289 审查：missing-error-handling）。
         """
         with self._lock:
             # 用哨兵区分"文件本来就不存在"（回滚时删除）与"读到了内容"（回滚时写回）。
@@ -148,7 +158,7 @@ class ConfigStore:
             # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
             # （PR #289 审查：incomplete-persistence-rollback）。
             prev_global = copy.deepcopy(dict(self.config)) if isinstance(self.config, dict) else None
-            self.save_json(self.runtime_path, self._runtime_maps)
+            self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
                 self.config.save_config()
             except Exception:
@@ -536,11 +546,50 @@ class ConfigStore:
         ops = self._list_ops(group_id, key)
         return bool(ops["added"] or ops["removed"])
 
+    def _adopt_snapshot(self, group_id: str, key: str, baseline: list, ops: dict) -> dict:
+        """首次变更旧版"普通列表快照"时，先把快照转成增量操作再叠加。
+
+        老版本（以及 set_group_override 的整体赋值）直接在 group_overrides 里
+        写完整列表、没有 __list_ops__ 记录。若不做转换，第一次增删就会用
+        "模板/全局基线 + 本次操作"覆盖掉快照，本群原有的名单条目会静默消失
+        （PR #289 审查：legacy-data-loss）。
+
+        转换规则：快照里有、基线里没有的项记 added；基线里有、快照里没有的项
+        记 removed（来源记为基线，与手动删除同语义）。转换后合并结果与快照一致，
+        后续增删再在此基础上叠加。
+        """
+        overrides = self.runtime_map("group_overrides")
+        gconf = overrides.get(str(group_id))
+        if not isinstance(gconf, dict):
+            return ops
+        snapshot = gconf.get(key)
+        if not isinstance(snapshot, list):
+            return ops
+        snap = self._as_str_list(snapshot)
+        added = [x for x in snap if x not in baseline]
+        removed = [x for x in baseline if x not in snap]
+        if not (added or removed):
+            return ops
+        logger.debug(
+            f"[群管插件] 群 {group_id} 的 {key} 是旧版列表快照，已转为增量操作"
+            f"（新增 {len(added)} 项、删除 {len(removed)} 项）"
+        )
+        return {
+            "added": added,
+            "removed": removed,
+            "removed_baseline": {x: True for x in removed},
+        }
+
     def _apply_list_ops(self, group_id: str, key: str, add=(), remove=()) -> list:
-        """记录一次增/删操作并物化生效列表（不做持久化，由调用方提交）。"""
+        """记录一次增/删操作并物化生效列表（不做持久化，由调用方提交）。
+
+        第一次变更旧版普通列表快照时先把快照转成增量（见 _adopt_snapshot）。
+        """
         ops = self._list_ops(group_id, key)
         # 记录删除时的基线（模板/全局）内容，供后续区分"删的是谁的项"
         baseline = self._as_str_list(self._template_or_global_setting(group_id, key, []))
+        if not (ops["added"] or ops["removed"]):
+            ops = self._adopt_snapshot(group_id, key, baseline, ops)
         for item in add:
             item = str(item).strip()
             if not item:

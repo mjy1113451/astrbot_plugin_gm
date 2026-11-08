@@ -67,13 +67,22 @@ class _FailingConfig(_Config):
 
 
 class _JsonStore:
+    """最小 JSON 存储桩：可切换"写失败"，用来验证 strict 写入的传播。"""
+
+    fail_saves = False
+
     def load_json(self, path, default):
         path = Path(path)
         if not path.exists():
             return default
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def save_json(self, path, data):
+    def save_json(self, path, data, strict=False):
+        if self.fail_saves:
+            # 真实 JsonStore 在 strict=True 时把写入异常抛给调用方
+            if strict:
+                raise OSError("runtime.json 写入失败（模拟）")
+            return
         Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
@@ -84,7 +93,7 @@ def _template_entry(group_id, **fields):
 
 
 class GroupOverrideTests(unittest.TestCase):
-    def make_store(self, config):
+    def make_store(self, config, json_store=None):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         base = Path(temp_dir.name)
@@ -96,7 +105,7 @@ class GroupOverrideTests(unittest.TestCase):
             stats_path=base / "stats.json",
             reports_path=base / "reports.json",
             lock=threading.RLock(),
-            json_store=_JsonStore(),
+            json_store=json_store or _JsonStore(),
         )
 
     def test_first_add_keeps_global_list_as_baseline(self):
@@ -485,6 +494,56 @@ class GroupOverrideTests(unittest.TestCase):
         )
         self.assertEqual(
             store.get_group_setting("100", "whitelist_users").count("g1"), 1
+        )
+
+    def test_legacy_plain_snapshot_survives_first_add(self):
+        # 升级前 runtime.json 里的普通列表快照（没有 __list_ops__）首次被增删时
+        # 必须转成增量继承下来，不能用"模板/全局基线 + 本次新增"把它覆盖掉
+        # （PR #289 审查：legacy-data-loss）。
+        config = _Config(whitelist_users=["global1"])
+        store = self.make_store(config)
+        store.runtime_map("group_overrides")["100"] = {
+            "whitelist_users": ["old1", "old2"]
+        }
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["old1", "old2"]
+        )
+        ok, current = store.mutate_group_list("100", "whitelist_users", "add", "new1")
+        self.assertTrue(ok)
+        self.assertEqual(current, ["old1", "old2", "new1"])
+        # 旧快照里没有的全局项视为本群显式删除，不会随迁移冒出来
+        self.assertNotIn("global1", current)
+        ops = store._list_ops("100", "whitelist_users")
+        self.assertEqual(ops["added"], ["old1", "old2", "new1"])
+        self.assertEqual(ops["removed"], ["global1"])
+
+    def test_legacy_plain_snapshot_survives_first_remove(self):
+        config = _Config(whitelist_users=["global1", "global2"])
+        store = self.make_store(config)
+        store.runtime_map("group_overrides")["100"] = {
+            "whitelist_users": ["global1", "global2", "old1"]
+        }
+        ok, current = store.mutate_group_list(
+            "100", "whitelist_users", "remove", "global2"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(current, ["global1", "old1"])
+        # 快照中的自定义项仍然在，只有被点名删除的项消失
+        self.assertIn("old1", current)
+
+    def test_runtime_write_failure_aborts_without_touching_config(self):
+        # runtime.json 写失败必须被感知：不能回执已生效、重启后丢数据
+        # （PR #289 审查：missing-error-handling）。
+        config = _FailingConfig(whitelist_users=["g1"])
+        json_store = _JsonStore()
+        json_store.fail_saves = True
+        store = self.make_store(config, json_store=json_store)
+        with self.assertRaises(OSError):
+            store.mutate_group_list("100", "whitelist_users", "add", "new1")
+        # 框架配置没有被提交，运行时覆盖也回滚了
+        self.assertEqual(config.saves, 0)
+        self.assertEqual(
+            store.get_group_setting("100", "whitelist_users"), ["g1"]
         )
 
     def test_save_config_failure_restores_runtime_file(self):
