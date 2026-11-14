@@ -10,7 +10,7 @@
 - ConfigStore（L1）：config / runtime_map / get_group_setting
 - OneBotApi（L2）：_do_recall / _get_self_id / _send / _mute_member / _unmute_member
   / _kick_member / _execute_action / _set_group_admin
-- RuntimeState（L2）：_dup_face_seen / _dup_face_last_mid
+- RuntimeState（L2）：_dup_face_seen / _dup_face_seq / _dup_face_last_mid
 - PermissionService（L2）：_is_authorized / has_group_admin_rights
 - TargetResolver（L2）：_resolve_colloquial_target（构造注入）
 - MessageParser（L2）：_message_at_bot / _extract_message_text_with_mentions / _build_text
@@ -47,10 +47,10 @@ if TYPE_CHECKING:
 
 # ===================== 重复表情包撤回（#196，原 dup_face.py） =====================
 
-# #273：同一发送者两次发出相同表情包之间，最多允许间隔的「其它消息」条数。
-# 仅当相同表情在紧邻窗口内（中间不超过 _DUP_FACE_MAX_GAP 条消息）重发才判重复；
-# 中间聊了若干条其它消息后再发同一表情属正常使用，不再撤回。
-_DUP_FACE_MAX_GAP = 2
+# #273 后续：同一发送者两次发出相同表情包之间，最多允许间隔的「其它群消息」条数。
+# 只有紧挨着的重发（中间一条消息都没有）才算刷屏；中间聊了文字或别人发言
+# 后再发同一表情属正常使用，不撤回。
+_DUP_FACE_MAX_GAP = 0
 _DUP_FACE_WINDOW = 1800  # 指纹保留窗口（秒），沿用原 30 分钟
 _DUP_FACE_MAX_KEYS = 200  # 单发送者缓存指纹上限，沿用原上限
 _DUP_FACE_MID_CACHE = 50  # 每群最近处理过的 message_id 缓存条数（#282）
@@ -129,10 +129,11 @@ class DupFaceService:
         B 发出与 A 相同的表情包会被当成 A 的重复而误撤回。
         #238：同一 message_id 只处理一次，避免消息被重复投递时把
         "自己"当成重复（仅发一次却被撤回）。
-        #273：不再把 30 分钟窗口内出现过的相同表情一律判重。seen 改为
-        {指纹: [时间戳, 间隔消息数]}，该发送者每发一条其它消息，所有缓存指纹的
-        间隔数 +1；只有相同指纹间隔消息数 ≤ _DUP_FACE_MAX_GAP 时才判重复，
-        「表情 → 几条聊天 → 同一表情」的正常使用不再被撤回。
+        #273：不再把 30 分钟窗口内出现过的相同表情一律判重，改为只判「紧邻重发」。
+        #273 后续：紧邻按整群消息时间线判定——同一发送者、且两次相同表情之间没有任何
+        其它群消息（自己的文字、别人的发言都算打断）。旧实现只累计该发送者自己
+        的消息数、且允许间隔 ≤2 条，于是「表情 → 一条文字 → 同一表情」仍被误
+        撤回；现在只有连发表情才撤回。
         """
         if not self._dup_face_enabled(group_id):
             return
@@ -163,26 +164,32 @@ class DupFaceService:
             if str(mid) in mid_cache:
                 return
             mid_cache.append(str(mid))
-        # seen：{指纹: [上次出现时间戳, 距上次出现后该发送者发的其它消息数]}
+        # #273 后续：按整群消息时间线推进序号——任何人发的任何一条群消息都会打断
+        # 「连发」，所以序号差 1 才代表「紧挨着的上一条群消息」。重复投递的
+        # 同一条消息在上面的 message_id 守卫里已返回，不会推进序号。
+        seq = self._runtime._dup_face_seq.get(group_id, 0) + 1
+        self._runtime._dup_face_seq[group_id] = seq
+        # seen：{指纹: [上次出现时间戳, 上次出现时的群消息序号]}
         seen = self._runtime._dup_face_seen.setdefault((group_id, sender_id), {})
         # 清理超过时间窗口的陈旧指纹
         for fp in [k for k, v in seen.items() if now - v[0] > _DUP_FACE_WINDOW]:
             del seen[fp]
         if not keys:
-            # 非表情包消息：所有指纹的间隔数 +1（#273：用于衡量是否"紧邻"）
-            for v in seen.values():
-                v[1] += 1
             return
         # 同一消息内的相同指纹去重，避免自身重复计入
         keys = list(dict.fromkeys(keys))
-        # 命中条件：指纹出现过且中间间隔消息数未超阈值
-        dup_fps = {k for k in keys if k in seen and seen[k][1] <= _DUP_FACE_MAX_GAP}
-        # 本次未出现的指纹间隔 +1；本次出现的指纹随后重置为 [now, 0]
-        for k, v in seen.items():
-            if k not in keys:
-                v[1] += 1
+        # 命中条件：同一发送者上次发同一表情就在紧挨着的群消息里（#273 后续）
+        dup_fps = set()
         for k in keys:
-            seen[k] = [now, 0]
+            last = seen.get(k)
+            if not last:
+                continue
+            gap = seq - last[1] - 1  # 两次相同表情之间隔了多少条群消息
+            if 0 <= gap <= _DUP_FACE_MAX_GAP:
+                dup_fps.add(k)
+        # 本次出现的指纹重置为「刚在 seq 这条消息里出现过」
+        for k in keys:
+            seen[k] = [now, seq]
         if len(seen) > _DUP_FACE_MAX_KEYS:
             overflow = len(seen) - _DUP_FACE_MAX_KEYS
             oldest = sorted(seen, key=lambda fp: seen[fp][0])[:overflow]

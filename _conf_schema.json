@@ -56,7 +56,7 @@
     "dup_face_recall_enabled": {
         "description": "重复表情包自动撤回全局开关（#196，默认关）",
         "type": "bool",
-        "hint": "开启后群内出现与近 30 分钟内相同的表情包（face id / 图片 md5→file→url 指纹）时自动撤回新消息。按群覆盖：/重复表情包撤回 开|关，或 group_overrides[gid][dup_face_recall_enabled]。",
+        "hint": "开启后，同一成员连续发送相同表情包（face id / 图片 md5→file→url 指纹）时自动撤回新消息。「连续」按整群消息时间线判定：两次相同表情之间没有任何其它群消息（自己的文字、别人的发言都算打断），中间夹了消息后再发同一表情包不撤回。按群覆盖：/重复表情包撤回 开|关，或 group_overrides[gid][dup_face_recall_enabled]。",
         "default": false
     },
     "qr_code_recall_enabled": {
