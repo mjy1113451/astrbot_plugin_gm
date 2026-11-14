@@ -101,7 +101,7 @@ def _runtime_prop(name):
     "group_admin",
     "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.8.0",
+    "2.8.1",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
@@ -265,6 +265,7 @@ class GroupAdminPlugin(Star):
     spam_records = _runtime_prop("spam_records")
     _msg_save_counter = _runtime_prop("_msg_save_counter")
     _dup_face_seen = _runtime_prop("_dup_face_seen")
+    _dup_face_seq = _runtime_prop("_dup_face_seq")
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
     _dup_face_mid_cache = _runtime_prop("_dup_face_mid_cache")
     _join_request_seen = _runtime_prop("_join_request_seen")

@@ -29,8 +29,12 @@ class RuntimeState:
         self.max_history: int = max_history
 
         # #196：重复表情包检测的近期 _seen 缓存（内存态，不持久化）
-        # key 为 (群号, 发送者QQ)，#239 起按发送者隔离，避免跨用户误撤回
+        # key 为 (群号, 发送者QQ)，#239 起按发送者隔离，避免跨用户误撤回；
+        # 值自「紧邻判定」改造起为 [上次出现时间戳, 上次出现时的群消息序号]
         self._dup_face_seen: dict = {}
+        # #273 后续：每个群已处理到的群消息序号（整群时间线），用于判定「紧邻重发」——
+        # 任何人发的任何一条群消息都会推进该序号，从而打断连发表情
+        self._dup_face_seq: dict = {}
         # #238：每个群最近处理过的 message_id（旧实现单值缓存，#282 起改为
         # 每群一个 deque，见 conversational._DUP_FACE_MID_CACHE；保留旧字段
         # 名以兼容既有引用，新逻辑使用 _dup_face_mid_cache）
