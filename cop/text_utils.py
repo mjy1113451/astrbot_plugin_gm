@@ -17,6 +17,24 @@ def _parse_qq_list(text: str) -> list:
     return list({m.group(1) for m in re.finditer(r"(\d{5,12})", text or "")})
 
 
+def normalize_qq_list(values) -> list:
+    """把配置里的 QQ 名单归一化为「去首尾空白、丢掉空项与 None」的字符串列表。
+
+    WebUI / JSON 里常出现 " 111 "、""、null 这类值：只判断 strip 后是否为空
+    而不真正 strip，会把 " 111 " 当成收件人发出去（协议端必然失败）；不同
+    调用方（通知发送 / 日志统计 / 诊断输出）也会因此对同一份配置得出不同
+    结论（PR #292 审查：inconsistent-recipient-normalization）。
+    """
+    result = []
+    for value in values or []:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            result.append(text)
+    return result
+
+
 def _cn_number_to_int(s: str):
     """把中文数字（支持 两/廿/十/十五/一百二十三）转为整数，失败返回 None。"""
     if not s:

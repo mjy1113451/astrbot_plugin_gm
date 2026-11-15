@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+from .text_utils import normalize_qq_list
+
 if TYPE_CHECKING:
     from .config_store import ConfigStore
     from .message_parse import MessageParser
@@ -123,22 +125,13 @@ class JoinReviewService:
         logger.info(
             f"[加群审核] 收到加群请求 group={group_id} sub_type={sub_type} "
             f"user_id={user_id} comment={_sanitize(comment)}")
-        # #288：记录请求事件到达时间，供 /加群申请通路检查 判断通路是否正常
-        try:
-            self._runtime._join_request_seen[group_id] = int(time.time())
-        except Exception:
-            pass
-
-        # 多群排障：把本群生效的通知配置随请求一起落日志，不用再在群里执行
-        # /加群申请通路检查——只看这两行 INFO 就能判断「为什么这个群没有通知」。
+        # 多群排障：把本群生效的通知配置随请求一起落日志——只看这两行 INFO
+        # 就能判断「为什么这个群没有通知」，不需要额外的诊断指令。
         audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
         notify_in_group = bool(
             self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
-        notify_admins = [
-            str(x) for x in
-            (self._store.get_group_setting(group_id, "join_notify_admins", []) or [])
-            if str(x).strip()
-        ]
+        notify_admins = normalize_qq_list(
+            self._store.get_group_setting(group_id, "join_notify_admins", []))
         logger.info(
             f"[加群审核] 群 {group_id} 通知配置：自动审核={'开' if audit_enabled else '关'}，"
             f"群内提醒={'开' if notify_in_group else '关'}，通知QQ={len(notify_admins)}人"

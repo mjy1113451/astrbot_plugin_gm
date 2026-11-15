@@ -20,6 +20,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain
 
 from .compat import MessageChain
+from .text_utils import normalize_qq_list
 
 if TYPE_CHECKING:
     from .config_store import ConfigStore
@@ -1295,11 +1296,9 @@ class OneBotApi:
         if purpose not in _ADMIN_NOTIFY_PURPOSES:
             raise ValueError(f"未知的管理员通知用途: {purpose}")
         key, label = _ADMIN_NOTIFY_PURPOSES[purpose]
-        admins = [
-            str(x) for x in
-            (self._store.get_group_setting(group_id, key, []) or [])
-            if str(x).strip()
-        ]
+        # " 111 " / "" / null 这类脏值统一在 L0 里清掉，避免把带空白的
+        # 号码当收件人发出去（PR #292 审查：inconsistent-recipient-normalization）
+        admins = normalize_qq_list(self._store.get_group_setting(group_id, key, []))
         if not admins:
             extra = ""
             if purpose == "join_request":

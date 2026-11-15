@@ -268,7 +268,6 @@ class GroupAdminPlugin(Star):
     _dup_face_seq = _runtime_prop("_dup_face_seq")
     _dup_face_last_mid = _runtime_prop("_dup_face_last_mid")
     _dup_face_mid_cache = _runtime_prop("_dup_face_mid_cache")
-    _join_request_seen = _runtime_prop("_join_request_seen")
     _banned_file_md5_cache = _runtime_prop("_banned_file_md5_cache")
 
     # ===================== 通用 IO（阶段1：委托 cop 存储层） =====================
@@ -1779,103 +1778,7 @@ class GroupAdminPlugin(Star):
         text = f"待处理加群申请（{len(applies)} 条）：\n\n" + "\n\n".join(applies)
         yield event.plain_result(text)
 
-    # #288: /加群申请通路检查 — 诊断加群申请事件通路与被过滤申请（群管/群主）
-    @filter.command("加群申请通路检查", "诊断本群加群申请事件通路与被过滤申请")
-    async def join_request_path_check_cmd(self, event: AstrMessageEvent):
-        raw = self._mp._get_raw_message(event)
-        if not raw or not raw.get("group_id"):
-            yield event.plain_result("此指令只能在群聊中使用")
-            return
-        sender_id = str(raw.get("user_id"))
-        if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
-            return
-        group_id = str(raw.get("group_id"))
-        lines = [f"【加群申请通路检查（群 {group_id}）】"]
-
-        # 1) 请求事件是否到达过插件（#288：内存态记录，重启后归零）
-        last_ts = self._join_request_seen.get(group_id)
-        if last_ts:
-            lines.append(
-                "1. 插件最近收到本群加群请求事件："
-                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_ts))}（重启后归零）")
-        else:
-            lines.append(
-                "1. 插件进程内从未收到本群加群请求事件——若刚有人申请却显示这条，"
-                "说明申请在协议端/平台层就没有投递到插件（典型原因：申请被 QQ 放进了"
-                "「过滤申请」，或 bot 不是群管理员）")
-
-        # 2) 逐个探测协议端申请查询接口。PR #289 审查（misleading-diagnostic-output）：
-        #    get_group_system_msg 返回的是群系统消息，其元素未必是加群申请，不能
-        #    统称"申请记录"——只有明确带 user_id 且带 flag/sub_type 的条目才按
-        #    申请展示，其余归为"非申请条目"，避免空 QQ / sub_type=? 的误导输出。
-        candidates = (
-            ("get_group_system_msg", "标准群系统消息/申请接口"),
-            ("get_group_filtered_requests", "被过滤申请"),
-            ("get_group_ignore_add_request", "被忽略申请"),
-        )
-        probed_ok = False
-        lines.append("2. 协议端申请查询接口逐个探测：")
-        for action, label in candidates:
-            resp = await self._api._call_onebot_raw(event, action, group_id=group_id)
-            if not (isinstance(resp, dict) and self._api._action_result_success(resp)):
-                lines.append(f"   - {action}（{label}）：不支持或调用失败")
-                continue
-            probed_ok = True
-            data = resp.get("data") if isinstance(resp.get("data"), (dict, list)) else resp
-            # 按接口类型分别解析：get_group_system_msg 只认 join_requests 字段；
-            # 被过滤/被忽略申请接口整个列表都是请求列表。申请判定还要求带
-            # flag/sub_type/request_type/comment 等请求专属字段
-            # （PR #289 审查：misleading-diagnostic-output）。
-            requests, others = self._api.collect_join_requests(
-                data, group_id, system_msg=(action == "get_group_system_msg"))
-            summary = f"   - {action}（{label}）：申请记录 {len(requests)} 条"
-            if others:
-                summary += f"，非申请条目 {others} 条（系统消息等，不展示）"
-            lines.append(summary)
-            for a in requests[:20]:
-                uid = str(a.get("user_id") or a.get("request_uin")
-                          or a.get("requester_uin") or "").strip() or "未知"
-                sub = str(a.get("sub_type") or a.get("request_type") or "?")
-                checked = bool(a.get("checked"))
-                lines.append(
-                    f"     · QQ {uid} | sub_type={sub} | 已处理={checked} | 来源 {action}")
-        if not probed_ok:
-            lines.append(
-                "   （所有候选接口均不可用，无法从协议端侧核对申请状态）")
-
-        # 3) 本群加群通知的生效配置：多群环境下「这个群没通知、别的群有」时，
-        #    先看这三项就能定位是审核开关、群内提醒还是通知 QQ 列表的问题
-        notify_in_group = bool(
-            self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
-        audit_enabled = bool(
-            self._store.get_group_setting(group_id, "join_audit_enabled", True))
-        notify_admins = self._store.get_group_setting(group_id, "join_notify_admins", []) or []
-        lines.append("3. 本群加群通知生效配置：")
-        lines.append(
-            f"   - 自动审核 join_audit_enabled：{'开' if audit_enabled else '关'}"
-            f"（关闭后只是不再自动同意/拒绝，通知与人工审核照常）")
-        lines.append(
-            f"   - 群内提醒 join_request_notify_in_group：{'开' if notify_in_group else '关'}"
-            f"（/开关加群申请提醒 on|off）")
-        lines.append(
-            f"   - 通知管理员QQ join_notify_admins：{len(notify_admins)} 人"
-            + ("（空 → 不会私聊任何人）" if not notify_admins else ""))
-        if not notify_in_group and not notify_admins:
-            lines.append(
-                "   ⚠ 两个通知渠道都没开：本群加群申请不会出现在任何地方——"
-                "先 /开关加群申请提醒 on，或 /添加加群通知QQ <QQ号>")
-
-        # 4) 结论与建议
-        lines.append(
-            "4. 说明：QQ 把风险账号的加群申请放进「过滤申请」时，该申请【不会】以标准 "
-            "request.group 事件投递给 bot，插件无法主动获取——这是平台侧行为，插件侧"
-            "无法根治。建议：①管理员在 QQ 客户端群管理的「过滤申请」里人工处理；"
-            "②让申请人解除账号风险状态后重新申请；③向所用协议端反馈，请求提供"
-            "查询被过滤申请的接口，插件会在接口可用后自动接入。")
-        yield event.plain_result("\n".join(lines))
-
-    # #151: /群信息 — 查看本群资料（任何成员可用）
+    # #151: /群信息    # #151: /群信息 — 查看本群资料（任何成员可用）
     @filter.command("群信息", "查看本群资料（名称/号/标签/人数）")
     async def group_info_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)

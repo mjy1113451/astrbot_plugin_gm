@@ -70,6 +70,7 @@ import cop.join_review as join_review_mod  # noqa: E402
 import cop.onebot_api as onebot_api_mod  # noqa: E402
 from cop.join_review import JoinReviewService  # noqa: E402
 from cop.onebot_api import OneBotApi  # noqa: E402
+from cop.text_utils import normalize_qq_list  # noqa: E402
 
 
 class _Store:
@@ -324,6 +325,20 @@ class AuditOffRequestCostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(api.group_texts), 1)
 
 
+class NormalizeQqListTests(unittest.TestCase):
+    """配置里的 QQ 名单必须先 strip 再丢空（#292 审查：inconsistent-recipient-normalization）。"""
+
+    def test_strips_blank_and_drops_none(self):
+        self.assertEqual(
+            normalize_qq_list([" 111 ", "", None, "222", "   "]),
+            ["111", "222"],
+        )
+
+    def test_none_input_is_empty(self):
+        self.assertEqual(normalize_qq_list(None), [])
+        self.assertEqual(normalize_qq_list([]), [])
+
+
 class RequestLogConfigTests(unittest.IsolatedAsyncioTestCase):
     """每次收到加群请求都要把本群生效通知配置打进日志（不用跑检查命令）。"""
 
@@ -344,6 +359,20 @@ class RequestLogConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("群内提醒=开", lines[0])
         self.assertIn("通知QQ=2人", lines[0])
         self.assertNotIn("两个通知渠道都关着", lines[0])
+
+    async def test_config_log_ignores_blank_and_none_recipients(self):
+        store = _Store({
+            "join_request_notify_in_group": True,
+            "join_notify_admins": [" 111 ", "", None],
+        })
+        recorder = _RecordingLogger()
+        with mock.patch.object(join_review_mod, "logger", recorder):
+            await _drain(_make_service(store, _Api())._handle_group_join_request(
+                _Event(), _add_raw()))
+
+        lines = [msg for level, msg in recorder.records if "通知配置" in msg]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("通知QQ=1人", lines[0])
 
     async def test_request_log_flags_both_channels_off(self):
         store = _Store({
@@ -399,6 +428,16 @@ class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
         warnings = [msg for level, msg in recorder.records if level == "warning"]
         self.assertEqual(len(warnings), 1)
         self.assertNotIn("两个渠道都没开", warnings[0])
+
+    async def test_recipients_are_stripped_and_none_dropped(self):
+        sent = []
+        api = self._api({"join_notify_admins": [" 111 ", "", None, "222"]}, sent)
+        recorder = _RecordingLogger()
+        with mock.patch.object(onebot_api_mod, "logger", recorder):
+            await api._notify_admins("通知正文", group_id="100")
+
+        self.assertEqual(sent, [("111", "通知正文"), ("222", "通知正文")])
+        self.assertEqual(recorder.records, [])
 
     async def test_report_purpose_uses_report_notify_admins(self):
         sent = []
