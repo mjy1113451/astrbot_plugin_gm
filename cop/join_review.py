@@ -129,12 +129,27 @@ class JoinReviewService:
         except Exception:
             pass
 
+        # 多群排障：把本群生效的通知配置随请求一起落日志，不用再在群里执行
+        # /加群申请通路检查——只看这两行 INFO 就能判断「为什么这个群没有通知」。
+        audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
+        notify_in_group = bool(
+            self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
+        notify_admins = [
+            str(x) for x in
+            (self._store.get_group_setting(group_id, "join_notify_admins", []) or [])
+            if str(x).strip()
+        ]
+        logger.info(
+            f"[加群审核] 群 {group_id} 通知配置：自动审核={'开' if audit_enabled else '关'}，"
+            f"群内提醒={'开' if notify_in_group else '关'}，通知QQ={len(notify_admins)}人"
+            + ("（两个通知渠道都关着：本群加群申请不会有任何通知提示）"
+               if not notify_in_group and not notify_admins else ""))
+
         # #155：审核总开关只关「自动处置」，不关申请入口。
         # 关闭后仍要发通知、登记待处理记录，管理员才能引用回复人工审核
         # （README 与配置提示的口径都是「关闭后仅保留管理员手动审核」）。
         # 旧实现直接 return：群内提醒、管理员私聊、待处理记录全部静默消失，
         # 连黑名单自动拒绝也一并失效——表现就是「别的群有申请通知，这个群没有」。
-        audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
         if not audit_enabled:
             logger.info(
                 f"[加群审核] 群 {group_id} 自动审核已关闭，本次只发通知供人工审核"
@@ -353,7 +368,7 @@ class JoinReviewService:
             return
 
         # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
-        if self._store.get_group_setting(group_id, "join_request_notify_in_group", False):
+        if notify_in_group:
             # #284：申请人的昵称/等级查询失败只影响展示，不能让整个通知流程挂掉——
             # 旧实现若此处抛出未捕获异常，该群的「新人加群」通知就静默消失。
             # #283：被邀请人未知时没有申请人可查，不能拿邀请人 A 的身份充数

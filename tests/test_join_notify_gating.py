@@ -66,6 +66,7 @@ def _install_astrbot_stubs():
 
 _install_astrbot_stubs()
 
+import cop.join_review as join_review_mod  # noqa: E402
 import cop.onebot_api as onebot_api_mod  # noqa: E402
 from cop.join_review import JoinReviewService  # noqa: E402
 from cop.onebot_api import OneBotApi  # noqa: E402
@@ -271,6 +272,44 @@ class _RecordingLogger:
 
     def debug(self, message, *args, **kwargs):
         self._add("debug", message)
+
+
+class RequestLogConfigTests(unittest.IsolatedAsyncioTestCase):
+    """每次收到加群请求都要把本群生效通知配置打进日志（不用跑检查命令）。"""
+
+    async def test_request_log_reports_effective_config(self):
+        store = _Store({
+            "join_audit_enabled": False,
+            "join_request_notify_in_group": True,
+            "join_notify_admins": ["111", "222"],
+        })
+        recorder = _RecordingLogger()
+        with mock.patch.object(join_review_mod, "logger", recorder):
+            await _drain(_make_service(store, _Api())._handle_group_join_request(
+                _Event(), _add_raw()))
+
+        lines = [msg for level, msg in recorder.records if "通知配置" in msg]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("自动审核=关", lines[0])
+        self.assertIn("群内提醒=开", lines[0])
+        self.assertIn("通知QQ=2人", lines[0])
+        self.assertNotIn("两个通知渠道都关着", lines[0])
+
+    async def test_request_log_flags_both_channels_off(self):
+        store = _Store({
+            "join_request_notify_in_group": False,
+            "join_notify_admins": [],
+        })
+        recorder = _RecordingLogger()
+        with mock.patch.object(join_review_mod, "logger", recorder):
+            await _drain(_make_service(store, _Api())._handle_group_join_request(
+                _Event(), _add_raw()))
+
+        lines = [msg for level, msg in recorder.records if "通知配置" in msg]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("群内提醒=关", lines[0])
+        self.assertIn("通知QQ=0人", lines[0])
+        self.assertIn("两个通知渠道都关着", lines[0])
 
 
 class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
