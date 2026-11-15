@@ -1270,6 +1270,28 @@ class OneBotApi:
         return ""
 
     async def _notify_admins(self, text: str, group_id: str = ""):
-        """向 join_notify_admins 配置的管理员发送私聊通知。"""
-        for admin_id in self._store.get_group_setting(group_id, "join_notify_admins", []) or []:
-            await self._send_private_msg(str(admin_id), text)
+        """向 join_notify_admins 配置的管理员发送私聊通知。
+
+        多群排查（silent-notification-drop）：收件人为空时旧实现直接
+        循环零次、什么也不做，多群环境下表现为「这个群的加群申请毫无通知」
+        却没有任何日志线索。这里补一条带群号的告警，并说明另一条通知渠道
+        （群内提醒）是否也关着，便于一眼定位。
+        """
+        admins = [
+            str(x) for x in
+            (self._store.get_group_setting(group_id, "join_notify_admins", []) or [])
+            if str(x).strip()
+        ]
+        if not admins:
+            in_group = bool(
+                self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
+            logger.warning(
+                f"[加群通知] 群 {group_id or '未知'} 没有配置加群通知管理员"
+                f"（join_notify_admins 为空），本次私聊通知未发送；"
+                f"本群群内提醒 join_request_notify_in_group="
+                f"{'开' if in_group else '关'}"
+                + ("——两个渠道都没开，该群加群申请不会有任何通知提示"
+                   if not in_group else ""))
+            return
+        for admin_id in admins:
+            await self._send_private_msg(admin_id, text)

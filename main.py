@@ -101,7 +101,7 @@ def _runtime_prop(name):
     "group_admin",
     "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.8.1",
+    "2.8.2",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
@@ -1817,12 +1817,12 @@ class GroupAdminPlugin(Star):
         probed_ok = False
         lines.append("2. 协议端申请查询接口逐个探测：")
         for action, label in candidates:
-            raw = await self._api._call_onebot_raw(event, action, group_id=group_id)
-            if not (isinstance(raw, dict) and self._api._action_result_success(raw)):
+            resp = await self._api._call_onebot_raw(event, action, group_id=group_id)
+            if not (isinstance(resp, dict) and self._api._action_result_success(resp)):
                 lines.append(f"   - {action}（{label}）：不支持或调用失败")
                 continue
             probed_ok = True
-            data = raw.get("data") if isinstance(raw.get("data"), (dict, list)) else raw
+            data = resp.get("data") if isinstance(resp.get("data"), (dict, list)) else resp
             # 按接口类型分别解析：get_group_system_msg 只认 join_requests 字段；
             # 被过滤/被忽略申请接口整个列表都是请求列表。申请判定还要求带
             # flag/sub_type/request_type/comment 等请求专属字段
@@ -1844,9 +1844,31 @@ class GroupAdminPlugin(Star):
             lines.append(
                 "   （所有候选接口均不可用，无法从协议端侧核对申请状态）")
 
-        # 3) 结论与建议
+        # 3) 本群加群通知的生效配置：多群环境下「这个群没通知、别的群有」时，
+        #    先看这三项就能定位是审核开关、群内提醒还是通知 QQ 列表的问题
+        notify_in_group = bool(
+            self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
+        audit_enabled = bool(
+            self._store.get_group_setting(group_id, "join_audit_enabled", True))
+        notify_admins = self._store.get_group_setting(group_id, "join_notify_admins", []) or []
+        lines.append("3. 本群加群通知生效配置：")
         lines.append(
-            "3. 说明：QQ 把风险账号的加群申请放进「过滤申请」时，该申请【不会】以标准 "
+            f"   - 自动审核 join_audit_enabled：{'开' if audit_enabled else '关'}"
+            f"（关闭后只是不再自动同意/拒绝，通知与人工审核照常）")
+        lines.append(
+            f"   - 群内提醒 join_request_notify_in_group：{'开' if notify_in_group else '关'}"
+            f"（/开关加群申请提醒 on|off）")
+        lines.append(
+            f"   - 通知管理员QQ join_notify_admins：{len(notify_admins)} 人"
+            + ("（空 → 不会私聊任何人）" if not notify_admins else ""))
+        if not notify_in_group and not notify_admins:
+            lines.append(
+                "   ⚠ 两个通知渠道都没开：本群加群申请不会出现在任何地方——"
+                "先 /开关加群申请提醒 on，或 /添加加群通知QQ <QQ号>")
+
+        # 4) 结论与建议
+        lines.append(
+            "4. 说明：QQ 把风险账号的加群申请放进「过滤申请」时，该申请【不会】以标准 "
             "request.group 事件投递给 bot，插件无法主动获取——这是平台侧行为，插件侧"
             "无法根治。建议：①管理员在 QQ 客户端群管理的「过滤申请」里人工处理；"
             "②让申请人解除账号风险状态后重新申请；③向所用协议端反馈，请求提供"

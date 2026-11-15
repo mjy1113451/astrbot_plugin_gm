@@ -129,12 +129,16 @@ class JoinReviewService:
         except Exception:
             pass
 
-        # #155：审核总开关关闭后，全部自动审核逻辑都跳过。
-        # PR #277 审查反馈：早退必须先于 inviter 解析 / _get_self_id /
-        # _is_group_member 等调用，关闭审核时不产生任何额外 OneBot 请求开销。
+        # #155：审核总开关只关「自动处置」，不关申请入口。
+        # 关闭后仍要发通知、登记待处理记录，管理员才能引用回复人工审核
+        # （README 与配置提示的口径都是「关闭后仅保留管理员手动审核」）。
+        # 旧实现直接 return：群内提醒、管理员私聊、待处理记录全部静默消失，
+        # 连黑名单自动拒绝也一并失效——表现就是「别的群有申请通知，这个群没有」。
         audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
         if not audit_enabled:
-            return
+            logger.info(
+                f"[加群审核] 群 {group_id} 自动审核已关闭，本次只发通知供人工审核"
+                f"（黑名单仍然直接拒绝）")
 
         # #270：解析邀请场景下的真实申请人（被邀请人）
         # #283：协议端（如 NapCat）对「A 邀请 B 入群」投递的 invite 事件只带
@@ -222,7 +226,7 @@ class JoinReviewService:
         # 直接同意并通知管理员；黑名单成员已在上方被拦截。
         # 闸门：仅在本群加群审核启用范围内（enabled）才放行——本群未启用
         # 违规检测/审核范围（enabled=False）时不自动通过，与 #192 语义一致。
-        if third_party_invite and enabled \
+        if third_party_invite and audit_enabled and enabled \
                 and self._store.get_group_setting(group_id, "invite_auto_approve", False):
             handled = await self._api._handle_group_request(
                 event, flag, True, "第三方邀请自动通过", sub_type=sub_type)
@@ -249,7 +253,7 @@ class JoinReviewService:
         # 避免把邀请人误当申请人拉黑，审核交由管理员手动处理
         reject_keywords = self._store.get_group_setting(group_id, "join_reject_keywords", [])
         hit_keyword = None
-        if applicant_id and enabled and reject_keywords:
+        if applicant_id and audit_enabled and enabled and reject_keywords:
             for kw in reject_keywords:
                 if str(kw) and str(kw) in comment:
                     hit_keyword = str(kw)
@@ -300,7 +304,8 @@ class JoinReviewService:
 
         # 命中违禁词：拒绝 + 通知管理员（#129 使用自定义拒绝理由；#159 优化提示）
         # #283：申请人为空时不自动拒绝（同上，避免误处置邀请人）
-        if applicant_id and enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
+        if applicant_id and audit_enabled and enabled and violation_keywords \
+                and any(kw in comment for kw in violation_keywords):
             detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
             handled = await self._api._handle_group_request(
                 event, flag, False, detail_reason, sub_type=sub_type)
@@ -321,7 +326,8 @@ class JoinReviewService:
 
         # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
         # #283：申请人为空时不自动同意（被邀请人未知，无法核对黑名单）
-        if applicant_id and enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
+        if applicant_id and audit_enabled and enabled and join_approve_keywords \
+                and any(kw in comment for kw in join_approve_keywords):
             handled = await self._api._handle_group_request(
                 event, flag, True, "命中关键词自动同意", sub_type=sub_type)
             yield event.plain_result(
