@@ -1606,8 +1606,8 @@ class GroupAdminPlugin(Star):
             if owner_qq:
                 await self._api._send_private_msg(str(owner_qq), report_text)
         else:
-            # 通知所有管理员 + 群主
-            await self._api._notify_admins(report_text, group_id=group_id)
+            # 通知 report_notify_admins 配置的举报通知管理员
+            await self._api._notify_admins(report_text, group_id=group_id, purpose="report")
         yield event.plain_result("已提交举报，管理员会尽快处理")
 
     # ===================== 新增命令（#131 #135 #139 #146 #150 #151）=====================

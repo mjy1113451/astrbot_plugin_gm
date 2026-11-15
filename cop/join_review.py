@@ -180,10 +180,16 @@ class JoinReviewService:
 
         # #271：审核对象已是群成员（管理员直接拉入 / 申请已被处理）→
         # 不再审批、不再发「新人加群」通知，并清理残留待处理记录。
+        # PR #292 审查（behavioral-compatibility-change）：这次复核不是自动审核
+        # 专属——它同时保证「已入群的人不会被再发一条新人加群通知」，因此只要
+        # 还有自动审核或任一通知渠道就保留；三者都没有时跳过这次协议请求，
+        # 但黑名单直接拒绝仍会执行（README：黑名单用户始终直接拒绝）。
         # 标准「bot 被邀请入群」时发起人本身就是群成员，该场景跳过复核。
         skip_member_check = (sub_type == "invite" and not third_party_invite) \
             or not applicant_id
-        if applicant_id and not skip_member_check and await self._api._is_group_member(event, group_id, applicant_id):
+        needs_member_check = applicant_id and not skip_member_check and bool(
+            audit_enabled or notify_in_group or notify_admins)
+        if needs_member_check and await self._api._is_group_member(event, group_id, applicant_id):
             logger.info(f"[加群审核] 用户 {applicant_id} 已是群 {group_id} 成员"
                         f"（疑似管理员直接拉入），跳过审核与群内通知")
             pending = self._store.runtime_map("pending_join_requests")
@@ -499,8 +505,12 @@ class JoinReviewService:
                     group_id=group_id,
                 )
             else:
-                nickname, _level = await self._safe_applicant_profile(
-                    event, applicant_id, group_id)
+                # PR #292 审查（behavioral-compatibility-change）：没有任何通知 QQ
+                # 时这条私聊消息本来发不出去，不必再查昵称/等级付额外协议开销。
+                nickname = ""
+                if notify_admins:
+                    nickname, _level = await self._safe_applicant_profile(
+                        event, applicant_id, group_id)
                 # 昵称拿不到时只显示 QQ 号，不要拼成「获取失败(777)（777）」
                 applicant_display = (
                     f"{nickname}（{applicant_id}）" if nickname else str(applicant_id)

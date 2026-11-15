@@ -109,6 +109,9 @@ class _Api:
         self.admin_texts = []
         self.group_texts = []
         self.handled = []
+        self.member_checks = []
+        self.nickname_queries = []
+        self.level_queries = []
         self.group_send_ok = True
         self.group_send_mid = "msg-1"
 
@@ -116,12 +119,14 @@ class _Api:
         return "999000111"
 
     async def _is_group_member(self, event, group_id, user_id):
+        self.member_checks.append(user_id)
         return False
 
     async def _get_user_nickname(self, event, user_id):
         return f"昵称{user_id}"
 
     async def _get_stranger_level(self, event, user_id):
+        self.level_queries.append(user_id)
         return "12"
 
     async def _send_group_text(self, event, group_id, text):
@@ -130,7 +135,11 @@ class _Api:
             return False, ""
         return True, self.group_send_mid
 
-    async def _notify_admins(self, text, group_id=None):
+    async def _notify_admins(self, text, group_id=None, purpose="join_request"):
+        key = "report_notify_admins" if purpose == "report" else "join_notify_admins"
+        store = getattr(self, "store", None)
+        if store is not None and not store.get_group_setting(group_id or "", key, []):
+            return  # 与真实实现一致：没有收件人 = 没有发出去
         self.admin_texts.append(text)
 
     async def _handle_group_request(self, event, flag, approve, reason, sub_type=None):
@@ -144,6 +153,7 @@ class _Event:
 
 
 def _make_service(store, api):
+    api.store = store
     return JoinReviewService(
         config_store=store,
         onebot_api=api,
@@ -176,6 +186,7 @@ class AuditSwitchOnlyGatesAutoActionsTests(unittest.IsolatedAsyncioTestCase):
         store = _Store({
             "join_audit_enabled": False,
             "join_request_notify_in_group": True,
+            "join_notify_admins": ["111"],
         })
         api = _Api()
         await _drain(_make_service(store, api)._handle_group_join_request(_Event(), _add_raw()))
@@ -191,6 +202,7 @@ class AuditSwitchOnlyGatesAutoActionsTests(unittest.IsolatedAsyncioTestCase):
         store = _Store({
             "join_audit_enabled": False,
             "join_request_notify_in_group": False,
+            "join_notify_admins": ["111"],
         })
         api = _Api()
         await _drain(_make_service(store, api)._handle_group_join_request(_Event(), _add_raw()))
@@ -233,6 +245,7 @@ class AuditSwitchOnlyGatesAutoActionsTests(unittest.IsolatedAsyncioTestCase):
         store = _Store({
             "join_audit_enabled": False,
             "blacklisted_users": ["777"],
+            "join_notify_admins": ["111"],
         })
         api = _Api()
         await _drain(_make_service(store, api)._handle_group_join_request(_Event(), _add_raw()))
@@ -272,6 +285,43 @@ class _RecordingLogger:
 
     def debug(self, message, *args, **kwargs):
         self._add("debug", message)
+
+
+class AuditOffRequestCostTests(unittest.IsolatedAsyncioTestCase):
+    """PR #292 审查（behavioral-compatibility-change）：关闭自动审核后的请求开销。
+
+    完全没有通知渠道时应当与旧实现一样零额外请求；只要还会发通知，成员复核
+    就保留（它同时防止对已入群成员重复发「新人加群」）。
+    """
+
+    async def test_audit_off_without_channels_makes_no_api_calls(self):
+        store = _Store({
+            "join_audit_enabled": False,
+            "join_request_notify_in_group": False,
+            "join_notify_admins": [],
+        })
+        api = _Api()
+        await _drain(_make_service(store, api)._handle_group_join_request(
+            _Event(), _add_raw()))
+
+        self.assertEqual(api.member_checks, [])
+        self.assertEqual(api.nickname_queries, [])
+        self.assertEqual(api.level_queries, [])
+        self.assertEqual(api.handled, [])
+        self.assertEqual(api.group_texts, [])
+        self.assertEqual(api.admin_texts, [])
+
+    async def test_audit_off_with_notify_still_checks_membership(self):
+        store = _Store({
+            "join_audit_enabled": False,
+            "join_request_notify_in_group": True,
+        })
+        api = _Api()
+        await _drain(_make_service(store, api)._handle_group_join_request(
+            _Event(), _add_raw()))
+
+        self.assertEqual(api.member_checks, ["777"])
+        self.assertEqual(len(api.group_texts), 1)
 
 
 class RequestLogConfigTests(unittest.IsolatedAsyncioTestCase):
@@ -349,6 +399,40 @@ class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
         warnings = [msg for level, msg in recorder.records if level == "warning"]
         self.assertEqual(len(warnings), 1)
         self.assertNotIn("两个渠道都没开", warnings[0])
+
+    async def test_report_purpose_uses_report_notify_admins(self):
+        sent = []
+        api = self._api({
+            "join_notify_admins": ["111"],
+            "report_notify_admins": ["333"],
+        }, sent)
+        recorder = _RecordingLogger()
+        with mock.patch.object(onebot_api_mod, "logger", recorder):
+            await api._notify_admins("[举报] 群 100", group_id="100", purpose="report")
+
+        self.assertEqual(sent, [("333", "[举报] 群 100")])
+        self.assertEqual(recorder.records, [])
+
+    async def test_report_purpose_empty_list_warns_with_report_wording(self):
+        sent = []
+        api = self._api({"report_notify_admins": [], "join_notify_admins": ["111"]}, sent)
+        recorder = _RecordingLogger()
+        with mock.patch.object(onebot_api_mod, "logger", recorder):
+            await api._notify_admins("[举报] 群 100", group_id="100", purpose="report")
+
+        self.assertEqual(sent, [])
+        warnings = [msg for level, msg in recorder.records if level == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("举报", warnings[0])
+        self.assertIn("report_notify_admins", warnings[0])
+        # 举报场景不应输出加群申请专属的「两个渠道都没开」诊断
+        self.assertNotIn("两个渠道都没开", warnings[0])
+
+    async def test_unknown_purpose_is_rejected(self):
+        sent = []
+        api = self._api({"join_notify_admins": ["111"]}, sent)
+        with self.assertRaises(ValueError):
+            await api._notify_admins("正文", group_id="100", purpose="mute")
 
     async def test_configured_admins_receive_private_messages(self):
         sent = []
