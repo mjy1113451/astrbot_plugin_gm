@@ -439,6 +439,23 @@ class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent, [("111", "通知正文"), ("222", "通知正文")])
         self.assertEqual(recorder.records, [])
 
+    async def test_report_purpose_falls_back_to_legacy_join_list(self):
+        # 升级兼容：只配过 join_notify_admins 的用户不能丢举报通知
+        sent = []
+        api = self._api({
+            "join_notify_admins": [" 111 "],
+            "report_notify_admins": [],
+        }, sent)
+        recorder = _RecordingLogger()
+        with mock.patch.object(onebot_api_mod, "logger", recorder):
+            await api._notify_admins("[举报] 群 100", group_id="100", purpose="report")
+
+        self.assertEqual(sent, [("111", "[举报] 群 100")])
+        warnings = [msg for level, msg in recorder.records if level == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("回退", warnings[0])
+        self.assertIn("report_notify_admins", warnings[0])
+
     async def test_report_purpose_uses_report_notify_admins(self):
         sent = []
         api = self._api({
@@ -454,7 +471,7 @@ class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_report_purpose_empty_list_warns_with_report_wording(self):
         sent = []
-        api = self._api({"report_notify_admins": [], "join_notify_admins": ["111"]}, sent)
+        api = self._api({"report_notify_admins": [], "join_notify_admins": []}, sent)
         recorder = _RecordingLogger()
         with mock.patch.object(onebot_api_mod, "logger", recorder):
             await api._notify_admins("[举报] 群 100", group_id="100", purpose="report")

@@ -1778,7 +1778,7 @@ class GroupAdminPlugin(Star):
         text = f"待处理加群申请（{len(applies)} 条）：\n\n" + "\n\n".join(applies)
         yield event.plain_result(text)
 
-    # #151: /群信息    # #151: /群信息 — 查看本群资料（任何成员可用）
+    # #151: /群信息 — 查看本群资料（任何成员可用）
     @filter.command("群信息", "查看本群资料（名称/号/标签/人数）")
     async def group_info_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)

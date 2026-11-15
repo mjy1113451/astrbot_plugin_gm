@@ -1299,6 +1299,18 @@ class OneBotApi:
         # " 111 " / "" / null 这类脏值统一在 L0 里清掉，避免把带空白的
         # 号码当收件人发出去（PR #292 审查：inconsistent-recipient-normalization）
         admins = normalize_qq_list(self._store.get_group_setting(group_id, key, []))
+        if not admins and purpose == "report":
+            # 兼容旧版：2.8.1 及以前举报通知实际读的是 join_notify_admins，
+            # 只配置过那个名单的用户升级后不能直接丢通知——回退旧名单并提示迁移
+            # （PR #292 审查：upgrade-compatibility）。
+            legacy = normalize_qq_list(
+                self._store.get_group_setting(group_id, "join_notify_admins", []))
+            if legacy:
+                logger.warning(
+                    f"[举报通知] 群 {group_id or '未知'} 未配置 report_notify_admins，"
+                    f"本次回退使用 join_notify_admins（{len(legacy)} 人）发送；"
+                    f"建议用 /添加举报通知QQ 迁移到独立的举报通知名单")
+                admins = legacy
         if not admins:
             extra = ""
             if purpose == "join_request":
