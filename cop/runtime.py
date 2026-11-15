@@ -42,10 +42,6 @@ class RuntimeState:
         # #282：每个群最近处理过的 message_id 缓存（deque(maxlen=N)），防非相邻重复投递误判
         self._dup_face_mid_cache: dict = {}
 
-        # #288：每个群最近一次收到加群请求事件的时间戳（内存态，不持久化），
-        # 供 /加群申请通路检查 判断「请求事件是否到达过插件」
-        self._join_request_seen: dict = {}
-
         # 群违规检测运行时状态（#109 PR #1）：spam_records[(group_id, user_id)] -> [timestamp, ...]
         # 仅内存，进程重启清空（与参考插件行为一致）
         self.spam_records = defaultdict(list)

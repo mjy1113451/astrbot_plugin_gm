@@ -21,7 +21,7 @@ from pathlib import Path
 from astrbot.api import logger
 
 from .constants import _RUNTIME_MAP_KEYS
-from .text_utils import _parse_qq_list
+from .text_utils import _parse_qq_list, normalize_qq_list
 
 
 class ConfigRollbackError(RuntimeError):
@@ -660,7 +660,7 @@ class ConfigStore:
     def _as_str_list(value) -> list:
         """把任意配置值规整成去空白的字符串列表。"""
         if isinstance(value, (list, tuple)):
-            return [str(x).strip() for x in value if str(x).strip()]
+            return normalize_qq_list(value)
         if isinstance(value, str):
             return [x for x in re.split(r"[,，;；\s]+", value) if x]
         return [] if value is None else [str(value).strip()]
@@ -901,7 +901,7 @@ class ConfigStore:
         """当前生效的列表值（运行时 → 模板 → 全局），返回可安全改动的新列表。"""
         current = self.get_group_setting(group_id, key, [])
         if isinstance(current, (list, tuple)):
-            return [str(x).strip() for x in current if str(x).strip()]
+            return normalize_qq_list(current)
         if isinstance(current, str):
             return self.normalize_qq_list_value(current)
         return [] if current is None else [current]
@@ -1040,14 +1040,14 @@ class ConfigStore:
         if value is None:
             return []
         if isinstance(value, (list, tuple)):
-            return [str(x).strip() for x in value if str(x).strip()]
+            return normalize_qq_list(value)
         text = str(value).strip()
         if not text:
             return []
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
+                return normalize_qq_list(parsed)
             if isinstance(parsed, (str, int)):
                 text = str(parsed)
         except (ValueError, TypeError):

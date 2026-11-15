@@ -20,6 +20,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain
 
 from .compat import MessageChain
+from .text_utils import normalize_qq_list
 
 if TYPE_CHECKING:
     from .config_store import ConfigStore
@@ -33,6 +34,15 @@ def _sanitize_log_text(text, limit: int = 80) -> str:
     """日志文本脱敏：抹除 base64 载荷并按 limit 截断。"""
     t = _B64_PAYLOAD_RE.sub("base64://<已省略>", str(text))
     return t[:limit]
+
+
+# 管理员私聊通知的用途 → (收件人配置键, 文案标签)。
+# PR #292 审查（misleading-diagnostic-output）：用途显式声明，告警文案与
+# 收件人配置键都由用途决定，避免复用该方法时输出与实际通知无关的诊断。
+_ADMIN_NOTIFY_PURPOSES = {
+    "join_request": ("join_notify_admins", "加群申请"),
+    "report": ("report_notify_admins", "举报"),
+}
 
 
 class OneBotApi:
@@ -1269,7 +1279,51 @@ class OneBotApi:
             logger.warning(f"[加群通知] 获取等级失败(user={user_id}): {e}")
         return ""
 
-    async def _notify_admins(self, text: str, group_id: str = ""):
-        """向 join_notify_admins 配置的管理员发送私聊通知。"""
-        for admin_id in self._store.get_group_setting(group_id, "join_notify_admins", []) or []:
-            await self._send_private_msg(str(admin_id), text)
+    async def _notify_admins(self, text: str, group_id: str = "", *,
+                             purpose: str = "join_request"):
+        """按用途向本群配置的管理员发送私聊通知。
+
+        purpose 决定收件人配置键与告警文案（见 _ADMIN_NOTIFY_PURPOSES）：
+        - ``join_request``：加群申请通知，读 join_notify_admins；
+        - ``report``：举报通知，读 report_notify_admins，与
+          /添加举报通知QQ 管理的列表保持一致。
+
+        用途必须显式，避免同一份「收件人为空」告警被不同业务复用时输出与
+        实际通知无关的诊断（PR #292 审查：misleading-diagnostic-output）。
+        收件人为空时不再静默返回：按用途落一条带群号的告警；加群申请场景
+        额外说明群内提醒开关状态，便于多群环境一眼定位。
+        """
+        if purpose not in _ADMIN_NOTIFY_PURPOSES:
+            raise ValueError(f"未知的管理员通知用途: {purpose}")
+        key, label = _ADMIN_NOTIFY_PURPOSES[purpose]
+        # " 111 " / "" / null 这类脏值统一在 L0 里清掉，避免把带空白的
+        # 号码当收件人发出去（PR #292 审查：inconsistent-recipient-normalization）
+        admins = normalize_qq_list(self._store.get_group_setting(group_id, key, []))
+        if not admins and purpose == "report":
+            # 兼容旧版：2.8.1 及以前举报通知实际读的是 join_notify_admins，
+            # 只配置过那个名单的用户升级后不能直接丢通知——回退旧名单并提示迁移
+            # （PR #292 审查：upgrade-compatibility）。
+            legacy = normalize_qq_list(
+                self._store.get_group_setting(group_id, "join_notify_admins", []))
+            if legacy:
+                logger.warning(
+                    f"[举报通知] 群 {group_id or '未知'} 未配置 report_notify_admins，"
+                    f"本次回退使用 join_notify_admins（{len(legacy)} 人）发送；"
+                    f"建议用 /添加举报通知QQ 迁移到独立的举报通知名单")
+                admins = legacy
+        if not admins:
+            extra = ""
+            if purpose == "join_request":
+                in_group = bool(self._store.get_group_setting(
+                    group_id, "join_request_notify_in_group", False))
+                extra = (
+                    "；本群群内提醒 join_request_notify_in_group="
+                    f"{'开' if in_group else '关'}"
+                    + ("——两个渠道都没开，该群加群申请不会有任何通知提示"
+                       if not in_group else ""))
+            logger.warning(
+                f"[{label}通知] 群 {group_id or '未知'} 没有配置{label}通知管理员"
+                f"（{key} 为空），本次私聊通知未发送{extra}")
+            return
+        for admin_id in admins:
+            await self._send_private_msg(admin_id, text)

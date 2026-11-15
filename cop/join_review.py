@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
+from .text_utils import normalize_qq_list
+
 if TYPE_CHECKING:
     from .config_store import ConfigStore
     from .message_parse import MessageParser
@@ -123,18 +125,28 @@ class JoinReviewService:
         logger.info(
             f"[加群审核] 收到加群请求 group={group_id} sub_type={sub_type} "
             f"user_id={user_id} comment={_sanitize(comment)}")
-        # #288：记录请求事件到达时间，供 /加群申请通路检查 判断通路是否正常
-        try:
-            self._runtime._join_request_seen[group_id] = int(time.time())
-        except Exception:
-            pass
-
-        # #155：审核总开关关闭后，全部自动审核逻辑都跳过。
-        # PR #277 审查反馈：早退必须先于 inviter 解析 / _get_self_id /
-        # _is_group_member 等调用，关闭审核时不产生任何额外 OneBot 请求开销。
+        # 多群排障：把本群生效的通知配置随请求一起落日志——只看这两行 INFO
+        # 就能判断「为什么这个群没有通知」，不需要额外的诊断指令。
         audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
+        notify_in_group = bool(
+            self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
+        notify_admins = normalize_qq_list(
+            self._store.get_group_setting(group_id, "join_notify_admins", []))
+        logger.info(
+            f"[加群审核] 群 {group_id} 通知配置：自动审核={'开' if audit_enabled else '关'}，"
+            f"群内提醒={'开' if notify_in_group else '关'}，通知QQ={len(notify_admins)}人"
+            + ("（两个通知渠道都关着：本群加群申请不会有任何通知提示）"
+               if not notify_in_group and not notify_admins else ""))
+
+        # #155：审核总开关只关「自动处置」，不关申请入口。
+        # 关闭后仍要发通知、登记待处理记录，管理员才能引用回复人工审核
+        # （README 与配置提示的口径都是「关闭后仅保留管理员手动审核」）。
+        # 旧实现直接 return：群内提醒、管理员私聊、待处理记录全部静默消失，
+        # 连黑名单自动拒绝也一并失效——表现就是「别的群有申请通知，这个群没有」。
         if not audit_enabled:
-            return
+            logger.info(
+                f"[加群审核] 群 {group_id} 自动审核已关闭，本次只发通知供人工审核"
+                f"（黑名单仍然直接拒绝）")
 
         # #270：解析邀请场景下的真实申请人（被邀请人）
         # #283：协议端（如 NapCat）对「A 邀请 B 入群」投递的 invite 事件只带
@@ -161,10 +173,16 @@ class JoinReviewService:
 
         # #271：审核对象已是群成员（管理员直接拉入 / 申请已被处理）→
         # 不再审批、不再发「新人加群」通知，并清理残留待处理记录。
+        # PR #292 审查（behavioral-compatibility-change）：这次复核不是自动审核
+        # 专属——它同时保证「已入群的人不会被再发一条新人加群通知」，因此只要
+        # 还有自动审核或任一通知渠道就保留；三者都没有时跳过这次协议请求，
+        # 但黑名单直接拒绝仍会执行（README：黑名单用户始终直接拒绝）。
         # 标准「bot 被邀请入群」时发起人本身就是群成员，该场景跳过复核。
         skip_member_check = (sub_type == "invite" and not third_party_invite) \
             or not applicant_id
-        if applicant_id and not skip_member_check and await self._api._is_group_member(event, group_id, applicant_id):
+        needs_member_check = applicant_id and not skip_member_check and bool(
+            audit_enabled or notify_in_group or notify_admins)
+        if needs_member_check and await self._api._is_group_member(event, group_id, applicant_id):
             logger.info(f"[加群审核] 用户 {applicant_id} 已是群 {group_id} 成员"
                         f"（疑似管理员直接拉入），跳过审核与群内通知")
             pending = self._store.runtime_map("pending_join_requests")
@@ -222,7 +240,7 @@ class JoinReviewService:
         # 直接同意并通知管理员；黑名单成员已在上方被拦截。
         # 闸门：仅在本群加群审核启用范围内（enabled）才放行——本群未启用
         # 违规检测/审核范围（enabled=False）时不自动通过，与 #192 语义一致。
-        if third_party_invite and enabled \
+        if third_party_invite and audit_enabled and enabled \
                 and self._store.get_group_setting(group_id, "invite_auto_approve", False):
             handled = await self._api._handle_group_request(
                 event, flag, True, "第三方邀请自动通过", sub_type=sub_type)
@@ -249,7 +267,7 @@ class JoinReviewService:
         # 避免把邀请人误当申请人拉黑，审核交由管理员手动处理
         reject_keywords = self._store.get_group_setting(group_id, "join_reject_keywords", [])
         hit_keyword = None
-        if applicant_id and enabled and reject_keywords:
+        if applicant_id and audit_enabled and enabled and reject_keywords:
             for kw in reject_keywords:
                 if str(kw) and str(kw) in comment:
                     hit_keyword = str(kw)
@@ -300,7 +318,8 @@ class JoinReviewService:
 
         # 命中违禁词：拒绝 + 通知管理员（#129 使用自定义拒绝理由；#159 优化提示）
         # #283：申请人为空时不自动拒绝（同上，避免误处置邀请人）
-        if applicant_id and enabled and violation_keywords and any(kw in comment for kw in violation_keywords):
+        if applicant_id and audit_enabled and enabled and violation_keywords \
+                and any(kw in comment for kw in violation_keywords):
             detail_reason = f"您的加群申请有词触碰到本群违禁词，自动拒绝（{reject_reason}）"
             handled = await self._api._handle_group_request(
                 event, flag, False, detail_reason, sub_type=sub_type)
@@ -321,7 +340,8 @@ class JoinReviewService:
 
         # 命中关键词：同意 + 通知管理员 + 群内通知（#186）
         # #283：申请人为空时不自动同意（被邀请人未知，无法核对黑名单）
-        if applicant_id and enabled and join_approve_keywords and any(kw in comment for kw in join_approve_keywords):
+        if applicant_id and audit_enabled and enabled and join_approve_keywords \
+                and any(kw in comment for kw in join_approve_keywords):
             handled = await self._api._handle_group_request(
                 event, flag, True, "命中关键词自动同意", sub_type=sub_type)
             yield event.plain_result(
@@ -347,7 +367,7 @@ class JoinReviewService:
             return
 
         # 群内提醒（#57）：发送申请消息到对应群聊，等待管理员引用回复同意/拒绝
-        if self._store.get_group_setting(group_id, "join_request_notify_in_group", False):
+        if notify_in_group:
             # #284：申请人的昵称/等级查询失败只影响展示，不能让整个通知流程挂掉——
             # 旧实现若此处抛出未捕获异常，该群的「新人加群」通知就静默消失。
             # #283：被邀请人未知时没有申请人可查，不能拿邀请人 A 的身份充数
@@ -478,8 +498,12 @@ class JoinReviewService:
                     group_id=group_id,
                 )
             else:
-                nickname, _level = await self._safe_applicant_profile(
-                    event, applicant_id, group_id)
+                # PR #292 审查（behavioral-compatibility-change）：没有任何通知 QQ
+                # 时这条私聊消息本来发不出去，不必再查昵称/等级付额外协议开销。
+                nickname = ""
+                if notify_admins:
+                    nickname, _level = await self._safe_applicant_profile(
+                        event, applicant_id, group_id)
                 # 昵称拿不到时只显示 QQ 号，不要拼成「获取失败(777)（777）」
                 applicant_display = (
                     f"{nickname}（{applicant_id}）" if nickname else str(applicant_id)

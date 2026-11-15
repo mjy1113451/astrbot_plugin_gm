@@ -71,7 +71,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "推荐按群覆盖：在群内执行 /设置群配置 report_notify_admins [QQ列表]。",
+        "hint": "推荐按群覆盖：在群内执行 /设置群配置 report_notify_admins [QQ列表]。留空时举报通知回退使用 join_notify_admins（兼容 2.8.1 及以前把举报通知发到加群通知名单的实现），迁移后只维护本名单即可。",
         "default": []
     },
     "rank_top_n": {
@@ -122,7 +122,7 @@
     "join_audit_enabled": {
         "description": "加群申请自动审核总开关",
         "type": "bool",
-        "hint": "关闭后所有自动审核（违禁词拒绝/关键词同意）都不生效。管理员手动审核（引用回复同意/拒绝）不受影响。推荐按群覆盖：/设置群配置 join_audit_enabled true/false。",
+        "hint": "关闭后所有自动审核（第三方邀请自动通过/自动拒绝关键词/违禁词拒绝/关键词同意）都不生效，但加群申请通知（群内提醒/管理员私聊）与待处理记录照常产生，管理员手动审核（引用回复同意/拒绝）不受影响，黑名单用户仍直接拒绝。推荐按群覆盖：/设置群配置 join_audit_enabled true/false。",
         "default": true
     },
     "invite_auto_approve": {
