@@ -1,7 +1,7 @@
 """L2 权限判定层：插件管理员 / 群主 / 群管理员 / 专项「设管理」名单等权限判定。
 
 迁出自 main.py 的权限相关方法。依赖：
-- L1 ConfigStore（构造注入）：读 group_overrides / 全局 config / _normalize_qq_list_value
+- L1 ConfigStore（构造注入）：读取本群生效的专项权限名单
 - 同层 MessageParser（构造注入）：仅 _moderation_require_admin(_msg) 需要读 raw
 
 依赖规则：不 import 同层模块，MessageParser 通过构造注入（TYPE_CHECKING + 字符串注解）。
@@ -120,25 +120,8 @@ class PermissionService:
     # ---------- 「设管理」专项名单 ----------
 
     def _effective_group_admin_admins(self, group_id: str) -> list:
-        """本群生效的「设管理」专项名单（#219 owner 要求：可像 group_overrides 一样按群覆盖）。
-
-        优先级：
-        1. group_overrides[群号]["group_admin_admins"]（群内 /添加管理管理 等指令维护）
-        2. group_admin_admins_by_group[群号]（WebUI 按群名单）
-        命中即替换（不与上层合并），与插件既有「按群覆盖 > 按群 WebUI 名单」语义一致。
-        """
-        # 注意：group_overrides 已迁移到 runtime.json，#219 上游实现仍读框架配置会永远取不到
-        # 群内指令写入的名单，故这里统一改走运行时映射（与 set_group_setting 写入侧一致）。
-        ov = self._store.runtime_map("group_overrides").get(str(group_id), {}).get("group_admin_admins")
-        ov_list = self._store.normalize_qq_list_value(ov)
-        if ov_list:
-            return ov_list
-        by_group = self._store.config.get("group_admin_admins_by_group", {}) or {}
-        if isinstance(by_group, dict):
-            g_list = self._store.normalize_qq_list_value(by_group.get(str(group_id)))
-            if g_list:
-                return g_list
-        return []
+        """本群生效的「设管理」专项名单：群内指令优先于 WebUI 按群名单。"""
+        return self._store.get_group_override_list(group_id, "group_admin_admins")
 
     def has_group_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
         """设管理/取消管理权限：设管理专项名单或插件管理员（群管理员/群主）。

@@ -44,6 +44,7 @@ from unittest.mock import patch  # noqa: E402
 from collections import UserDict  # noqa: E402
 
 from cop.config_store import ConfigRollbackError, ConfigStore  # noqa: E402
+from cop.permissions import PermissionService  # noqa: E402
 
 
 class _Config(dict):
@@ -195,21 +196,34 @@ def _template_entry(group_id, **fields):
     return entry
 
 
+def make_store(test, config, json_store=None):
+    temp_dir = tempfile.TemporaryDirectory()
+    test.addCleanup(temp_dir.cleanup)
+    base = Path(temp_dir.name)
+    return ConfigStore(
+        config=config,
+        runtime_path=base / "runtime.json",
+        data_dir=base,
+        config_path=base / "config.json",
+        stats_path=base / "stats.json",
+        reports_path=base / "reports.json",
+        lock=threading.RLock(),
+        json_store=json_store or _JsonStore(),
+    )
+
+
 class GroupOverrideTests(unittest.TestCase):
-    def make_store(self, config, json_store=None):
-        temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(temp_dir.cleanup)
-        base = Path(temp_dir.name)
-        return ConfigStore(
-            config=config,
-            runtime_path=base / "runtime.json",
-            data_dir=base,
-            config_path=base / "config.json",
-            stats_path=base / "stats.json",
-            reports_path=base / "reports.json",
-            lock=threading.RLock(),
-            json_store=json_store or _JsonStore(),
-        )
+    make_store = make_store
+
+    def test_global_write_failure_before_framework_save_keeps_memory_unchanged(self):
+        json_store = _JsonStore()
+        config = _FailingConfig(rank_top_n=10)
+        store = self.make_store(config, json_store=json_store)
+        json_store.fail_saves = True
+        with self.assertRaises(OSError):
+            store.set_global_setting("rank_top_n", 20)
+        self.assertEqual(config["rank_top_n"], 10)
+        self.assertEqual(config.saves, 0)
 
     def test_first_add_keeps_global_list_as_baseline(self):
         store = self.make_store(_Config(blacklisted_users=["global1", "global2"]))
@@ -339,7 +353,9 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertNotIn("100", store.runtime_map("group_overrides"))
 
     def test_admin_add_without_change_does_not_materialize(self):
-        store = self.make_store(_Config(group_admin_admins=["1"]))
+        store = self.make_store(_Config(group_overrides_templates=[
+            _template_entry("100", group_admin_admins=["1"]),
+        ]))
         self.assertEqual(
             store.add_group_override_admins("100", "group_admin_admins", ["1"]), []
         )
@@ -348,6 +364,70 @@ class GroupOverrideTests(unittest.TestCase):
             store.add_group_override_admins("100", "group_admin_admins", ["2"]), ["2"]
         )
         self.assertEqual(store.get_group_setting("100", "group_admin_admins"), ["1", "2"])
+
+    def test_migrate_legacy_group_admins_without_overwriting_existing_template(self):
+        config = _FailingConfig(
+            group_admin_admins_by_group={
+                "100": [10001, " 10002 ", "", None],
+                "200": "10003,10004",
+                "300": '["10005"]',
+                "400": ["10006"],
+                "500": ["10007"],
+            },
+            group_overrides_templates=[
+                _template_entry("100", mute_notice=False, group_admin_admins=[]),
+                _template_entry("400", group_admin_admins=["10008"]),
+                _template_entry("500", group_admin_admins=[], explicit_override_fields="group_admin_admins"),
+            ],
+        )
+        store = self.make_store(config)
+        self.assertEqual(config.saves, 1)
+        self.assertEqual(config["group_admin_admins_by_group"], {})
+        self.assertEqual(len(config["group_overrides_templates"]), 6)
+        self.assertTrue(all(row["__template_key"] == "group_config" for row in config["group_overrides_templates"]))
+        self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001", "10002"])
+        self.assertFalse(store.get_group_setting("100", "mute_notice"))
+        self.assertCountEqual(store.get_group_override_list("200", "group_admin_admins"), ["10003", "10004"])
+        self.assertEqual(store.get_group_override_list("300", "group_admin_admins"), ["10005"])
+        self.assertEqual(store.get_group_override_list("400", "group_admin_admins"), ["10008"])
+        self.assertEqual(store.get_group_override_list("500", "group_admin_admins"), [])
+        self.make_store(config)
+        self.assertEqual(config.saves, 1)
+        self.assertEqual(len(config["group_overrides_templates"]), 6)
+
+    def test_admin_migration_save_failure_preserves_legacy_and_existing_rows(self):
+        legacy = {"100": ["10001"]}
+        entries = [_template_entry("100", mute_notice=False)]
+        for fail_runtime_write in (False, True):
+            with self.subTest(fail_runtime_write=fail_runtime_write):
+                config = _FailingConfig(group_admin_admins_by_group=legacy, group_overrides_templates=entries)
+                config.fail = not fail_runtime_write
+                json_store = _JsonStore()
+                json_store.fail_saves = fail_runtime_write
+                store = self.make_store(config, json_store=json_store)
+                self.assertEqual(config["group_admin_admins_by_group"], legacy)
+                self.assertEqual(config["group_overrides_templates"], entries)
+                self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001"])
+                self.assertEqual(store.get_group_override_list("200", "group_admin_admins"), [])
+
+    def test_special_admin_permission_and_list_edits_stay_in_their_group(self):
+        store = self.make_store(_Config(group_overrides_templates=[
+            _template_entry("100", group_admin_admins=["10001"]),
+            _template_entry("200", join_notify_admins=["10001"], group_admin_admins=["10002"]),
+        ]))
+        perms = PermissionService(config_store=store, message_parse=None, onebot_api=None)
+        raw = {"sender": {"role": "member"}}
+        store.runtime_map("group_overrides")["100"] = {"group_admin_admins": []}
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
+        self.assertFalse(perms.has_group_admin_rights("10001", "200", raw))
+        self.assertEqual(store.add_group_override_admins("100", "group_admin_admins", ["10003"]), ["10003"])
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
+        self.assertEqual(store.remove_group_override_admins("100", "group_admin_admins", ["10001", "10003"]),
+                         ["10001", "10003"])
+        self.assertFalse(perms.has_group_admin_rights("10001", "100", raw))
+        self.assertTrue(perms.has_group_admin_rights("10002", "200", raw))
+        self.assertTrue(store.drop_group_override("100", "group_admin_admins"))
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
 
     def test_runtime_override_wins_over_template(self):
         store = self.make_store(
@@ -982,26 +1062,74 @@ class GroupOverrideTests(unittest.TestCase):
         entry = store._template_group_entry("100")
         self.assertEqual(entry["ad_keywords"], ["third"])
 
-    def test_template_defaults_match_global_defaults(self):
-        # 模板字段默认值必须与全局同名字段一致，否则"填了非默认值"会被误判成
-        # "没覆盖"，或反之（PR #289 审查：template-default-mismatch）。
-        schema_path = Path(__file__).resolve().parents[1] / "_conf_schema.json"
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        items = schema["group_overrides_templates"]["templates"]["group_config"]["items"]
-        meta = {"group_id", "explicit_override_fields"}
-        checked = 0
-        for key, spec in items.items():
-            if key in meta:
-                continue
+    def test_template_schema_covers_group_settings_only(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        template_list = schema["group_overrides_templates"]
+        self.assertEqual(template_list["type"], "template_list")
+        self.assertEqual(template_list["default"], [])
+        self.assertTrue(schema["group_admin_admins_by_group"]["invisible"])
+        items = template_list["templates"]["group_config"]["items"]
+        self.assertEqual(items["group_id"]["type"], "string")
+        dedicated_defaults = {
+            "enabled_groups": "inherit", "auto_recall_enabled_groups": "inherit",
+            "group_admin_admins": [], "mute_kick_threshold": 0, "violation_keywords": [],
+            "banned_images": [], "profanity_keywords": [], "welcome_enabled": False,
+            "welcome_message": "欢迎 {at} 加入本群！",
+        }
+        global_only = {
+            "group_admin_admins_by_group", "api_type", "api_endpoint", "api_key",
+            "model_name", "detection_prompt", "threshold", "check_porn", "check_sexy",
+            "political_keywords", "political_ban_duration", "banned_image_files",
+            "voice_asr_endpoint", "voice_asr_api_key", "voice_asr_model", "voice_check_timeout",
+            "group_overrides_templates",
+        }
+        shared = schema.keys() - global_only - dedicated_defaults.keys()
+        self.assertEqual(set(items), shared | dedicated_defaults.keys() | {"group_id", "explicit_override_fields"})
+        for key in shared:
             with self.subTest(field=key):
-                self.assertIn(key, schema, "模板字段在全局 schema 里不存在")
-                self.assertEqual(
-                    spec.get("default"),
-                    schema[key].get("default"),
-                    "模板字段默认值与全局不一致",
-                )
-                checked += 1
-        self.assertGreater(checked, 40)
+                self.assertEqual(items[key]["default"], schema[key]["default"])
+                self.assertEqual(items[key]["type"], schema[key]["type"])
+        for key, default in dedicated_defaults.items():
+            with self.subTest(field=key):
+                self.assertEqual(items[key]["default"], default)
+                if default == "inherit":
+                    self.assertEqual(items[key]["options"], ["inherit", "on", "off"])
+
+    def test_webui_row_defaults_do_not_override_existing_config(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["group_overrides_templates"]["templates"]["group_config"]["items"]
+        entry = {key: spec["default"] for key, spec in items.items()}
+        entry.update(__template_key="group_config", group_id="100")
+        store = self.make_store(_Config(
+            enabled_groups=["200"], profanity_keywords=["全局关键词"], admin_bypass=False,
+            group_overrides_templates=[entry],
+        ))
+        self.assertEqual(store.get_group_scope("100", "enabled_groups"), ["200"])
+        self.assertEqual(store.get_group_setting("100", "profanity_keywords"), ["全局关键词"])
+        self.assertFalse(store.get_group_setting("100", "admin_bypass"))
+        self.assertEqual(store.group_override_keys("100"), [])
+
+    def test_scope_dropdown_preserves_legacy_overrides_and_inheritance(self):
+        for key in ("enabled_groups", "auto_recall_enabled_groups"):
+            with self.subTest(field=key):
+                store = self.make_store(_Config({
+                    key: ["200"],
+                    "group_overrides_templates": [
+                        _template_entry("100", **{key: "on"}),
+                        _template_entry("100", **{key: "inherit"}),
+                        _template_entry("200", **{key: "off"}),
+                        _template_entry("300", **{key: "invalid"}),
+                    ],
+                }))
+                self.assertIs(store.get_group_scope("100", key), True)
+                self.assertIs(store.get_group_scope("200", key), False)
+                self.assertEqual(store.get_group_scope("300", key), ["200"])
+                store.set_group_override("100", key, False)
+                self.assertIs(store.get_group_scope("100", key), False)
+                store.set_group_override("100", key, ["400"])
+                self.assertEqual(store.get_group_scope("100", key), ["400"])
+                self.assertIs(store.get_group_scope("100", key, allow_runtime_list=False), True)
+                self.assertEqual(store.group_override_keys("100"), [key])
 
     def test_removed_baseline_flag_is_recorded(self):
         config = _Config(whitelist_users=["g1"])

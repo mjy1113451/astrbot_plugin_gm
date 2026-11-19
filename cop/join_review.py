@@ -19,8 +19,8 @@
 - MessageParser（L2）：_extract_text
 - context：AstrBot Context（get_stranger_info，取 QQ 等级 #189）
 
-enabled_groups 语义（与 moderation 不同，逐字保留本处原语义）：
-    经 get_group_setting 合并按群覆盖；bool 直接采用；空列表回退旧 violation_enabled_groups，
+enabled_groups 语义（与 moderation 不同，审核也接受旧运行时的列表覆盖）：
+    经 get_group_scope 合并按群覆盖；bool 直接采用；空列表回退旧 violation_enabled_groups，
     两者皆空 = 全群启用；非空列表按 * / all / 群号命中判定。
 """
 
@@ -86,8 +86,13 @@ class JoinReviewService:
             if stale_keys:
                 self._store.save_config()
         welcome_conf = self._store.runtime_map("groups").get(group_id, {})
-        if welcome_conf.get("welcome_enabled", False):
-            welcome = welcome_conf.get("welcome_message", "欢迎 {at} 加入本群！")
+        welcome_enabled = self._store.get_group_setting(
+            group_id, "welcome_enabled", welcome_conf.get("welcome_enabled", False)
+        )
+        if welcome_enabled:
+            welcome = self._store.get_group_setting(
+                group_id, "welcome_message", welcome_conf.get("welcome_message", "欢迎 {at} 加入本群！")
+            )
             content = welcome.replace("{at}", f"@{raw.get('user_id')}")
             await self._api._send(event, self._mp._build_text(content))
 
@@ -196,7 +201,7 @@ class JoinReviewService:
                 self._store.save_config()
             return
 
-        enabled_groups = self._store.get_group_setting(group_id, "enabled_groups", [])
+        enabled_groups = self._store.get_group_scope(group_id, "enabled_groups")
         violation_keywords = self._store.get_group_setting(group_id, "violation_keywords", [])
         join_approve_keywords = self._store.get_group_setting(group_id, "join_approve_keywords", [])
         # #192 owner：留空 = 全群启用；迁移兼容：新列表为空回退旧 violation_enabled_groups；

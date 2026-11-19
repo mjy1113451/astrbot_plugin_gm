@@ -71,6 +71,7 @@ import cop.onebot_api as onebot_api_mod  # noqa: E402
 from cop.join_review import JoinReviewService  # noqa: E402
 from cop.onebot_api import OneBotApi  # noqa: E402
 from cop.text_utils import normalize_qq_list  # noqa: E402
+from test_config_store import _Config, _template_entry, make_store  # noqa: E402
 
 
 class _Store:
@@ -83,6 +84,9 @@ class _Store:
 
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
+
+    def get_group_scope(self, group_id, key):
+        return self.get_group_setting(group_id, key, [])
 
     def runtime_map(self, name):
         return self._maps.setdefault(name, {})
@@ -109,6 +113,7 @@ class _Api:
     def __init__(self):
         self.admin_texts = []
         self.group_texts = []
+        self.group_destinations = []
         self.handled = []
         self.member_checks = []
         self.nickname_queries = []
@@ -131,6 +136,7 @@ class _Api:
         return "12"
 
     async def _send_group_text(self, event, group_id, text):
+        self.group_destinations.append(group_id)
         self.group_texts.append(text)
         if not self.group_send_ok:
             return False, ""
@@ -182,6 +188,45 @@ def _add_raw(**overrides):
 
 class AuditSwitchOnlyGatesAutoActionsTests(unittest.IsolatedAsyncioTestCase):
     """关掉自动审核后，申请通知与人工审核链路必须照常。"""
+
+    async def test_webui_scope_gates_only_the_configured_groups_auto_actions(self):
+        store = make_store(self, _Config(
+            enabled_groups=["100"],
+            join_approve_keywords=["你好"],
+            join_request_notify_in_group=True,
+            group_overrides_templates=[
+                _template_entry("100", enabled_groups="off"),
+                _template_entry("200", enabled_groups="on"),
+            ],
+        ))
+        api = _Api()
+        service = _make_service(store, api)
+        await _drain(service._handle_group_join_request(_Event(), _add_raw(group_id=100, flag="f-100")))
+        await _drain(service._handle_group_join_request(_Event(), _add_raw(group_id=200, flag="f-200")))
+
+        self.assertEqual(api.handled, [("f-200", True, "命中关键词自动同意")])
+        self.assertEqual(api.group_destinations, ["100", "200"])
+        self.assertIn("【新人加群】通知", api.group_texts[0])
+        self.assertEqual(store.runtime_map("pending_join_requests")["msg-1"]["group_id"], "100")
+
+    async def test_webui_welcome_overrides_legacy_settings_only_in_its_group(self):
+        store = make_store(self, _Config(group_overrides_templates=[
+            _template_entry("100", welcome_enabled=True, welcome_message="你好 {at}"),
+            _template_entry("200", welcome_enabled=False, explicit_override_fields="welcome_enabled"),
+        ]))
+        store.runtime_map("groups").update({
+            "200": {"welcome_enabled": True},
+            "300": {"welcome_enabled": True, "welcome_message": "旧欢迎语 {at}"},
+        })
+        api = _Api()
+        api._send = mock.AsyncMock()
+        service = _make_service(store, api)
+        service._mp = SimpleNamespace(_build_text=str)
+        for gid in ("100", "200", "300"):
+            await service._handle_group_increase_notice(gid, {"group_id": gid, "user_id": "777"})
+        self.assertEqual(api._send.await_args_list, [
+            mock.call("100", "你好 @777"), mock.call("300", "旧欢迎语 @777"),
+        ])
 
     async def test_audit_off_still_sends_group_reminder(self):
         store = _Store({

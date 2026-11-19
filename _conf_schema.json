@@ -2,7 +2,7 @@
     "show_recall_notice": {
         "description": "撤回消息后发送提示",
         "type": "bool",
-        "hint": "推荐按群覆盖：在群内执行 /设置群配置 show_recall_notice true/false。",
+        "hint": "可在「按群配置」中覆盖，或在群内执行 /开关撤回提示 on|off。",
         "default": true
     },
     "mute_notice": {
@@ -41,7 +41,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "推荐按群覆盖：在群内执行 /设置群配置 auto_recall_keywords [关键词列表]。",
+        "hint": "可在「按群配置」中覆盖，或在群内用 /添加自动撤回关键词 和 /删除自动撤回关键词 维护。",
         "default": []
     },
     "auto_recall_enabled_groups": {
@@ -50,7 +50,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "留空 = 全群启用（#192 owner 拍板）：Bot 发言命中 auto_recall_keywords 时在任意群撤回，keywords 为空时无命中、不产生实际撤回。非空：* / all 全启用，或精确群号。可按群覆盖单群开关：group_overrides[gid][auto_recall_enabled_groups] = false。",
+        "hint": "留空或包含 * / all 时默认全群启用，非空时也可填指定群号。单群可在「按群配置」中独立开启或关闭。只有 Bot 发言命中关键词时才撤回。",
         "default": []
     },
     "dup_face_recall_enabled": {
@@ -71,13 +71,13 @@
         "items": {
             "type": "string"
         },
-        "hint": "推荐按群覆盖：在群内执行 /设置群配置 report_notify_admins [QQ列表]。留空时举报通知回退使用 join_notify_admins（兼容 2.8.1 及以前把举报通知发到加群通知名单的实现），迁移后只维护本名单即可。",
+        "hint": "可在「按群配置」中覆盖，或在群内用 /添加举报通知QQ 和 /删除举报通知QQ 维护。生效名单为空时，兼容旧版并回退到加群通知名单。",
         "default": []
     },
     "rank_top_n": {
         "description": "发言排名榜最多显示人数（推荐按群覆盖）",
         "type": "int",
-        "hint": "推荐按群覆盖：/设置群配置 rank_top_n N。",
+        "hint": "可在「按群配置」中覆盖，或在群内执行 /设置排名人数 N。",
         "default": 10
     },
     "join_approve_keywords": {
@@ -86,7 +86,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "推荐按群覆盖：在群内 /设置群配置 join_approve_keywords [关键词列表]。",
+        "hint": "可在「按群配置」中覆盖，或在群内用 /添加加群审核通过关键词 和 /删除加群审核通过关键词 维护。",
         "default": []
     },
     "join_reject_keywords": {
@@ -95,7 +95,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "命中任一关键词即自动拒绝该加群申请，并把申请人加入本群黑名单（#194），此后其再申请直接拒绝且不再发群内提醒。本群列表非空时优先于全局；按群维护：/加群自动拒绝关键词 添加 <关键词> | 删除 <关键词> | 查看。与违禁词自动拒绝同样受加群申请自动审核总开关 join_audit_enabled 与启用群范围 enabled_groups 控制。",
+        "hint": "命中任一关键词即拒绝加群申请并加入本群黑名单。可在「按群配置」中覆盖，或用 /加群自动拒绝关键词 添加|删除|查看。受本群自动审核开关和启用范围控制。",
         "default": []
     },
     "join_notify_admins": {
@@ -110,7 +110,7 @@
     "join_request_notify_in_group": {
         "description": "加群申请在对应群内发送提醒（推荐按群覆盖）",
         "type": "bool",
-        "hint": "推荐按群覆盖：/设置群配置 join_request_notify_in_group true/false。",
+        "hint": "可在「按群配置」中覆盖，或在群内执行 /开关加群申请提醒 on|off。",
         "default": false
     },
     "join_reject_reason": {
@@ -122,7 +122,7 @@
     "join_audit_enabled": {
         "description": "加群申请自动审核总开关",
         "type": "bool",
-        "hint": "关闭后所有自动审核（第三方邀请自动通过/自动拒绝关键词/违禁词拒绝/关键词同意）都不生效，但加群申请通知（群内提醒/管理员私聊）与待处理记录照常产生，管理员手动审核（引用回复同意/拒绝）不受影响，黑名单用户仍直接拒绝。推荐按群覆盖：/设置群配置 join_audit_enabled true/false。",
+        "hint": "关闭后不自动审核，但加群通知和手动审核不受影响，黑名单仍直接拒绝。可在「按群配置」中覆盖，或在群内执行 /开关加群自动审核 on|off。",
         "default": true
     },
     "invite_auto_approve": {
@@ -132,10 +132,9 @@
         "default": false
     },
     "group_admin_admins_by_group": {
-        "description": "按群设置「可设置/取消群管理」的专项管理员（{群号: [QQ...]}）",
+        "description": "旧版专项管理员名单（仅用于迁移）",
         "type": "dict",
-        "items": {},
-        "hint": "示例：{\"123456789\": [\"10001\", \"10002\"]}。命中本表的群用该群名单（专项管理员可执行 /设管理 与 /取消管理，不受群管理身份限制）；群内 /添加管理管理 /删除管理管理 维护的名单优先级更高。值可以是 JSON 数组，也可写成 \"10001,10002\"。查看某群实际生效名单：群内 /status。",
+        "invisible": true,
         "default": {}
     },
     "api_type": {
@@ -196,7 +195,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "留空 = 全群启用（#192 owner 拍板）；非空：* / all 全启用，或精确群号（未命中群不启用）。可按群覆盖单群开关：group_overrides[gid][enabled_groups] = false。",
+        "hint": "违规检测与加群自动审核的默认范围。留空或包含 * / all 时默认全群启用，非空时也可填指定群号。单群可在「按群配置」中独立开启或关闭。",
         "default": []
     },
     "spam_check_enabled": {
@@ -286,12 +285,12 @@
         "default": 600
     },
     "profanity_keywords": {
-        "description": "骂人关键词列表（关键词模式下使用，仅全局配置，#204 已移除按群指令）",
+        "description": "骂人关键词全局硬清单",
         "type": "list",
         "items": {
             "type": "string"
         },
-        "hint": "仅全局配置（#204 已移除添加/删除/查看骂人关键词指令）；关键词模式由 /切换骂人检测模式 控制。",
+        "hint": "全局关键词对所有启用骂人检测的群生效。在「按群配置」可追加单群关键词，但不会移除全局词。",
         "default": [
             "傻逼",
             "操你妈",
@@ -394,7 +393,7 @@
         "items": {
             "type": "string"
         },
-        "hint": "这些域名（含子域）不参与不安全网站检测，另复用 link_whitelist。默认预置常见大站，可按需增删：/设置群配置 link_safety_whitelist [域名列表]。",
+        "hint": "这些域名及其子域不参与不安全网站检测，另复用 link_whitelist。可在「按群配置」中覆盖。",
         "default": [
             "douyin.com",
             "bilibili.com"
@@ -558,13 +557,15 @@
         "default": 15
     },
     "group_overrides_templates": {
-        "description": "按群配置（模板列表，PR #290）",
+        "description": "按群配置（模板列表）",
         "type": "template_list",
-        "hint": "在 WebUI 里为每个群单独覆盖插件配置：PR #290 按群配置模板：字段保持默认值时视为未覆盖、回退全局配置；需要强制覆盖为与默认相同的值（例如用空列表清空全局名单）时，把字段名写进该群条目的「显式覆盖字段」。读取优先级：按群覆盖指令写入的运行时覆盖 > 本列表（字段值≠默认值或已声明显式覆盖）> 全局配置。同一群号可以拆成多条记录分别配置不同侧面：合并时只有真正改过（≠默认值或已声明显式覆盖）的字段生效，后面条目里仍是默认值的字段不会抹掉前面条目已配置的值。 需要 AstrBot v4.10.4+。",
+        "hint": "填写群号后仅修改本群需要调整的项目。读取优先级：群内指令 > 按群配置 > 全局默认。字段保留模板默认值时继承全局；若要强制使用默认值（如空名单），请填写「显式覆盖字段」。同群的多条记录仅合并实际覆盖的字段。",
+        "default": [],
         "templates": {
             "group_config": {
                 "name": "单群配置",
                 "hint": "一个条目对应一个群的按群覆盖配置",
+                "display_item": "group_id",
                 "items": {
                     "group_id": {
                         "description": "群号",
@@ -575,8 +576,30 @@
                     "explicit_override_fields": {
                         "description": "显式覆盖字段（即使等于默认值也生效）",
                         "type": "string",
-                        "hint": "填写字段名，多个用逗号分隔，例如：blacklist_keywords,whitelist_users。这些字段即使填写的是默认值（如空列表）也按本群覆盖处理，可用于把全局名单在本群清空。普通字段无需填写此列，填写非默认值即自动生效。作用范围（单条记录级）：声明只对该条记录里给出的值生效；某条只声明不给值表示「本群不要前面记录的该字段值」，该字段回退全局；同群后面另有一条记录给出非默认值时，按那条记录的值生效。",
+                        "hint": "填写本条需要强制覆盖的字段名，多个用逗号分隔，例如 blacklisted_users,whitelist_users。此处声明的字段即使使用模板默认值（如空列表）也生效。两个群范围字段直接用下拉菜单设置。",
                         "default": ""
+                    },
+                    "enabled_groups": {
+                        "description": "本群违规检测与加群自动审核范围",
+                        "type": "string",
+                        "options": ["inherit", "on", "off"],
+                        "labels": ["继承全局范围", "启用", "停用"],
+                        "hint": "仅影响本群。不会关闭加群通知、手动审核或黑名单拒绝。",
+                        "default": "inherit"
+                    },
+                    "auto_recall_enabled_groups": {
+                        "description": "本群 Bot 发言关键词自动撤回",
+                        "type": "string",
+                        "options": ["inherit", "on", "off"],
+                        "labels": ["继承全局范围", "启用", "停用"],
+                        "hint": "开启后仍须命中关键词才会撤回。",
+                        "default": "inherit"
+                    },
+                    "group_admin_admins": {
+                        "description": "可设置/取消群管理的专项管理员 QQ 列表",
+                        "type": "list",
+                        "hint": "仅授权 /设管理 和 /取消管理，每项填一个 QQ 号。群内名单指令保存的整份名单优先；用 /清除群配置 group_admin_admins 恢复此处的名单。",
+                        "default": []
                     },
                     "show_recall_notice": {
                         "description": "撤回消息后发送提示",
@@ -614,6 +637,23 @@
                         "type": "int",
                         "default": 10
                     },
+                    "reject_re_add": {
+                        "description": "踢人后拒绝再次加群",
+                        "type": "bool",
+                        "default": false
+                    },
+                    "max_message_history": {
+                        "description": "本群撤回消息历史缓存条数",
+                        "type": "int",
+                        "hint": "用于 /撤回 和 /撤回自身 的历史回退。",
+                        "default": 50
+                    },
+                    "mute_kick_threshold": {
+                        "description": "禁言次数达到阈值后自动踢出",
+                        "type": "int",
+                        "hint": "累计禁言次数达到该值时踢出本群成员。默认 0，表示关闭。",
+                        "default": 0
+                    },
                     "auto_recall_keywords": {
                         "description": "Bot发言自动撤回关键词列表",
                         "type": "list",
@@ -628,6 +668,17 @@
                         "description": "二维码识别检测开关（#237）",
                         "type": "bool",
                         "default": false
+                    },
+                    "welcome_enabled": {
+                        "description": "在本群发送新人欢迎语",
+                        "type": "bool",
+                        "default": false
+                    },
+                    "welcome_message": {
+                        "description": "本群新人欢迎语",
+                        "type": "string",
+                        "hint": "可用 {at} 插入新成员的 QQ 提示。",
+                        "default": "欢迎 {at} 加入本群！"
                     },
                     "join_request_notify_in_group": {
                         "description": "加群申请在对应群内发送提醒",
@@ -647,6 +698,12 @@
                     "join_reject_keywords": {
                         "description": "加群验证消息命中后自动拒绝并拉黑的关键词列表（#229）",
                         "type": "list",
+                        "default": []
+                    },
+                    "violation_keywords": {
+                        "description": "加群验证违禁词列表",
+                        "type": "list",
+                        "hint": "加群验证消息命中即自动拒绝（不拉黑）；需开启本群自动审核。",
                         "default": []
                     },
                     "join_reject_reason": {
@@ -672,6 +729,17 @@
                     "whitelist_users": {
                         "description": "本群白名单用户QQ号列表（不受违规检测限制）",
                         "type": "list",
+                        "default": []
+                    },
+                    "admin_bypass": {
+                        "description": "管理员和群主豁免违规检测",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "banned_images": {
+                        "description": "本群违禁图片 MD5 列表",
+                        "type": "list",
+                        "hint": "每项填一个 32 位小写十六进制 MD5；全局上传的违禁图片仍在本群生效。也可引用图片执行 /添加违禁图片。",
                         "default": []
                     },
                     "spam_check_enabled": {
@@ -703,6 +771,24 @@
                         "description": "启用骂人检测",
                         "type": "bool",
                         "default": true
+                    },
+                    "profanity_use_ai": {
+                        "description": "使用 AI 检测骂人",
+                        "type": "bool",
+                        "hint": "关闭后仍做关键词匹配。",
+                        "default": true
+                    },
+                    "profanity_detection_prompt": {
+                        "description": "AI 骂人检测提示词",
+                        "type": "text",
+                        "hint": "可用 {text} 插入待检测文本。留空使用内置提示词。",
+                        "default": "你是严格的内容审核助手。请判断以下文本是否包含骂人、侮辱、人身攻击。\n同时评估严重程度 severity，取值范围只能是 mild / medium / severe（mild=轻度调侃，medium=明显侮辱，severe=极端恶毒或人身威胁）。\n请仅返回 JSON：{\"is_profanity\": true/false, \"reason\": \"简短原因\", \"severity\": \"mild|medium|severe\"}"
+                    },
+                    "profanity_keywords": {
+                        "description": "本群额外骂人关键词",
+                        "type": "list",
+                        "hint": "与全局硬清单同时生效；留空只使用全局词。",
+                        "default": []
                     },
                     "profanity_ban_duration": {
                         "description": "骂人禁言时长（秒）",
@@ -770,6 +856,22 @@
                         "description": "不安全网站违规禁言时长（秒）",
                         "type": "int",
                         "default": 600
+                    },
+                    "link_safety_blocked_is_unsafe": {
+                        "description": "目标站拒绝访问时视为不安全",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "link_safety_keywords": {
+                        "description": "不安全网站关键词（域名及目标页正文匹配）",
+                        "type": "list",
+                        "default": ["赌博", "博彩", "彩票", "色情", "成人", "裸聊", "约炮", "娱乐城", "投注", "棋牌", "援交", "一夜情", "外围女"]
+                    },
+                    "link_fetch_timeout": {
+                        "description": "链接目标页抓取超时（秒）",
+                        "type": "int",
+                        "hint": "链接广告内容检测和不安全网站检测共用，范围 1–15 秒。",
+                        "default": 5
                     },
                     "group_promotion_check_enabled": {
                         "description": "启用群号推广检测",

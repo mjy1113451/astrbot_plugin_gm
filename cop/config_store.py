@@ -31,6 +31,8 @@ class ConfigRollbackError(RuntimeError):
 class ConfigStore:
     """无状态（相对于插件类）的配置/运行时映射存储。"""
 
+    _GROUP_SCOPE_FIELDS = {"enabled_groups", "auto_recall_enabled_groups"}
+
     def __init__(
         self,
         *,
@@ -56,13 +58,7 @@ class ConfigStore:
         # PR #290：WebUI 按群配置模板（template_list）的字段默认值缓存，
         # 用于区分"字段未动（回退全局）"与"显式覆盖"。
         self._template_field_defaults = self._load_template_field_defaults()
-        # 本次保存事务里由插件显式改写的全局配置键：回滚时只删这些键，
-        # 不做"当前键集合 − 快照"的差集删除（PR #289 审查：overbroad-memory-rollback）。
-        self._touched_keys: tuple = ()
-        # set_global_setting 登记的单键写前值：save_config 的快照是在改动之后
-        # 才拍的，靠它才能把回滚目标修正回真正的写前状态
-        # （PR #289 审查：double-rollback-corruption）。
-        self._touched_prev: dict = {}
+        self._migrate_group_admin_admins()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -137,7 +133,42 @@ class ConfigStore:
             self._runtime_maps[key] = value
         return value
 
-    def save_config(self) -> None:
+    def _migrate_group_admin_admins(self) -> None:
+        """把旧 WebUI 名单移入模板；旧键留在 schema 中，防止框架预先清除。"""
+        if not isinstance(self.config, Mapping) or "group_admin_admins" not in self._template_field_defaults:
+            return
+        legacy = self.config.get("group_admin_admins_by_group")
+        if not isinstance(legacy, dict) or not legacy:
+            return
+        entries = self.config.get("group_overrides_templates", [])
+        if not isinstance(entries, list):
+            logger.warning("[群管插件] 按群配置不是列表，保留旧版专项管理员名单")
+            return
+        migrated = []
+        for group_id, raw in legacy.items():
+            gid = str(group_id)
+            admins = self.normalize_qq_list_value(raw)
+            if not gid.isascii() or not gid.isdecimal() or not admins:
+                continue
+            entry = self._template_group_entry(gid) or {}
+            if "group_admin_admins" in entry:
+                continue
+            migrated.append({
+                "__template_key": "group_config",
+                "group_id": gid,
+                "group_admin_admins": admins,
+            })
+        try:
+            self.save_config(global_updates={
+                "group_overrides_templates": [*entries, *migrated],
+                "group_admin_admins_by_group": {},
+            })
+        except ConfigRollbackError:
+            raise
+        except Exception as e:
+            logger.warning(f"[群管插件] 迁移专项管理员到按群模板失败，将继续读取旧名单: {e}")
+
+    def save_config(self, *, global_updates: dict | None = None) -> None:
         """保存配置（两个存储目标，缺一不可）。
 
         - 运行时动态映射（group_overrides / groups / pending_join_requests）→ runtime.json，
@@ -182,22 +213,19 @@ class ConfigStore:
             # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
             # （PR #289 审查：incomplete-persistence-rollback）。
             prev_global = self._config_snapshot()
+            if global_updates and prev_global is None:
+                raise TypeError("无法安全备份并更新框架配置")
             prev_global_file = self._snapshot_framework_file()
-            touched_keys = tuple(self._touched_keys)
-            touched_prev = dict(self._touched_prev)
-            # 这一步失败不需要回滚：JsonStore 用临时文件 + os.replace 原子写，
-            # 失败时磁盘上仍是写前内容，且框架配置此时还没开始写，没有第二个
-            # 目标需要恢复，因此直接向上抛出即可
-            # （PR #289 审查：transaction-boundary）。
+            # 运行时文件原子写失败时，框架配置尚未修改，不需要回滚。
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
+                for key, value in (global_updates or {}).items():
+                    self.config[key] = value
                 self.config.save_config()
             except Exception as exc:
-                failure = self._restore_framework_config(
-                    prev_global, touched_keys, touched_prev)
-                self._touched_keys = ()
-                self._touched_prev = {}
-                failure = failure or self._restore_framework_file(prev_global_file)
+                failure = self._restore_framework_config(prev_global, global_updates)
+                file_failure = self._restore_framework_file(prev_global_file)
+                failure = failure or file_failure
                 try:
                     if prev_runtime is missing:
                         self.runtime_path.unlink(missing_ok=True)
@@ -216,43 +244,10 @@ class ConfigStore:
                         f"当前进程的配置可能不可信，请重启插件或到 WebUI 核对后重试"
                     ) from exc
                 raise
-            else:
-                self._touched_keys = ()
-                self._touched_prev = {}
 
     def set_global_setting(self, key: str, value) -> None:
-        """写入单个全局配置项并持久化；保存失败时由 save_config 统一回滚。
-
-        命令层直接 `self.config[key] = value` 再 save 的话，落盘失败后进程内会
-        留下未落盘的新值；这里把"改了哪个键"及其写前值显式登记下来交给
-        save_config——因为 save_config 的快照是在本次改动**之后**才拍的，
-        自己拿不到旧值。
-
-        回滚只发生在 save_config 里，这里不再二次写值：两层各改一遍很容易把
-        已恢复的旧值又覆盖成新值（PR #289 审查：double-rollback-corruption）。
-        """
-        with self._lock:
-            # 按 Mapping 协议而不是 isinstance(dict) 判定：UserDict 等非 dict
-            # 映射同样要能写入并建立快照；不支持 Mapping 的对象直接抛错，
-            # 不能"既不写也不报错"让调用方以为已保存
-            # （PR #289 审查：unsupported-config-type）。
-            if not isinstance(self.config, Mapping):
-                raise TypeError(
-                    f"配置对象类型 {type(self.config).__name__} 不支持 Mapping 协议，"
-                    "无法安全写入并回滚")
-            snapshot = self._config_snapshot()
-            if snapshot is not None and key in snapshot:
-                self._touched_prev = {key: (copy.deepcopy(snapshot[key]), True)}
-            else:
-                self._touched_prev = {key: (None, False)}
-            self._touched_keys = (key,)
-            try:
-                self.config[key] = value
-                self.save_config()
-            except Exception:
-                self._touched_keys = ()
-                self._touched_prev = {}
-                raise
+        """写入单个全局配置项并持久化；保存失败时由 save_config 统一回滚。"""
+        self.save_config(global_updates={key: value})
 
     def _config_snapshot(self):
         """按 Mapping 协议取框架配置的全量键值快照；不支持时返回 None。"""
@@ -290,35 +285,12 @@ class ConfigStore:
             return e
         return None
 
-    def _restore_framework_config(self, prev_global, touched=None, touched_prev=None):
-        """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
-
-        只做两件安全的事：把目标快照里的键改回原值；把"本次通过
-        set_global_setting 显式登记、且写前并不存在"的键删掉。
-
-        新增键只删登记过的：快照是在调用方改动之后才拍的，所以出现在 new_keys
-        里的键必然是 **save_config() 执行过程中** 才多出来的——那是框架自己在
-        写盘前后注入的键（含 schema 声明过的辅助/内部键）。仅凭"在
-        _conf_schema.json 里有声明"就去删，会把框架刚注入的合法键删掉，反而
-        让进程内配置与磁盘不一致（PR #289 审查：overbroad-schema-rollback）。
-        业务层若绕过 set_global_setting 直接写配置，其写入发生在快照之前，
-        已随快照一起恢复，不需要靠删键兜底。
-
-        touched_prev 是 set_global_setting 记下的"这些键的写前值"：save_config
-        的快照是在调用方改完之后才拍的，必须用它把目标快照修正回真正的写前状态，
-        否则回滚会把新值当成旧值留下来（PR #289 审查：double-rollback-corruption）。
-        """
+    def _restore_framework_config(self, prev_global, touched=None):
+        """逐键恢复快照；新增键只删除本次由插件显式更新的键，不碰框架注入的键。"""
         if prev_global is None or not isinstance(self.config, Mapping):
             return None
-        target = dict(prev_global)
-        for key, info in (touched_prev or {}).items():
-            value, had_key = info
-            if had_key:
-                target[key] = value
-            else:
-                target.pop(key, None)
         failures = []
-        for key, value in target.items():
+        for key, value in prev_global.items():
             try:
                 if key in self.config and self.config[key] == value:
                     continue
@@ -329,7 +301,7 @@ class ConfigStore:
             except Exception as e:
                 failures.append(e)
         try:
-            new_keys = [k for k in self.config.keys() if k not in target]
+            new_keys = [k for k in self.config.keys() if k not in prev_global]
         except Exception:
             new_keys = []
         removable = [k for k in new_keys if k in (touched or ())]
@@ -442,7 +414,7 @@ class ConfigStore:
             logger.warning(
                 "[IMPORTANT][群管插件] enabled_groups 为空：按 #192 新语义，违规检测"
                 "（含刷屏/图片AI等）将在【全部群】启用。如需限定范围，请配置 "
-                "enabled_groups 列表，或通过 group_overrides 将指定群 enabled_groups 设为 false。"
+                "enabled_groups 列表，或在 WebUI 的按群配置中关闭指定群的违规检测。"
             )
         if not auto_recall_groups:
             logger.warning(
@@ -472,6 +444,12 @@ class ConfigStore:
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if isinstance(overrides, dict) and key in overrides:
             value = overrides[key]
+            if key == "group_admin_admins":
+                admins = self.normalize_qq_list_value(value)
+                if admins or self._is_explicit_snapshot(group_id, key):
+                    return admins
+                # 老版本的空运行时名单从不遮盖 WebUI 名单。
+                return self._template_or_global_setting(group_id, key, [])
             if isinstance(value, list):
                 # 有增量操作时以最新模板/全局基线重算，否则按整体快照返回
                 if self._has_list_ops(group_id, key):
@@ -479,6 +457,14 @@ class ConfigStore:
                 return self._as_str_list(value)
             return value
         return self._template_or_global_setting(group_id, key, default)
+
+    def get_group_scope(self, group_id: str, key: str, *, allow_runtime_list: bool = True):
+        """群范围：保留旧运行时开关/名单，模板的 on/off 转为布尔值。"""
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        value = overrides.get(key) if isinstance(overrides, dict) else None
+        if isinstance(value, bool) or (allow_runtime_list and isinstance(value, list)):
+            return self.get_group_setting(group_id, key, [])
+        return self._template_or_global_setting(group_id, key, [])
 
     def _template_or_global_setting(self, group_id: str, key: str, default=None):
         """模板层 → 全局层 的配置值（不含运行时覆盖）。
@@ -488,11 +474,10 @@ class ConfigStore:
         """
         entry = self._template_group_entry(group_id)
         if entry is not None and key in self._template_field_defaults:
-            default = self._template_field_defaults[key]
             if key in entry:
-                value = entry[key]
-                if value != default or self._is_explicit_override(entry, key):
-                    return value
+                if key in self._GROUP_SCOPE_FIELDS:
+                    return entry[key] == "on"
+                return entry[key]
             elif key in (entry.get("__present_fields__") or []):
                 # 条目里写过这个字段，但值仍等于模板默认值、也没写进显式覆盖字段
                 # → 按「未覆盖、回退全局」处理（PR #289 审查：template-default-fallback）。
@@ -505,7 +490,21 @@ class ConfigStore:
                 logger.debug(
                     f"[群管插件] 群 {group_id} 的模板条目未填写 {key}，按未覆盖处理并回退全局配置"
                 )
+        if key == "group_admin_admins":
+            legacy = self.config.get("group_admin_admins_by_group")
+            if isinstance(legacy, dict) and str(group_id) in legacy:
+                return self.normalize_qq_list_value(legacy[str(group_id)])
+            return []
         return self.config.get(key, default)
+
+    def group_override_keys(self, group_id: str) -> list:
+        """列出本群在模板或运行时实际覆盖的键，不返回存储层元数据。"""
+        entry = self._template_group_entry(group_id) or {}
+        keys = {key: None for key in entry if key in self._template_field_defaults}
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        if isinstance(overrides, dict):
+            keys.update((key, None) for key in overrides if not key.startswith("__"))
+        return list(keys)
 
     # ===================== WebUI 按群配置模板（PR #290） =====================
 
@@ -547,7 +546,7 @@ class ConfigStore:
         if not isinstance(entries, list):
             return None
         gid = str(group_id).strip()
-        if not gid:
+        if not gid.isascii() or not gid.isdecimal():
             return None
         defaults = self._template_field_defaults
         merged = None
@@ -557,7 +556,7 @@ class ConfigStore:
         # （PR #289 审查：template-explicit-override-lost）。
         meta_keys = ("__template_key", "group_id", "explicit_override_fields", "__present_fields__")
         for entry in entries:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get("__template_key", "group_config") != "group_config":
                 continue
             if str(entry.get("group_id", "")).strip() != gid:
                 continue
@@ -580,11 +579,11 @@ class ConfigStore:
                     # 多条记录的显式覆盖声明要累加，不能被后一条覆盖掉。
                     merged[k] = self._merge_explicit_fields(merged.get(k), v)
                     continue
-                if (
-                    k in defaults
-                    and v == defaults[k]
-                    and not self._is_explicit_override(entry, k)
-                ):
+                if k in self._GROUP_SCOPE_FIELDS and v not in ("on", "off"):
+                    if k in declared and v == "inherit":
+                        merged.pop(k, None)
+                    continue
+                if k in defaults and v == defaults[k] and k not in declared:
                     # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。
                     continue
                 merged[k] = v
@@ -632,14 +631,6 @@ class ConfigStore:
             if name not in merged:
                 merged.append(name)
         return merged
-
-    def _is_explicit_override(self, entry: dict, key: str) -> bool:
-        """模板条目是否显式声明要覆盖 key（即使填写值等于模板默认值）。
-
-        explicit_override_fields 支持列表或逗号/空格分隔的字符串两种写法，
-        用于"本群要用空列表清空全局名单"这类无法靠默认值比较表达的意图。
-        """
-        return key in self._explicit_field_names(entry.get("explicit_override_fields"))
 
     # ===================== 按群覆盖读写 =====================
 
@@ -920,6 +911,8 @@ class ConfigStore:
         for_update 参数保留以兼容旧调用点，语义上不再需要"可写本体"。
         """
         with self._lock:
+            if key == "group_admin_admins":
+                return self.normalize_qq_list_value(self.get_group_setting(group_id, key, []))
             overrides = self.runtime_map("group_overrides").get(str(group_id), {})
             value = overrides.get(key) if isinstance(overrides, dict) else None
             if isinstance(value, list):
@@ -1018,7 +1011,7 @@ class ConfigStore:
                     pending.append(qq)
             if not pending:
                 return []
-            self._commit_list_change(group_id, key, add=pending)
+            self.set_group_override(group_id, key, current + pending)
             return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
@@ -1028,7 +1021,7 @@ class ConfigStore:
             pending = [qq for qq in (str(x) for x in qq_list) if qq and qq in current]
             if not pending:
                 return []
-            self._commit_list_change(group_id, key, remove=pending)
+            self.set_group_override(group_id, key, [qq for qq in current if qq not in pending])
             return pending
 
     def normalize_qq_list_value(self, value) -> list:

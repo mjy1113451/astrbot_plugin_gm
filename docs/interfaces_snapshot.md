@@ -52,7 +52,7 @@
 | 40 | `查看加群通知QQ` | 查看本群加群请求通知管理员QQ列表 | — | `list_join_notify_cmd` |
 | 41 | `查看广告关键词` | 查看广告关键词列表（本群） | — | `list_ad_keywords_cmd` |
 | 42 | `查看白名单` | 查看白名单用户列表（本群+全局） | — | `list_whitelist_cmd` |
-| 43 | `查看群配置` | 查看本群生效的配置覆盖 | — | `view_group_config_cmd` |
+| 43 | `查看群配置` | 管理员查看本群生效的配置覆盖 | — | `view_group_config_cmd` |
 | 44 | `查看自动撤回关键词` | 查看Bot发言自动撤回关键词列表（本群+全局） | — | `list_auto_recall_keywords_cmd` |
 | 45 | `查看违禁图片` | 查看本群违禁图片列表 | — | `list_banned_images_cmd` |
 | 46 | `查看违规统计` | 查看违规统计（默认全群；带 QQ 号查个人） | — | `view_violation_stats_cmd` |
@@ -72,7 +72,7 @@
 | 60 | `添加黑名单` | 将用户加入本群黑名单（拒绝加群申请） | — | `add_blacklist_cmd` |
 | 61 | `清用户历史` | 撤回某用户在本群的最近 N 条消息（/清用户历史 @某人 [N]） | — | `clear_user_history_cmd` |
 | 62 | `清除数据` | 清除本群发言计数 | — | `clear_rank_cmd` |
-| 63 | `清除群配置` | 清除本群所有覆盖 | — | `clear_group_config_cmd` |
+| 63 | `清除群配置` | 清除群内指令写入的覆盖（不删除 WebUI 模板） | — | `clear_group_config_cmd` |
 | 64 | `禁我` | 禁言发送者自己（自我禁言/自怼）。当用户说『禁我、把我禁言、禁言我、自我禁言、自怼、我想安静一会儿』等要求禁言其本人的意图时调用，任意成员均可使用；格式：/禁我 [分钟]，默认10分钟，范围1~43200（30天） | — | `mute_self_cmd` |
 | 65 | `禁言` | 禁言成员 | — | `mute_cmd` |
 | 66 | `禁言列表` | 查看本群当前被禁言成员列表 | — | `mute_list_cmd` |
@@ -141,7 +141,7 @@
 - `after_message_sent`
 
 
-**配置键总数：73**
+**顶层配置键总数：74**（包含一个仅用于升级迁移的隐藏键）。
 
 
 | # | key | type | default |
@@ -165,7 +165,7 @@
 | 17 | `join_reject_reason` | string | `"不满足加群条件"` |
 | 18 | `join_audit_enabled` | bool | `true` |
 | 19 | `invite_auto_approve` | bool | `false` |
-| 20 | `group_admin_admins_by_group` | dict | `{}` |
+| 20 | `group_admin_admins_by_group`（隐藏，旧名单迁移） | dict | `{}` |
 | 21 | `api_type` | string | `"openai_vision"` |
 | 22 | `api_endpoint` | string | `""` |
 | 23 | `api_key` | string | `""` |
@@ -219,6 +219,9 @@
 | 71 | `link_safety_ban_duration` | int | `600` |
 | 72 | `link_safety_keywords` | list | 预填黄赌毒常见词 |
 | 73 | `link_fetch_timeout` | int | `5` |
+| 74 | `group_overrides_templates` | template_list | `[]` |
+
+`group_overrides_templates` 的模板 ID 是 `group_config`，保存时每条带 `__template_key` 与字符串 `group_id`。群范围字段在模板里用 `inherit` / `on` / `off`，而顶层同名字段仍为默认群号列表。`group_admin_admins`、`mute_kick_threshold`、`banned_images`、`violation_keywords`、`welcome_enabled`、`welcome_message` 仅在群模板中提供；旧 `group_admin_admins_by_group` 在首次成功迁移后清空。
 
 ## 4. 数据文件路径与 data_dir 推导
 

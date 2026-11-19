@@ -3,6 +3,7 @@ desc: "AstrBot 群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关�
 version: v2.8.2
 author: mjy1113451
 repo: "https://github.com/mjy1113451/astrbot_plugin_gm"
+astrbot_version: ">=4.28.0"
 tags:
   - 群管
   - 管理

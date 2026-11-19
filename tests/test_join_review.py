@@ -53,6 +53,9 @@ class _Store:
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
 
+    def get_group_scope(self, group_id, key):
+        return self.get_group_setting(group_id, key, [])
+
     def get_group_override_list(self, group_id, key):
         return list(self.settings.get(key, []) or [])
 

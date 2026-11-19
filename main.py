@@ -1011,6 +1011,7 @@ class GroupAdminPlugin(Star):
         recalled_total = 0
         kick_recall_enabled = bool(self._store.get_group_setting(group_id, "kick_recall_enabled", False))
         kick_recall_count = max(1, min(int(self._store.get_group_setting(group_id, "kick_recall_count", 10) or 10), 50))
+        reject_re_add = self._store.get_group_setting(group_id, "reject_re_add", False)
         for qq in qq_list:
             # #145：踢人前撤回该成员近期消息（踢出后无法再拉取其历史）
             recalled = 0
@@ -1018,7 +1019,7 @@ class GroupAdminPlugin(Star):
                 recalled = await self._history._recall_user_recent_msgs(event, group_id, qq, kick_recall_count)
                 recalled_total += recalled
             ok = await self._api._kick_member(event, group_id, qq)
-            if ok and self.config.get("reject_re_add", False):
+            if ok and reject_re_add:
                 await self._api._execute_action(event, "reject_add", group_id=group_id, user_id=qq)
             results.append((qq, ok))
             if recalled:
@@ -1531,8 +1532,7 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw.get("group_id"))
-        top_n = int(self.config.get("rank_top_n", 10))
-        ranked = self._stats.get_rank(group_id, top_n)
+        ranked = self._stats.get_rank(group_id)
         if not ranked:
             yield event.plain_result("暂无发言数据")
             return
@@ -2206,15 +2206,15 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("只有群管理员或群主可执行此操作")
             return
         group_id = str(raw.get("group_id"))
-        # 本群段落只展示运行时覆盖，全局值单独成段，避免重复展示同一批 MD5。
-        banned = self._store.runtime_group_list(group_id, "banned_images")
-        global_banned = self.config.get("banned_images", [])
+        global_banned = self._store.config_list("banned_images")
+        banned = [md5 for md5 in self._store.get_group_override_list(group_id, "banned_images")
+                  if md5 not in global_banned]
         lines = []
         if banned:
             lines.append(f"本群违禁图（{len(banned)} 张）：")
             for m in banned:
                 lines.append(f"  - {m}")
-        if isinstance(global_banned, list) and global_banned:
+        if global_banned:
             lines.append(f"\n全局违禁图（{len(global_banned)} 张）：")
             for m in global_banned:
                 lines.append(f"  - {m}")
@@ -2516,30 +2516,21 @@ class GroupAdminPlugin(Star):
         ql = self._store.get_group_setting(gid, "join_notify_admins", [])
         yield event.plain_result(f"本群加群通知QQ：{', '.join(ql) if ql else '空'}")
 
-    @filter.command("查看群配置", "查看本群生效的配置覆盖")
+    @filter.command("查看群配置", "查看本群生效的配置覆盖（仅插件管理员）")
     async def view_group_config_cmd(self, event: AstrMessageEvent):
-        raw = self._mp._get_raw_message(event)
-        if not raw or not raw.get("group_id"):
-            yield event.plain_result("此指令只能在群聊中使用")
+        if not await self._perms._moderation_require_admin_msg(event):
             return
-        group_id = str(raw.get("group_id"))
-        gconf = self._store.runtime_map("group_overrides").get(group_id, {})
-        if not gconf:
+        group_id = self._mp._get_group_id_or_none(event)
+        if not group_id:
+            return
+        keys = self._store.group_override_keys(group_id)
+        if not keys:
             yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
             return
-        lines = []
-        for k, v in gconf.items():
-            if str(k).startswith("__"):
-                # 内部元数据（如列表派生基线）不展示
-                continue
-            shown = self._store.get_group_setting(group_id, k) if isinstance(v, list) else v
-            lines.append(f"{k}: {shown}")
-        if not lines:
-            yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
-            return
-        yield event.plain_result(f"本群覆盖配置：\n" + "\n".join(lines))
+        lines = [f"{key}: {self._store.get_group_setting(group_id, key)}" for key in keys]
+        yield event.plain_result("本群覆盖配置：\n" + "\n".join(lines))
 
-    @filter.command("清除群配置", "清除本群所有覆盖")
+    @filter.command("清除群配置", "清除群内指令写入的覆盖（不删除 WebUI 模板）")
     async def clear_group_config_cmd(self, event: AstrMessageEvent, key: str = ""):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -2552,7 +2543,7 @@ class GroupAdminPlugin(Star):
         gconf = self._store.runtime_map("group_overrides").get(group_id, {})
         if key:
             if key not in gconf:
-                yield event.plain_result(f"本群未设置 {key}")
+                yield event.plain_result(f"本群没有通过指令覆盖 {key}")
                 return
             # 值 + 增量操作 + 整体快照标记一起清，避免残留让本群配置"复活"
             try:
@@ -2561,7 +2552,7 @@ class GroupAdminPlugin(Star):
                 logger.error(f"清除本群配置 {key} 失败（群 {group_id}）: {e}")
                 yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
                 return
-            yield event.plain_result(f"已清除本群 {key} 覆盖")
+            yield event.plain_result(f"已清除本群 {key} 指令覆盖；恢复使用 WebUI 按群配置或全局默认")
         else:
             # 整群清除同样走事务：保存失败要回滚，不能内存删了磁盘还在
             try:
@@ -2571,9 +2562,9 @@ class GroupAdminPlugin(Star):
                 yield event.plain_result("[错误] 保存失败，本次清除未生效，请稍后重试")
                 return
             if not cleared:
-                yield event.plain_result("本群未设置任何覆盖（全部使用全局默认）")
+                yield event.plain_result("本群没有通过指令写入的覆盖；WebUI 按群配置不受影响")
                 return
-            yield event.plain_result("已清除本群所有覆盖")
+            yield event.plain_result("已清除本群指令覆盖；恢复使用 WebUI 按群配置或全局默认")
 
     @filter.command("status", "查看插件配置")
     async def status_cmd(self, event: AstrMessageEvent):
@@ -2588,11 +2579,9 @@ class GroupAdminPlugin(Star):
             f"rank_top_n: {c.get('rank_top_n', 10)}",
         ]
         if group_id:
-            overrides = self._store.runtime_map("group_overrides").get(group_id, {})
             lines.extend([
                 f"本群 group_admin_admins: {', '.join(self._perms._effective_group_admin_admins(group_id)) or '空'}",
-                f"本群 mute_kick_threshold: {self._store.get_group_setting(group_id, 'mute_kick_threshold', 0)}"
-                f"{'（按群覆盖）' if 'mute_kick_threshold' in overrides else '（全局默认）'}",
+                f"本群 mute_kick_threshold: {self._store.get_group_setting(group_id, 'mute_kick_threshold', 0)}",
             ])
         yield event.plain_result("插件配置：\n" + "\n".join(lines))
 
@@ -2759,7 +2748,7 @@ class GroupAdminPlugin(Star):
         # 3) 关键词自动撤回（#46）
         # #260：只用「本次发送链的可见文本」判定——纯图片/表情包消息 bot_text 为空，
         # 直接返回，不会再用图片文件名/URL 等回退文本匹配关键词而被误撤回。
-        enabled = self._store.get_group_setting(group_id, "auto_recall_enabled_groups", [])
+        enabled = self._store.get_group_scope(group_id, "auto_recall_enabled_groups")
         keywords = self._store.get_group_setting(group_id, "auto_recall_keywords", [])
         # #192 owner 拍板：留空 = 全群启用（keywords 为空时本就无命中，不产生实际撤回）；
         # 按群覆盖 bool 可单群显式开/关；非空列表按 * / all / 群号判定

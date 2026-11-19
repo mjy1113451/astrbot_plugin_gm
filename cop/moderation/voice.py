@@ -4,8 +4,7 @@
     _recognize_audio_url
 
 依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
-- ConfigStore（L1）：config（voice_check_timeout / voice_check_provider_id /
-  voice_asr_endpoint / voice_asr_api_key / voice_asr_model）
+- ConfigStore（L1）：get_group_setting（voice_check_provider_id）/ config（ASR 兜底配置与超时）
 - context：AstrBot Context（取 provider_manager 作内置 STT 通路）
 
 延迟导入约束（必须保持函数内局部导入，不得提升为模块级）：
@@ -46,7 +45,7 @@ class VoiceModeration:
         if not audio_url:
             return ""
         timeout = max(5, int(self.config.get("voice_check_timeout", 15) or 15))
-        provider_id = str(self.config.get("voice_check_provider_id", "") or "").strip()
+        provider_id = str(self._store.get_group_setting(group_id, "voice_check_provider_id", "") or "").strip()
         # 1) AstrBot 内置 provider：优先用户指定 provider_id，否则用当前激活的 STT provider
         try:
             ctx = getattr(self, "context", None)

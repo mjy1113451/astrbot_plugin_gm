@@ -56,7 +56,11 @@ class StatsService:
             self._store.save_stats(self._runtime.stats)
             self._runtime._msg_save_counter = 0
 
-    def get_rank(self, group_id: str, top_n: int) -> list:
+    def get_rank(self, group_id: str) -> list:
+        try:
+            top_n = max(1, int(self._store.get_group_setting(group_id, "rank_top_n", 10)))
+        except (TypeError, ValueError):
+            top_n = 10
         groups = self._runtime.stats.get("groups", {})
         msgs = groups.get(str(group_id), {}).get("messages", {})
         ranked = sorted(msgs.items(), key=lambda kv: kv[1], reverse=True)
