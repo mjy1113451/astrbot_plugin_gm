@@ -221,7 +221,7 @@
 | 73 | `link_fetch_timeout` | int | `5` |
 | 74 | `group_overrides_templates` | template_list | `[]` |
 
-`group_overrides_templates` 的模板 ID 是 `group_config`，保存时每条带 `__template_key` 与字符串 `group_id`。群范围字段在模板里用 `inherit` / `on` / `off`，而顶层同名字段仍为默认群号列表。`group_admin_admins`、`mute_kick_threshold`、`banned_images`、`violation_keywords`、`welcome_enabled`、`welcome_message` 仅在群模板中提供；旧 `group_admin_admins_by_group` 在首次成功迁移后清空。
+`group_overrides_templates` 的模板 ID 是 `group_config`，保存时每条带 `__template_key` 与字符串 `group_id`。群范围取本群最后一条有效的 `inherit` / `on` / `off`；`""` 或缺键不覆盖前条。`inherit` 读取顶层同名群号列表并继续按原列表规则判断。`group_admin_admins`、`mute_kick_threshold`、`banned_images`、`violation_keywords`、`welcome_enabled`、`welcome_message` 仅在群模板中提供；旧 `group_admin_admins_by_group` 在首次成功迁移后清空。
 
 ## 4. 数据文件路径与 data_dir 推导
 

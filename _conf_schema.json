@@ -559,7 +559,7 @@
     "group_overrides_templates": {
         "description": "按群配置（模板列表）",
         "type": "template_list",
-        "hint": "填写群号后仅修改本群需要调整的项目。读取优先级：群内指令 > 按群配置 > 全局默认。字段保留模板默认值时继承全局；若要强制使用默认值（如空名单），请填写「显式覆盖字段」。同群的多条记录仅合并实际覆盖的字段。",
+        "hint": "填写群号后仅修改本群需要调整的项目。读取优先级：群内指令 > 按群配置 > 全局默认。普通字段保留默认值时继承全局，可用「显式覆盖字段」强制使用默认值。同群多条记录的两个群范围以最后一个有效选择为准，其他字段只合并实际覆盖的值。",
         "default": [],
         "templates": {
             "group_config": {
@@ -582,18 +582,18 @@
                     "enabled_groups": {
                         "description": "本群违规检测与加群自动审核范围",
                         "type": "string",
-                        "options": ["inherit", "on", "off"],
-                        "labels": ["继承全局范围", "启用", "停用"],
+                        "options": ["", "inherit", "on", "off"],
+                        "labels": ["未设置（不覆盖前一条）", "继承全局范围", "启用", "停用"],
                         "hint": "仅影响本群。不会关闭加群通知、手动审核或黑名单拒绝。",
-                        "default": "inherit"
+                        "default": ""
                     },
                     "auto_recall_enabled_groups": {
                         "description": "本群 Bot 发言关键词自动撤回",
                         "type": "string",
-                        "options": ["inherit", "on", "off"],
-                        "labels": ["继承全局范围", "启用", "停用"],
+                        "options": ["", "inherit", "on", "off"],
+                        "labels": ["未设置（不覆盖前一条）", "继承全局范围", "启用", "停用"],
                         "hint": "开启后仍须命中关键词才会撤回。",
-                        "default": "inherit"
+                        "default": ""
                     },
                     "group_admin_admins": {
                         "description": "可设置/取消群管理的专项管理员 QQ 列表",

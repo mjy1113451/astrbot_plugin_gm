@@ -38,6 +38,28 @@ class GroupTemplateConsumerTests(unittest.IsolatedAsyncioTestCase):
         store.set_group_override("100", "enabled_groups", True)
         self.assertTrue(service._is_group_monitoring_enabled("100"))
 
+    async def test_explicit_inherit_uses_original_moderation_group_rules(self):
+        config = _Config(
+            group_overrides_templates=[
+                _template_entry("100", enabled_groups="off"),
+                _template_entry("100", enabled_groups="inherit"),
+            ],
+        )
+        store = make_store(self, config)
+        service = ModerationService(
+            config_store=store, onebot_api=None, stats=None, permissions=None,
+            message_parse=None, runtime=None, text_moderation=None,
+            image_moderation=None, voice_moderation=None,
+        )
+        for group_range, legacy, expected in (
+            (["200"], [], False), (["100"], [], True), (["ALL"], [], True),
+            ([], [], True), ([], ["200"], False), ([], ["100"], True),
+        ):
+            with self.subTest(group_range=group_range, legacy=legacy):
+                config["enabled_groups"] = group_range
+                config["violation_enabled_groups"] = legacy
+                self.assertIs(service._is_group_monitoring_enabled("100"), expected)
+
     async def test_history_and_ranking_use_the_configured_group_limits(self):
         store = make_store(self, _Config(
             max_message_history=5, rank_top_n=3,
