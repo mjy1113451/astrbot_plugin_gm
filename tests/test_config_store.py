@@ -424,18 +424,16 @@ class GroupOverrideTests(unittest.TestCase):
         json_store = _JsonStore()
         store = self.make_store(config, json_store=json_store)
         self.assertEqual(json_store.saves, 1)
-        self.assertEqual(config.saves, 2)
+        self.assertEqual(config.saves, 3)
         first = config.save_snapshots[0]
         self.assertEqual(first["group_admin_admins_by_group"]["600"], ["10009"])
-        self.assertEqual(first["group_overrides_templates"], config["group_overrides_templates"])
         self.assertEqual(config.disk_before_saves[1], first)
         self.assertEqual(config["group_admin_admins_by_group"], {})
-        self.assertEqual(len(config["group_overrides_templates"]), 7)
+        self.assertEqual(config["group_overrides_templates"], [])
+        self.assertEqual(len(config["group_admin_admins_group_overrides"]), 6)
         self.assertEqual(json.loads(config.config_path.read_bytes()), config)
-        self.assertEqual(sum(row["group_id"] == "100" for row in config["group_overrides_templates"]), 2)
-        self.assertEqual(store._template_group_entry("100")["enabled_groups"], "inherit")
+        self.assertEqual(store.get_group_scope("100", "enabled_groups"), [])
         self.assertIs(store.get_group_scope("100", "auto_recall_enabled_groups"), True)
-        self.assertTrue(all(row["__template_key"] == "group_config" for row in config["group_overrides_templates"]))
         self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001", "10002"])
         self.assertFalse(store.get_group_setting("100", "mute_notice"))
         self.assertCountEqual(store.get_group_override_list("200", "group_admin_admins"), ["10003", "10004"])
@@ -444,8 +442,8 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertEqual(store.get_group_override_list("500", "group_admin_admins"), [])
         self.assertEqual(store.get_group_override_list("600", "group_admin_admins"), ["10009"])
         self.make_store(config)
-        self.assertEqual(config.saves, 2)
-        self.assertEqual(len(config["group_overrides_templates"]), 7)
+        self.assertEqual(config.saves, 3)
+        self.assertEqual(config["group_overrides_templates"], [])
 
     def test_admin_migration_preserves_legacy_when_template_has_no_effective_list(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -468,8 +466,8 @@ class GroupOverrideTests(unittest.TestCase):
                 store = self.make_store(config)
                 saved = json.loads(path.read_bytes())
                 self.assertEqual(saved["group_admin_admins_by_group"], {})
-                self.assertEqual(len(saved["group_overrides_templates"]), 1)
-                self.assertEqual(saved["group_overrides_templates"][0][key], ["10001"])
+                self.assertEqual(saved["group_overrides_templates"], [])
+                self.assertEqual(saved[f"{key}_group_overrides"][0]["value"], ["10001"])
                 self.assertEqual(store.get_group_override_list("100", key), ["10001"])
                 self.assertFalse(store.get_group_setting("100", "mute_notice"))
 
@@ -575,9 +573,10 @@ class GroupOverrideTests(unittest.TestCase):
                 self.assertEqual(json.loads(path.read_bytes()), config)
                 self.assertEqual(store.get_group_override_list("100", key), ["10001"])
                 self.make_store(config)
-                self.assertEqual(config.saves, 3)
+                self.assertEqual(config.saves, 4)
                 self.assertEqual(config["group_admin_admins_by_group"], {})
-                self.assertEqual(len(config["group_overrides_templates"]), 1)
+                self.assertEqual(config["group_overrides_templates"], [])
+                self.assertEqual(len(config[f"{key}_group_overrides"]), 1)
                 self.assertEqual(json.loads(path.read_bytes()), config)
 
     def test_admin_cleanup_continues_if_restore_raises_after_restoring_file(self):
@@ -1340,7 +1339,23 @@ class GroupOverrideTests(unittest.TestCase):
             "voice_asr_endpoint", "voice_asr_api_key", "voice_asr_model", "voice_check_timeout",
             "group_overrides_templates",
         }
-        shared = schema.keys() - global_only - dedicated_defaults.keys()
+        suffix = "_group_overrides"
+        lists = {key.removesuffix(suffix): spec for key, spec in schema.items() if key.endswith(suffix)}
+        self.assertTrue(template_list["invisible"])
+        self.assertEqual(lists.keys(), items.keys() - {"group_id", "explicit_override_fields"})
+        ordered_keys = list(schema)
+        for key, spec in lists.items():
+            with self.subTest(setting=key):
+                self.assertEqual(spec["type"], "template_list")
+                self.assertEqual(spec["default"], [])
+                row = spec["templates"]["group"]
+                self.assertEqual(row["display_item"], "group_id")
+                self.assertEqual(row["items"].keys(), {"group_id", "value"})
+                self.assertEqual(row["items"]["group_id"]["type"], "string")
+                self.assertEqual(row["items"]["value"]["type"], items[key]["type"])
+                if key in schema:
+                    self.assertEqual(ordered_keys[ordered_keys.index(key) + 1], key + suffix)
+        shared = schema.keys() - global_only - dedicated_defaults.keys() - {key + suffix for key in lists}
         self.assertEqual(set(items), shared | dedicated_defaults.keys() | {"group_id", "explicit_override_fields"})
         for key in shared:
             with self.subTest(field=key):
@@ -1351,6 +1366,89 @@ class GroupOverrideTests(unittest.TestCase):
                 self.assertEqual(items[key]["default"], default)
                 if key in ("enabled_groups", "auto_recall_enabled_groups"):
                     self.assertEqual(items[key]["options"], ["", "inherit", "on", "off"])
+
+    def test_per_setting_templates_keep_explicit_values_and_command_precedence(self):
+        def row(value, gid="100"):
+            return {"__template_key": "group", "group_id": gid, "value": value}
+
+        config = _Config(
+            rank_top_n=10, mute_notice=True, mute_kick_threshold=5,
+            whitelist_users=["10001"], profanity_ban_duration_severity={"mild": 180},
+            rank_top_n_group_overrides=[row(20), row(5, "200"), row(30), row(True)],
+            mute_notice_group_overrides=[row(False)],
+            mute_kick_threshold_group_overrides=[row(0)],
+            whitelist_users_group_overrides=[row([])],
+            profanity_ban_duration_severity_group_overrides=[row({})],
+            group_admin_admins_group_overrides=[row(["10001"]), row([]), row([" "])],
+            voice_check_provider_id="global", voice_check_provider_id_group_overrides=[row("")],
+        )
+        store = self.make_store(config)
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 30)
+        self.assertEqual(store.get_group_setting("200", "rank_top_n"), 5)
+        self.assertEqual(store.get_group_setting("300", "rank_top_n"), 10)
+        for key, value in {"mute_notice": False, "mute_kick_threshold": 0, "whitelist_users": [],
+                           "profanity_ban_duration_severity": {}, "voice_check_provider_id": "",
+                           "group_admin_admins": []}.items():
+            self.assertEqual(store.get_group_setting("100", key), value)
+            self.assertIn(key, store.group_override_keys("100"))
+        store.set_group_override("100", "rank_top_n", 12)
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 12)
+        store.drop_group_override("100", "rank_top_n")
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 30)
+        store.mutate_group_list("100", "whitelist_users", "add", "10002")
+        config["whitelist_users_group_overrides"] = [row(["10003"])]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["10003", "10002"])
+
+    def test_migrate_per_setting_templates_and_delete_without_reviving_legacy(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        config = _MigrationConfig(
+            path, rank_top_n=8, mute_notice=False, enabled_groups=["200"],
+            group_overrides_templates=[
+                _template_entry("100", rank_top_n=20, mute_notice=True, enabled_groups="off",
+                                whitelist_users=[], explicit_override_fields="whitelist_users"),
+                _template_entry("100", rank_top_n=10, enabled_groups="inherit"),
+                _template_entry("200", rank_top_n=25, mute_notice=True),
+            ],
+            rank_top_n_group_overrides=[{"__template_key": "group", "group_id": "200", "value": 5}],
+        )
+        store = self.make_store(config)
+        self.assertEqual(config["group_overrides_templates"], [])
+        self.assertEqual(config, json.loads(path.read_bytes()))
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 20)
+        self.assertEqual(store.get_group_setting("200", "rank_top_n"), 5)
+        self.assertIs(store.get_group_setting("100", "mute_notice"), False)
+        self.assertNotIn("mute_notice_group_overrides", config)
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), [])
+        self.assertEqual(store.get_group_scope("100", "enabled_groups"), ["200"])
+        config["rank_top_n_group_overrides"] = []
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 8)
+        self.assertEqual(store.get_group_setting("200", "rank_top_n"), 8)
+        self.make_store(config)
+        self.assertEqual(config.saves, 1)
+
+    def test_per_setting_migration_restores_original_on_failed_save(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        for failure in ("silent", "partial"):
+            with self.subTest(failure=failure):
+                config = _MigrationConfig(path, rank_top_n=8,
+                                          group_overrides_templates=[_template_entry("100", rank_top_n=20)])
+                original = path.read_bytes()
+                before = copy.deepcopy(dict(config))
+
+                def fail_save():
+                    if failure == "partial":
+                        path.write_bytes(b"{broken")
+                        raise OSError("save failed")
+
+                with patch.object(config, "save_config", side_effect=fail_save):
+                    store = self.make_store(config)
+                self.assertEqual(config, before)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(store.get_group_setting("100", "rank_top_n"), 20)
 
     def test_webui_row_defaults_do_not_override_existing_config(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))

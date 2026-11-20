@@ -141,7 +141,7 @@
 - `after_message_sent`
 
 
-**顶层配置键总数：74**（包含一个仅用于升级迁移的隐藏键）。
+**顶层配置键总数：137**（下表列出 74 个基础及兼容键，另有 63 个独立按群列表）。
 
 
 | # | key | type | default |
@@ -219,9 +219,9 @@
 | 71 | `link_safety_ban_duration` | int | `600` |
 | 72 | `link_safety_keywords` | list | 预填黄赌毒常见词 |
 | 73 | `link_fetch_timeout` | int | `5` |
-| 74 | `group_overrides_templates` | template_list | `[]` |
+| 74 | `group_overrides_templates`（隐藏，兼容旧配置） | template_list | `[]` |
 
-`group_overrides_templates` 的模板 ID 是 `group_config`，保存时每条带 `__template_key` 与字符串 `group_id`。群范围取本群最后一条有效的 `inherit` / `on` / `off`；`""` 或缺键不覆盖前条。`inherit` 读取顶层同名群号列表并继续按原列表规则判断。`group_admin_admins`、`mute_kick_threshold`、`banned_images`、`violation_keywords`、`welcome_enabled`、`welcome_message` 仅在群模板中提供；旧 `group_admin_admins_by_group` 在首次成功迁移后清空。
+WebUI 各项的 `<字段名>_group_overrides` 为独立 `template_list`，默认空列表。每条为 `{"__template_key": "group", "group_id": "123456789", "value": ...}`。`value` 使用对应设置的类型；两个范围项使用 `inherit` / `on` / `off`。同群同设置最后一条有效记录优先，群内指令仍高于 WebUI。`group_overrides_templates` 仅为隐藏的升级兼容键，迁移成功后清空。
 
 ## 4. 数据文件路径与 data_dir 推导
 
