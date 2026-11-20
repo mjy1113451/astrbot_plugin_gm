@@ -104,20 +104,12 @@ class DupFaceService:
         onebot_api: "OneBotApi",
     ):
         self._store = config_store
-        self.config = config_store.config
         self._runtime = runtime
         self._api = onebot_api
 
     def _dup_face_enabled(self, group_id: str) -> bool:
-        """#196：重复表情包撤回是否启用（按群 bool 覆盖 > 全局开关）。"""
-        ov = (
-            self._store.runtime_map("group_overrides")
-            .get(str(group_id), {})
-            .get("dup_face_recall_enabled")
-        )
-        if isinstance(ov, bool):
-            return ov
-        return bool(self.config.get("dup_face_recall_enabled", False))
+        """#196：重复表情包撤回是否启用。"""
+        return bool(self._store.get_group_setting(group_id, "dup_face_recall_enabled", False))
 
     async def _dup_face_recall_check(self, event: AstrMessageEvent, raw: dict, group_id: str) -> None:
         """#196：检测群内重复表情包（face id / 图片指纹），命中则撤回新消息。
@@ -352,7 +344,7 @@ class ColloquialService:
                     event, group_id, target,
                     max(1, min(int(self._store.get_group_setting(group_id, "kick_recall_count", 10) or 10), 50)))
             ok = await self._api._kick_member(event, group_id, target)
-            if ok and self.config.get("reject_re_add", False):
+            if ok and self._store.get_group_setting(group_id, "reject_re_add", False):
                 await self._api._execute_action(event, "reject_add", group_id=group_id, user_id=target)
             msg = f"已踢出 {target}" if ok else f"踢出 {target} 失败（请确认 bot 有管理员权限，且对方不是群主）"
             if recalled:

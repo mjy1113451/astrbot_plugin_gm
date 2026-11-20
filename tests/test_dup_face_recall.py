@@ -58,6 +58,7 @@ def _install_astrbot_stubs():
 _install_astrbot_stubs()
 
 from cop.conversational import DupFaceService  # noqa: E402
+from test_config_store import _Config, _template_entry, make_store  # noqa: E402
 
 
 _HASH_A = "0123456789abcdef0123456789abcdef"
@@ -68,14 +69,14 @@ _OTHER = 10002
 
 
 class _FakeStore:
-    """ConfigStore 桩件：只提供 config 与 runtime_map。"""
+    """ConfigStore 桩件：读取运行时覆盖和全局默认值。"""
 
     def __init__(self, enabled=True):
         self.config = {"dup_face_recall_enabled": enabled}
         self._maps = {"group_overrides": {}}
 
-    def runtime_map(self, key):
-        return self._maps.setdefault(key, {})
+    def get_group_setting(self, group_id, key, default=None):
+        return self._maps["group_overrides"].get(group_id, {}).get(key, self.config.get(key, default))
 
 
 class _FakeApi:
@@ -107,8 +108,8 @@ def _text_seg(text="嗯"):
 class _DupFaceHarness:
     """按群消息时间线依次喂消息，返回每条消息的 message_id。"""
 
-    def __init__(self, enabled=True, fail=False):
-        self.store = _FakeStore(enabled)
+    def __init__(self, enabled=True, fail=False, store=None):
+        self.store = store if store is not None else _FakeStore(enabled)
         self.api = _FakeApi(fail)
         self.runtime = SimpleNamespace(
             _dup_face_seen={},
@@ -147,6 +148,17 @@ class _DupFaceHarness:
 class DupFaceAdjacencyTests(unittest.TestCase):
     def test_back_to_back_same_image_is_recalled(self):
         case = _DupFaceHarness()
+        case.send([_image_seg(_HASH_A)])
+        second = case.send([_image_seg(_HASH_A)])
+        self.assertEqual(case.api.recalled, [str(second)])
+
+    def test_webui_switch_only_recalls_in_the_configured_group(self):
+        store = make_store(self, _Config(group_overrides_templates=[
+            _template_entry(_GROUP, dup_face_recall_enabled=True),
+        ]))
+        case = _DupFaceHarness(store=store)
+        case.send([_image_seg(_HASH_A)], group_id="234567")
+        case.send([_image_seg(_HASH_A)], group_id="234567")
         case.send([_image_seg(_HASH_A)])
         second = case.send([_image_seg(_HASH_A)])
         self.assertEqual(case.api.recalled, [str(second)])

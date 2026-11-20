@@ -6,7 +6,7 @@
 设计说明：
 - 通过构造注入 JsonStore（L4 门面负责组装），避免 L1 内部同层互相 import。
 - 可依赖 L0：从 constants 取 _RUNTIME_MAP_KEYS，从 text_utils 取 _parse_qq_list。
-- 原 main.py 中的方法体逻辑逐字保留（含异常兜底、注释语义），仅参数名从 self.xxx 改为存储字段。
+- 框架配置负责 WebUI 模板，运行时文件保存群内指令写入的覆盖，两者分开管理。
 """
 
 import copy
@@ -30,6 +30,9 @@ class ConfigRollbackError(RuntimeError):
 
 class ConfigStore:
     """无状态（相对于插件类）的配置/运行时映射存储。"""
+
+    _GROUP_SCOPE_FIELDS = {"enabled_groups", "auto_recall_enabled_groups"}
+    _GROUP_SCOPE_STATES = ("inherit", "on", "off")
 
     def __init__(
         self,
@@ -56,13 +59,7 @@ class ConfigStore:
         # PR #290：WebUI 按群配置模板（template_list）的字段默认值缓存，
         # 用于区分"字段未动（回退全局）"与"显式覆盖"。
         self._template_field_defaults = self._load_template_field_defaults()
-        # 本次保存事务里由插件显式改写的全局配置键：回滚时只删这些键，
-        # 不做"当前键集合 − 快照"的差集删除（PR #289 审查：overbroad-memory-rollback）。
-        self._touched_keys: tuple = ()
-        # set_global_setting 登记的单键写前值：save_config 的快照是在改动之后
-        # 才拍的，靠它才能把回滚目标修正回真正的写前状态
-        # （PR #289 审查：double-rollback-corruption）。
-        self._touched_prev: dict = {}
+        self._migrate_group_admin_admins()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -137,7 +134,131 @@ class ConfigStore:
             self._runtime_maps[key] = value
         return value
 
-    def save_config(self) -> None:
+    def _migrate_group_admin_admins(self) -> None:
+        """把旧 WebUI 名单移入模板，不改动运行时配置文件。"""
+        legacy_key = "group_admin_admins_by_group"
+        template_key = "group_overrides_templates"
+        admin_key = "group_admin_admins"
+        if not isinstance(self.config, Mapping) or admin_key not in self._template_field_defaults:
+            return
+        with self._lock:
+            legacy = self.config.get(legacy_key)
+            if not isinstance(legacy, dict) or not legacy:
+                return
+            before = self._config_snapshot()
+            file_before = self._snapshot_framework_file()
+            if before is None or file_before is None:
+                logger.warning("[群管插件] 无法备份旧配置，跳过专项管理员迁移并保留旧名单")
+                return
+            entries = before.get(template_key, [])
+            if not isinstance(entries, list) or any(not isinstance(row, dict) for row in entries):
+                logger.warning("[群管插件] 按群配置格式不正确，保留旧版专项管理员名单")
+                return
+            candidate = copy.deepcopy(entries)
+            expected_admins = {}
+            for group_id, raw in before[legacy_key].items():
+                gid = str(group_id)
+                admins = self.normalize_qq_list_value(raw)
+                if not admins:
+                    continue
+                if not gid.isascii() or not gid.isdecimal() or not all(
+                    qq.isascii() and qq.isdecimal() for qq in admins
+                ):
+                    logger.warning("[群管插件] 旧专项管理员名单包含无效群号或 QQ 号，跳过迁移并保留旧名单")
+                    return
+                template_admins = self._get_template_group_admins(gid, entries=entries)
+                if template_admins is not None:
+                    expected_admins[gid] = template_admins
+                    continue
+                expected_admins[gid] = admins
+                for row in reversed(candidate):
+                    if self._matches_group_template(row, gid):
+                        row.setdefault("__template_key", "group_config")
+                        row[admin_key] = admins
+                        break
+                else:
+                    candidate.append({
+                        "__template_key": "group_config",
+                        "group_id": gid,
+                        admin_key: admins,
+                    })
+            try:
+                expected = json.loads(json.dumps({**before, template_key: candidate}, allow_nan=False))
+            except (TypeError, ValueError) as exc:
+                logger.warning(f"[群管插件] 专项管理员迁移数据无法保存，保留旧名单: {exc}")
+                return
+            path = file_before[0]
+            touched = (template_key, legacy_key)
+            try:
+                if candidate != entries:
+                    self.config[template_key] = candidate
+                    self.config.save_config()
+                verified_bytes = self._read_verified_migration_config(path, expected)
+                saved = json.loads(verified_bytes)
+                for gid, admins in expected_admins.items():
+                    if self._get_template_group_admins(gid, entries=saved.get(template_key, [])) != admins:
+                        raise ValueError(f"群 {gid} 的专项管理员名单未在新模板生效")
+            except Exception as exc:
+                rollback_failure = self._rollback_group_admin_migration(before, file_before, touched)
+                if rollback_failure is not None:
+                    message = f"专项管理员迁移失败且无法确认回滚，已停止加载插件: {rollback_failure}"
+                    logger.error(f"[群管插件] {message}")
+                    raise ConfigRollbackError(message) from exc
+                logger.warning(f"[群管插件] 专项管理员迁移失败，已恢复旧名单与模板并继续加载: {exc}")
+                return
+
+            # 只有确认模板能独立提供名单后，才清理旧键。
+            try:
+                self.config[legacy_key] = {}
+                self.config.save_config()
+                self._read_verified_migration_config(path, {**saved, legacy_key: {}})
+            except Exception as exc:
+                rollback_failure = self._rollback_group_admin_migration(saved, (path, verified_bytes), touched)
+                if rollback_failure is not None:
+                    message = f"清理旧专项管理员名单失败且无法确认回滚，已停止加载插件: {rollback_failure}"
+                    logger.error(f"[群管插件] {message}")
+                    raise ConfigRollbackError(message) from exc
+                logger.warning(f"[群管插件] 清理旧专项管理员名单失败，回滚已验证，保留模板和旧名单并继续加载: {exc}")
+
+    def _read_verified_migration_config(self, path: Path, expected: dict) -> bytes:
+        data = path.read_bytes()
+        if json.loads(data) != expected or dict(self.config) != expected:
+            raise OSError("保存后读取的专项管理员配置与迁移结果不一致")
+        return data
+
+    def _rollback_group_admin_migration(
+        self, before: dict, file_before: tuple[Path, bytes], touched: tuple[str, ...]
+    ) -> str | None:
+        """尝试恢复内存和磁盘；仅在无法验证快照时返回失败原因。"""
+        path, data = file_before
+        restore_failures = []
+        for restore, args in (
+            (self._restore_framework_config, (before, touched)),
+            (self._restore_framework_file, (file_before,)),
+        ):
+            try:
+                failure = restore(*args)
+            except Exception as exc:
+                failure = exc
+            if failure is not None:
+                restore_failures.append(str(failure))
+
+        verification_failures = []
+        try:
+            if dict(self.config) != before:
+                verification_failures.append("内存配置与快照不一致")
+        except Exception as exc:
+            verification_failures.append(f"无法核对内存配置: {exc}")
+        try:
+            if path.read_bytes() != data:
+                verification_failures.append("磁盘配置与快照不一致")
+        except Exception as exc:
+            verification_failures.append(f"无法核对磁盘配置: {exc}")
+        if verification_failures:
+            return "；".join(verification_failures + restore_failures)
+        return None
+
+    def save_config(self, *, global_updates: dict | None = None) -> None:
         """保存配置（两个存储目标，缺一不可）。
 
         - 运行时动态映射（group_overrides / groups / pending_join_requests）→ runtime.json，
@@ -173,38 +294,32 @@ class ConfigStore:
             # 其它 OSError 直接抛出：连备份都读不到就无法在失败时恢复，宁可这次
             # 不写，也不能在之后的回滚里删掉一个原本存在的文件
             # （PR #289 审查：incorrect-rollback-deletion）。
-            missing = object()
             try:
-                prev_runtime = self.runtime_path.read_text(encoding="utf-8")
+                prev_runtime = self.runtime_path.read_bytes()
             except FileNotFoundError:
-                prev_runtime = missing
+                prev_runtime = None
             # 框架配置对象也拍一份快照：save_config() 失败时进程内可能已经改了
             # 值，只恢复 runtime.json 会留下"内存是新的、磁盘是旧的"
             # （PR #289 审查：incomplete-persistence-rollback）。
             prev_global = self._config_snapshot()
+            if global_updates and prev_global is None:
+                raise TypeError("无法安全备份并更新框架配置")
             prev_global_file = self._snapshot_framework_file()
-            touched_keys = tuple(self._touched_keys)
-            touched_prev = dict(self._touched_prev)
-            # 这一步失败不需要回滚：JsonStore 用临时文件 + os.replace 原子写，
-            # 失败时磁盘上仍是写前内容，且框架配置此时还没开始写，没有第二个
-            # 目标需要恢复，因此直接向上抛出即可
-            # （PR #289 审查：transaction-boundary）。
+            # 运行时文件原子写失败时，框架配置尚未修改，不需要回滚。
             self.save_json(self.runtime_path, self._runtime_maps, strict=True)
             try:
+                for key, value in (global_updates or {}).items():
+                    self.config[key] = value
                 self.config.save_config()
             except Exception as exc:
-                failure = self._restore_framework_config(
-                    prev_global, touched_keys, touched_prev)
-                self._touched_keys = ()
-                self._touched_prev = {}
-                failure = failure or self._restore_framework_file(prev_global_file)
+                failure = self._restore_framework_config(prev_global, global_updates)
+                file_failure = self._restore_framework_file(prev_global_file)
+                failure = failure or file_failure
                 try:
-                    if prev_runtime is missing:
+                    if prev_runtime is None:
                         self.runtime_path.unlink(missing_ok=True)
                     else:
-                        # 原子写回：临时文件 + os.replace，避免恢复过程中断电/异常
-                        # 把备份内容再写坏一半
-                        self._atomic_write_text(self.runtime_path, prev_runtime)
+                        self._atomic_write_bytes(self.runtime_path, prev_runtime)
                 except OSError as e:
                     logger.error(
                         f"[群管插件] 保存框架配置失败后回滚 runtime.json 也失败，"
@@ -216,43 +331,10 @@ class ConfigStore:
                         f"当前进程的配置可能不可信，请重启插件或到 WebUI 核对后重试"
                     ) from exc
                 raise
-            else:
-                self._touched_keys = ()
-                self._touched_prev = {}
 
     def set_global_setting(self, key: str, value) -> None:
-        """写入单个全局配置项并持久化；保存失败时由 save_config 统一回滚。
-
-        命令层直接 `self.config[key] = value` 再 save 的话，落盘失败后进程内会
-        留下未落盘的新值；这里把"改了哪个键"及其写前值显式登记下来交给
-        save_config——因为 save_config 的快照是在本次改动**之后**才拍的，
-        自己拿不到旧值。
-
-        回滚只发生在 save_config 里，这里不再二次写值：两层各改一遍很容易把
-        已恢复的旧值又覆盖成新值（PR #289 审查：double-rollback-corruption）。
-        """
-        with self._lock:
-            # 按 Mapping 协议而不是 isinstance(dict) 判定：UserDict 等非 dict
-            # 映射同样要能写入并建立快照；不支持 Mapping 的对象直接抛错，
-            # 不能"既不写也不报错"让调用方以为已保存
-            # （PR #289 审查：unsupported-config-type）。
-            if not isinstance(self.config, Mapping):
-                raise TypeError(
-                    f"配置对象类型 {type(self.config).__name__} 不支持 Mapping 协议，"
-                    "无法安全写入并回滚")
-            snapshot = self._config_snapshot()
-            if snapshot is not None and key in snapshot:
-                self._touched_prev = {key: (copy.deepcopy(snapshot[key]), True)}
-            else:
-                self._touched_prev = {key: (None, False)}
-            self._touched_keys = (key,)
-            try:
-                self.config[key] = value
-                self.save_config()
-            except Exception:
-                self._touched_keys = ()
-                self._touched_prev = {}
-                raise
+        """写入单个全局配置项并持久化；保存失败时由 save_config 统一回滚。"""
+        self.save_config(global_updates={key: value})
 
     def _config_snapshot(self):
         """按 Mapping 协议取框架配置的全量键值快照；不支持时返回 None。"""
@@ -266,59 +348,40 @@ class ConfigStore:
             return None
 
     def _snapshot_framework_file(self):
-        """备份框架配置文件原文（拿不到路径或读不到内容时返回 None）。"""
-        path = getattr(self.config, "config_path", None)
-        if not path:
-            return None
+        """备份框架配置文件的原始字节（拿不到路径或读不到时返回 None）。"""
         try:
+            path = getattr(self.config, "config_path", None)
+            if not path:
+                return None
             path = Path(path)
-            return path, path.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning(f"[群管插件] 备份框架配置文件失败，回滚时无法恢复磁盘内容: {e}")
+            return path, path.read_bytes()
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning(f"[群管插件] 无法备份框架配置文件: {exc}")
             return None
 
     def _restore_framework_file(self, snapshot):
-        """把框架配置文件恢复成写前原文；返回恢复失败的异常，全部成功返回 None。"""
-        if not snapshot:
+        """恢复框架配置文件原始字节；返回恢复失败的异常，成功返回 None。"""
+        if snapshot is None:
             return None
-        path, text = snapshot
+        path, original = snapshot
         try:
-            if not path.exists() or path.read_text(encoding="utf-8") != text:
-                self._atomic_write_text(path, text)
-        except OSError as e:
-            logger.error(f"[群管插件] 回滚框架配置文件失败: {e}")
-            return e
+            try:
+                current = path.read_bytes()
+            except OSError:
+                current = None
+            if current != original:
+                self._atomic_write_bytes(path, original)
+        except OSError as exc:
+            logger.error(f"[群管插件] 回滚框架配置文件失败: {exc}")
+            return exc
         return None
 
-    def _restore_framework_config(self, prev_global, touched=None, touched_prev=None):
-        """把框架配置对象恢复成写前快照；返回恢复失败的异常，全部成功返回 None。
-
-        只做两件安全的事：把目标快照里的键改回原值；把"本次通过
-        set_global_setting 显式登记、且写前并不存在"的键删掉。
-
-        新增键只删登记过的：快照是在调用方改动之后才拍的，所以出现在 new_keys
-        里的键必然是 **save_config() 执行过程中** 才多出来的——那是框架自己在
-        写盘前后注入的键（含 schema 声明过的辅助/内部键）。仅凭"在
-        _conf_schema.json 里有声明"就去删，会把框架刚注入的合法键删掉，反而
-        让进程内配置与磁盘不一致（PR #289 审查：overbroad-schema-rollback）。
-        业务层若绕过 set_global_setting 直接写配置，其写入发生在快照之前，
-        已随快照一起恢复，不需要靠删键兜底。
-
-        touched_prev 是 set_global_setting 记下的"这些键的写前值"：save_config
-        的快照是在调用方改完之后才拍的，必须用它把目标快照修正回真正的写前状态，
-        否则回滚会把新值当成旧值留下来（PR #289 审查：double-rollback-corruption）。
-        """
+    def _restore_framework_config(self, prev_global, touched=None):
+        """逐键恢复快照；新增键只删除本次由插件显式更新的键，不碰框架注入的键。"""
         if prev_global is None or not isinstance(self.config, Mapping):
             return None
-        target = dict(prev_global)
-        for key, info in (touched_prev or {}).items():
-            value, had_key = info
-            if had_key:
-                target[key] = value
-            else:
-                target.pop(key, None)
         failures = []
-        for key, value in target.items():
+        for key, value in prev_global.items():
             try:
                 if key in self.config and self.config[key] == value:
                     continue
@@ -329,7 +392,7 @@ class ConfigStore:
             except Exception as e:
                 failures.append(e)
         try:
-            new_keys = [k for k in self.config.keys() if k not in target]
+            new_keys = [k for k in self.config.keys() if k not in prev_global]
         except Exception:
             new_keys = []
         removable = [k for k in new_keys if k in (touched or ())]
@@ -348,14 +411,14 @@ class ConfigStore:
         return None
 
     @staticmethod
-    def _atomic_write_text(path: Path, text: str) -> None:
-        """原子写文本：同目录临时文件写完 fsync 后 os.replace。"""
+    def _atomic_write_bytes(path: Path, data: bytes) -> None:
+        """原子写入：同目录临时文件写完 fsync 后 os.replace。"""
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
@@ -442,7 +505,7 @@ class ConfigStore:
             logger.warning(
                 "[IMPORTANT][群管插件] enabled_groups 为空：按 #192 新语义，违规检测"
                 "（含刷屏/图片AI等）将在【全部群】启用。如需限定范围，请配置 "
-                "enabled_groups 列表，或通过 group_overrides 将指定群 enabled_groups 设为 false。"
+                "enabled_groups 列表，或在 WebUI 的按群配置中关闭指定群的违规检测。"
             )
         if not auto_recall_groups:
             logger.warning(
@@ -461,8 +524,7 @@ class ConfigStore:
            config-override-precedence-loss）；
         2. WebUI 按群配置模板（_conf_schema.json 的 group_overrides_templates，
            AstrBot template_list）：本群条目里该字段的值 ≠ 模板默认值时视为
-           显式覆盖——字段保持默认值意味着"未覆盖、回退全局"，这样管理员
-           只需要填写真正想改的字段，也不用担心模板默认值冻结全局配置；
+           显式覆盖；群范围例外，on/off/inherit 三态按最后一条有效值生效；
         3. 全局配置 / 默认值。
 
         默认值判定拿不到"字段是否被显式填写"的信息，所以模板条目里另有
@@ -472,6 +534,12 @@ class ConfigStore:
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if isinstance(overrides, dict) and key in overrides:
             value = overrides[key]
+            if key == "group_admin_admins":
+                admins = self.normalize_qq_list_value(value)
+                if admins or self._is_explicit_snapshot(group_id, key):
+                    return admins
+                # 老版本的空运行时名单从不遮盖 WebUI 名单。
+                return self._template_or_global_setting(group_id, key, [])
             if isinstance(value, list):
                 # 有增量操作时以最新模板/全局基线重算，否则按整体快照返回
                 if self._has_list_ops(group_id, key):
@@ -480,19 +548,37 @@ class ConfigStore:
             return value
         return self._template_or_global_setting(group_id, key, default)
 
+    def get_group_scope(self, group_id: str, key: str, *, allow_runtime_list: bool = True):
+        """群范围：保留旧运行时开关/名单；模板 on/off 转为布尔值，inherit 读取全局范围。"""
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        value = overrides.get(key) if isinstance(overrides, dict) else None
+        if isinstance(value, bool) or (allow_runtime_list and isinstance(value, list)):
+            return self.get_group_setting(group_id, key, [])
+        return self._template_or_global_setting(group_id, key, [])
+
     def _template_or_global_setting(self, group_id: str, key: str, default=None):
         """模板层 → 全局层 的配置值（不含运行时覆盖）。
 
         get_group_setting 与列表基线重算共用这一个入口，保证两条路径
         对"模板条目算不算覆盖"的判定完全一致。
         """
+        if key == "group_admin_admins":
+            template_admins = self._get_template_group_admins(group_id)
+            if template_admins is not None:
+                return template_admins
+            legacy = self.config.get("group_admin_admins_by_group")
+            if isinstance(legacy, dict):
+                return self.normalize_qq_list_value(legacy.get(str(group_id)))
+            return []
         entry = self._template_group_entry(group_id)
         if entry is not None and key in self._template_field_defaults:
-            default = self._template_field_defaults[key]
             if key in entry:
                 value = entry[key]
-                if value != default or self._is_explicit_override(entry, key):
+                if key not in self._GROUP_SCOPE_FIELDS:
                     return value
+                if value == "inherit":
+                    return self.config.get(key, default)
+                return value == "on"
             elif key in (entry.get("__present_fields__") or []):
                 # 条目里写过这个字段，但值仍等于模板默认值、也没写进显式覆盖字段
                 # → 按「未覆盖、回退全局」处理（PR #289 审查：template-default-fallback）。
@@ -506,6 +592,19 @@ class ConfigStore:
                     f"[群管插件] 群 {group_id} 的模板条目未填写 {key}，按未覆盖处理并回退全局配置"
                 )
         return self.config.get(key, default)
+
+    def group_override_keys(self, group_id: str) -> list:
+        """列出本群在模板或运行时实际覆盖的键，不返回存储层元数据。"""
+        entry = self._template_group_entry(group_id) or {}
+        keys = {
+            key: None for key, value in entry.items()
+            if key in self._template_field_defaults
+            and not (key in self._GROUP_SCOPE_FIELDS and value == "inherit")
+        }
+        overrides = self.runtime_map("group_overrides").get(str(group_id), {})
+        if isinstance(overrides, dict):
+            keys.update((key, None) for key in overrides if not key.startswith("__"))
+        return list(keys)
 
     # ===================== WebUI 按群配置模板（PR #290） =====================
 
@@ -534,20 +633,21 @@ class ConfigStore:
             logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
             return {}
 
-    def _template_group_entry(self, group_id: str):
-        """取本群在 WebUI 按群配置模板列表里的合并条目；无条目返回 None。
+    def _get_template_group_admins(self, group_id: str, *, entries=None) -> list | None:
+        """仅返回模板层名单：None 是未配置，显式空名单返回 []。"""
+        if "group_admin_admins" not in self._template_field_defaults:
+            return None
+        entry = self._template_group_entry(group_id, entries=entries) or {}
+        return entry.get("group_admin_admins")
 
-        template_list 保存后形如 [{"__template_key": "...", "group_id": "...", ...}]；
-        同一群号出现多条时按顺序合并，便于管理员拆多条配置同群的不同侧面。
-        合并只让"真正改过的字段"生效：后一条记录里仍是模板默认值的字段视为
-        未覆盖，保留前一条已配置的值，否则拆多条配置时后一条会把前一条的
-        设置整体抹回默认（PR #289 审查：template-merge-default-overwrite）。
-        """
-        entries = self.config.get("group_overrides_templates")
+    def _template_group_entry(self, group_id: str, *, entries=None):
+        """合并同群模板。普通字段忽略未声明的默认值；群范围保留最后一个有效状态。"""
+        if entries is None:
+            entries = self.config.get("group_overrides_templates")
         if not isinstance(entries, list):
             return None
         gid = str(group_id).strip()
-        if not gid:
+        if not gid.isascii() or not gid.isdecimal():
             return None
         defaults = self._template_field_defaults
         merged = None
@@ -557,9 +657,7 @@ class ConfigStore:
         # （PR #289 审查：template-explicit-override-lost）。
         meta_keys = ("__template_key", "group_id", "explicit_override_fields", "__present_fields__")
         for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("group_id", "")).strip() != gid:
+            if not self._matches_group_template(entry, gid):
                 continue
             if merged is None:
                 merged = {}
@@ -580,16 +678,25 @@ class ConfigStore:
                     # 多条记录的显式覆盖声明要累加，不能被后一条覆盖掉。
                     merged[k] = self._merge_explicit_fields(merged.get(k), v)
                     continue
-                if (
-                    k in defaults
-                    and v == defaults[k]
-                    and not self._is_explicit_override(entry, k)
-                ):
+                if k in self._GROUP_SCOPE_FIELDS:
+                    if v in self._GROUP_SCOPE_STATES:
+                        merged[k] = v
+                    continue
+                if k == "group_admin_admins":
+                    if isinstance(v, (list, str, int)):
+                        admins = [
+                            qq for qq in self.normalize_qq_list_value(v)
+                            if qq.isascii() and qq.isdecimal()
+                        ]
+                        if admins or (v == [] and k in declared):
+                            merged[k] = admins
+                    continue
+                if k in defaults and v == defaults[k] and k not in declared:
                     # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。
                     continue
                 merged[k] = v
             for name in declared:
-                if name in entry or name in meta_keys:
+                if name in entry or name in meta_keys or name in self._GROUP_SCOPE_FIELDS:
                     continue
                 # 声明了却没给值 → 前一条的值作废，回退全局配置
                 merged.pop(name, None)
@@ -609,6 +716,14 @@ class ConfigStore:
             # （PR #289 审查：template-default-fallback）。
             merged["__present_fields__"] = present_fields
         return merged
+
+    @staticmethod
+    def _matches_group_template(row, group_id: str) -> bool:
+        return (
+            isinstance(row, dict)
+            and row.get("__template_key", "group_config") == "group_config"
+            and str(row.get("group_id", "")).strip() == group_id
+        )
 
     @staticmethod
     def _explicit_field_names(raw) -> list:
@@ -632,14 +747,6 @@ class ConfigStore:
             if name not in merged:
                 merged.append(name)
         return merged
-
-    def _is_explicit_override(self, entry: dict, key: str) -> bool:
-        """模板条目是否显式声明要覆盖 key（即使填写值等于模板默认值）。
-
-        explicit_override_fields 支持列表或逗号/空格分隔的字符串两种写法，
-        用于"本群要用空列表清空全局名单"这类无法靠默认值比较表达的意图。
-        """
-        return key in self._explicit_field_names(entry.get("explicit_override_fields"))
 
     # ===================== 按群覆盖读写 =====================
 
@@ -920,6 +1027,8 @@ class ConfigStore:
         for_update 参数保留以兼容旧调用点，语义上不再需要"可写本体"。
         """
         with self._lock:
+            if key == "group_admin_admins":
+                return self.normalize_qq_list_value(self.get_group_setting(group_id, key, []))
             overrides = self.runtime_map("group_overrides").get(str(group_id), {})
             value = overrides.get(key) if isinstance(overrides, dict) else None
             if isinstance(value, list):
@@ -1018,7 +1127,7 @@ class ConfigStore:
                     pending.append(qq)
             if not pending:
                 return []
-            self._commit_list_change(group_id, key, add=pending)
+            self.set_group_override(group_id, key, current + pending)
             return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
@@ -1028,7 +1137,7 @@ class ConfigStore:
             pending = [qq for qq in (str(x) for x in qq_list) if qq and qq in current]
             if not pending:
                 return []
-            self._commit_list_change(group_id, key, remove=pending)
+            self.set_group_override(group_id, key, [qq for qq in current if qq not in pending])
             return pending
 
     def normalize_qq_list_value(self, value) -> list:

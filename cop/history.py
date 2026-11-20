@@ -49,6 +49,14 @@ class HistoryService:
 
     # ===================== 撤回消息历史（对齐 astrbot_plugin_batchrecall，修复 #117 #118 #122） =====================
 
+    def _history_limit(self, group_id: str) -> int:
+        fallback = self._runtime.max_history
+        value = self._store.get_group_setting(group_id, "max_message_history", fallback)
+        try:
+            return max(1, int(value or fallback))
+        except (TypeError, ValueError):
+            return fallback
+
     def _add_message_to_history(self, group_id: str, message_id, content: str,
                                 sender_id: str, sender_name: str, is_bot: bool = False,
                                 msg_time=None):
@@ -68,8 +76,7 @@ class HistoryService:
         self._runtime.message_history[key].insert(
             0, (msg_id, (content or "")[:100], int(msg_time), str(sender_id), sender_name or "未知", bool(is_bot))
         )
-        if len(self._runtime.message_history[key]) > self._runtime.max_history:
-            self._runtime.message_history[key] = self._runtime.message_history[key][: self._runtime.max_history]
+        del self._runtime.message_history[key][self._history_limit(key):]
 
     def _remove_message_from_history(self, group_id: str, message_id):
         """从历史中移除已撤回的消息。"""
@@ -107,7 +114,8 @@ class HistoryService:
         if not group_id:
             return
         try:
-            fetch_count = min(self._runtime.max_history * 2, 100)
+            limit = self._history_limit(group_id)
+            fetch_count = min(limit * 2, 100)
             result = await self._api._execute_action(
                 event, "get_group_msg_history", return_raw=True,
                 group_id=group_id, count=fetch_count,
@@ -123,7 +131,7 @@ class HistoryService:
 
             bot_self_id = self._api._get_self_id(event)
             history_list = []
-            for msg in history_messages[: self._runtime.max_history]:
+            for msg in history_messages[:limit]:
                 msg_id = msg.get("message_id")
                 if not msg_id:
                     continue
@@ -157,10 +165,11 @@ class HistoryService:
         if not hist:
             await self._load_history_from_api(event, group_id)
             hist = self._runtime.message_history.get(key, [])
-        if current_msg_id and hist:
+        snapshot = hist[:self._history_limit(key)]
+        if current_msg_id:
             cur = str(current_msg_id)
-            return [m for m in hist if m[0] != cur]
-        return list(hist)
+            return [m for m in snapshot if m[0] != cur]
+        return snapshot
 
     async def _recall_user_recent_msgs(self, event, group_id: str, user_id: str, count: int) -> int:
         """撤回某用户在群内最近 count 条消息（#145，对齐 zcj-ui/astrbot_plugin_group_guardian）。
@@ -176,7 +185,7 @@ class HistoryService:
             # 本地为空：尝试 OneBot API
             try:
                 history = await self._api._execute_action(event, "get_group_msg_history", return_raw=True,
-                                                          group_id=gid, count=min(self._runtime.max_history * 2, 100))
+                                                          group_id=gid, count=min(self._history_limit(gid) * 2, 100))
                 msgs = []
                 if isinstance(history, dict):
                     msgs = history.get("data", {}).get("messages") or history.get("messages") or []

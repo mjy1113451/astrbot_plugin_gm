@@ -18,10 +18,7 @@
 2. 踢人：kick_cmd 与口语化 kick 分支文案不同（批量成功/失败汇总 vs 单人
    "已踢出 {target}"），不得改文案，故不合并文案；如需共享流程须以 notify
    文案参数区分，本阶段暂不抽取，避免任何行为漂移。
-3. enabled_groups 判定：`_is_group_monitoring_enabled` 与 join_review/`on_group_event`
-   内实现**并非同构**（前者仅认 bool 覆盖、list 非空未命中即 False；后者经
-   get_group_setting 合并覆盖、list 覆盖也生效）。故本阶段不建 group_scope_enabled，
-   留待阶段 4 由 moderation / join_review 各自迁移时再评估。
+3. enabled_groups 判定统一读取模板开关，但只有加群审核兼容旧运行时列表覆盖。
 
 依赖（构造注入，L3 只依赖 L0/L1/L2，不 import 同层）：
 - MessageParser（L2）：_get_raw_message / _extract_at_qqs

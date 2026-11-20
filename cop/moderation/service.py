@@ -6,7 +6,7 @@
     _handle_violation / _moderation_dispatch
 
 依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
-- ConfigStore（L1）：config / get_group_setting / runtime_map
+- ConfigStore（L1）：config / get_group_setting / get_group_scope
 - OneBotApi（L2）：_recall_message / _mute_member / _send
 - StatsService（L3a）：_record_mute_and_maybe_kick / _record_violation
 - PermissionService（L2）：保留注入（对齐分层约定 / 后续复用）
@@ -66,19 +66,10 @@ class ModerationService:
     # ===================== 群违规检测开关 / 豁免 =====================
 
     def _is_group_monitoring_enabled(self, group_id: str) -> bool:
-        """群是否启用违规检测。
-        优先级
-        1. group_overrides[gid]["enabled_groups"] 为 bool 时，按 bool 决定
-        2. top-level enabled_groups 列表：包含 * / all 表示全部；包含群号表示启用；
-           非空但未命中表示不启用
-        3. 兼容旧 violation_enabled_groups 列表：非空时按旧列表判定（老用户行为不漂移）
-        4. #192 owner 拍板：两处均留空 = 全群启用
-        """
-        overrides = self._store.runtime_map("group_overrides").get(str(group_id), {})
-        v = overrides.get("enabled_groups")
-        if isinstance(v, bool):
-            return v
-        enabled = self.config.get("enabled_groups", []) or []
+        """群是否启用违规检测；旧运行时只接受布尔覆盖。"""
+        enabled = self._store.get_group_scope(group_id, "enabled_groups", allow_runtime_list=False)
+        if isinstance(enabled, bool):
+            return enabled
         if enabled:
             for x in enabled:
                 sx = str(x).lower()
