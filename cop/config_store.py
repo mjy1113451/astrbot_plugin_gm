@@ -138,7 +138,8 @@ class ConfigStore:
         """把旧 WebUI 名单移入模板，不改动运行时配置文件。"""
         legacy_key = "group_admin_admins_by_group"
         template_key = "group_overrides_templates"
-        if not isinstance(self.config, Mapping) or "group_admin_admins" not in self._template_field_defaults:
+        admin_key = "group_admin_admins"
+        if not isinstance(self.config, Mapping) or admin_key not in self._template_field_defaults:
             return
         with self._lock:
             legacy = self.config.get(legacy_key)
@@ -154,53 +155,79 @@ class ConfigStore:
                 logger.warning("[群管插件] 按群配置格式不正确，保留旧版专项管理员名单")
                 return
             candidate = copy.deepcopy(entries)
+            expected_admins = {}
             for group_id, raw in before[legacy_key].items():
                 gid = str(group_id)
                 admins = self.normalize_qq_list_value(raw)
                 if not admins:
                     continue
-                if not gid.isascii() or not gid.isdecimal():
-                    logger.warning("[群管插件] 旧专项管理员名单包含无效群号，跳过迁移并保留旧名单")
+                if not gid.isascii() or not gid.isdecimal() or not all(
+                    qq.isascii() and qq.isdecimal() for qq in admins
+                ):
+                    logger.warning("[群管插件] 旧专项管理员名单包含无效群号或 QQ 号，跳过迁移并保留旧名单")
                     return
-                entry = self._template_group_entry(gid, entries=entries) or {}
-                if "group_admin_admins" in entry:
+                template_admins = self._get_template_group_admins(gid, entries=entries)
+                if template_admins is not None:
+                    expected_admins[gid] = template_admins
                     continue
+                expected_admins[gid] = admins
                 for row in reversed(candidate):
                     if self._matches_group_template(row, gid):
                         row.setdefault("__template_key", "group_config")
-                        row["group_admin_admins"] = admins
+                        row[admin_key] = admins
                         break
                 else:
                     candidate.append({
                         "__template_key": "group_config",
                         "group_id": gid,
-                        "group_admin_admins": admins,
+                        admin_key: admins,
                     })
-            updates = {template_key: candidate, legacy_key: {}}
             try:
-                expected = json.loads(json.dumps({**before, **updates}, allow_nan=False))
+                expected = json.loads(json.dumps({**before, template_key: candidate}, allow_nan=False))
             except (TypeError, ValueError) as exc:
                 logger.warning(f"[群管插件] 专项管理员迁移数据无法保存，保留旧名单: {exc}")
                 return
-            # AstrBot 的保存接口从配置对象取快照，失败时必须验证内存与磁盘都已回滚。
+            path = file_before[0]
+            touched = (template_key, legacy_key)
             try:
-                for key, value in updates.items():
-                    self.config[key] = value
-                self.config.save_config()
-                saved = json.loads(file_before[0].read_bytes())
-                if saved != expected or dict(self.config) != expected:
-                    raise OSError("保存后读取的专项管理员配置与迁移结果不一致")
+                if candidate != entries:
+                    self.config[template_key] = candidate
+                    self.config.save_config()
+                verified_bytes = self._read_verified_migration_config(path, expected)
+                saved = json.loads(verified_bytes)
+                for gid, admins in expected_admins.items():
+                    if self._get_template_group_admins(gid, entries=saved.get(template_key, [])) != admins:
+                        raise ValueError(f"群 {gid} 的专项管理员名单未在新模板生效")
             except Exception as exc:
-                self._restore_framework_config(before, updates)
-                self._restore_framework_file(file_before)
-                try:
-                    memory_matches = dict(self.config) == before
-                    disk_matches = file_before[0].read_bytes() == file_before[1]
-                except Exception as rollback_error:
-                    raise ConfigRollbackError("无法确认专项管理员配置已回滚，已停止加载插件") from rollback_error
-                if not (memory_matches and disk_matches):
-                    raise ConfigRollbackError("专项管理员迁移回滚不完整，已停止加载插件") from exc
+                self._rollback_group_admin_migration(before, file_before, touched)
                 logger.warning(f"[群管插件] 专项管理员迁移失败，已恢复旧名单与模板: {exc}")
+                return
+
+            # 只有确认模板能独立提供名单后，才清理旧键；清理失败保留已验证的模板。
+            try:
+                self.config[legacy_key] = {}
+                self.config.save_config()
+                self._read_verified_migration_config(path, {**saved, legacy_key: {}})
+            except Exception as exc:
+                self._rollback_group_admin_migration(saved, (path, verified_bytes), touched)
+                logger.warning(f"[群管插件] 清理旧专项管理员名单失败，保留已验证的模板和旧名单: {exc}")
+
+    def _read_verified_migration_config(self, path: Path, expected: dict) -> bytes:
+        data = path.read_bytes()
+        if json.loads(data) != expected or dict(self.config) != expected:
+            raise OSError("保存后读取的专项管理员配置与迁移结果不一致")
+        return data
+
+    def _rollback_group_admin_migration(self, before: dict, file_before, touched) -> None:
+        self._restore_framework_config(before, touched)
+        self._restore_framework_file(file_before)
+        try:
+            memory_matches = dict(self.config) == before
+            disk_matches = file_before[0].read_bytes() == file_before[1]
+        except Exception as exc:
+            raise ConfigRollbackError("无法确认专项管理员配置已回滚，已停止加载插件") from exc
+        if not (memory_matches and disk_matches):
+            raise ConfigRollbackError("专项管理员迁移回滚不完整，已停止加载插件")
 
     def save_config(self, *, global_updates: dict | None = None) -> None:
         """保存配置（两个存储目标，缺一不可）。
@@ -506,6 +533,14 @@ class ConfigStore:
         get_group_setting 与列表基线重算共用这一个入口，保证两条路径
         对"模板条目算不算覆盖"的判定完全一致。
         """
+        if key == "group_admin_admins":
+            template_admins = self._get_template_group_admins(group_id)
+            if template_admins is not None:
+                return template_admins
+            legacy = self.config.get("group_admin_admins_by_group")
+            if isinstance(legacy, dict):
+                return self.normalize_qq_list_value(legacy.get(str(group_id)))
+            return []
         entry = self._template_group_entry(group_id)
         if entry is not None and key in self._template_field_defaults:
             if key in entry:
@@ -527,11 +562,6 @@ class ConfigStore:
                 logger.debug(
                     f"[群管插件] 群 {group_id} 的模板条目未填写 {key}，按未覆盖处理并回退全局配置"
                 )
-        if key == "group_admin_admins":
-            legacy = self.config.get("group_admin_admins_by_group")
-            if isinstance(legacy, dict) and str(group_id) in legacy:
-                return self.normalize_qq_list_value(legacy[str(group_id)])
-            return []
         return self.config.get(key, default)
 
     def group_override_keys(self, group_id: str) -> list:
@@ -574,6 +604,13 @@ class ConfigStore:
             logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
             return {}
 
+    def _get_template_group_admins(self, group_id: str, *, entries=None) -> list | None:
+        """仅返回模板层名单：None 是未配置，显式空名单返回 []。"""
+        if "group_admin_admins" not in self._template_field_defaults:
+            return None
+        entry = self._template_group_entry(group_id, entries=entries) or {}
+        return entry.get("group_admin_admins")
+
     def _template_group_entry(self, group_id: str, *, entries=None):
         """合并同群模板。普通字段忽略未声明的默认值；群范围保留最后一个有效状态。"""
         if entries is None:
@@ -615,6 +652,15 @@ class ConfigStore:
                 if k in self._GROUP_SCOPE_FIELDS:
                     if v in self._GROUP_SCOPE_STATES:
                         merged[k] = v
+                    continue
+                if k == "group_admin_admins":
+                    if isinstance(v, (list, str, int)):
+                        admins = [
+                            qq for qq in self.normalize_qq_list_value(v)
+                            if qq.isascii() and qq.isdecimal()
+                        ]
+                        if admins or (v == [] and k in declared):
+                            merged[k] = admins
                     continue
                 if k in defaults and v == defaults[k] and k not in declared:
                     # 本条该字段仍是默认值且未声明显式覆盖 → 不覆盖前面条目的值。

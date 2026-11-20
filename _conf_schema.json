@@ -598,7 +598,7 @@
                     "group_admin_admins": {
                         "description": "可设置/取消群管理的专项管理员 QQ 列表",
                         "type": "list",
-                        "hint": "仅授权 /设管理 和 /取消管理，每项填一个 QQ 号。群内名单指令保存的整份名单优先；用 /清除群配置 group_admin_admins 恢复此处的名单。",
+                        "hint": "仅授权 /设管理 和 /取消管理，每项一个 QQ 号。要明确清空名单，请保留空列表并在「显式覆盖字段」写入 group_admin_admins。群内指令保存的名单优先；用 /清除群配置 group_admin_admins 恢复模板名单。",
                         "default": []
                     },
                     "show_recall_notice": {

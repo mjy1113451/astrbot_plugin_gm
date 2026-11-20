@@ -127,24 +127,30 @@ class _WriteThenFailConfig(_FailingConfig):
 
 class _MigrationConfig(_FailingConfig):
     failure = ""
+    failure_on_save = 1
 
     def __init__(self, config_path, **settings):
         super().__init__(**settings)
+        self.save_snapshots = []
+        self.disk_before_saves = []
         self.config_path = config_path
         config_path.write_bytes(
             json.dumps(self, indent=2).replace("\n", "\r\n").encode("utf-8-sig")
         )
 
     def __setitem__(self, key, value):
-        if self.failure == "ignore_restore" and self.saves and key == "group_admin_admins_by_group":
+        if self.failure == "ignore_restore" and self.saves and key == "group_overrides_templates":
             return
         super().__setitem__(key, value)
 
     def save_config(self):
         self.saves += 1
-        if self.failure == "silent":
+        self.save_snapshots.append(copy.deepcopy(dict(self)))
+        self.disk_before_saves.append(json.loads(self.config_path.read_bytes()))
+        failure = self.failure if self.saves == self.failure_on_save else ""
+        if failure == "silent":
             return
-        if self.failure in ("partial", "ignore_restore"):
+        if failure in ("partial", "ignore_restore"):
             rows = self.get("group_overrides_templates", [])
             rows[0]["blacklisted_users"].append("99999")
             self.pop("group_overrides_templates", None)
@@ -418,7 +424,11 @@ class GroupOverrideTests(unittest.TestCase):
         json_store = _JsonStore()
         store = self.make_store(config, json_store=json_store)
         self.assertEqual(json_store.saves, 1)
-        self.assertEqual(config.saves, 1)
+        self.assertEqual(config.saves, 2)
+        first = config.save_snapshots[0]
+        self.assertEqual(first["group_admin_admins_by_group"]["600"], ["10009"])
+        self.assertEqual(first["group_overrides_templates"], config["group_overrides_templates"])
+        self.assertEqual(config.disk_before_saves[1], first)
         self.assertEqual(config["group_admin_admins_by_group"], {})
         self.assertEqual(len(config["group_overrides_templates"]), 7)
         self.assertEqual(json.loads(config.config_path.read_bytes()), config)
@@ -434,18 +444,74 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertEqual(store.get_group_override_list("500", "group_admin_admins"), [])
         self.assertEqual(store.get_group_override_list("600", "group_admin_admins"), ["10009"])
         self.make_store(config)
-        self.assertEqual(config.saves, 1)
+        self.assertEqual(config.saves, 2)
         self.assertEqual(len(config["group_overrides_templates"]), 7)
 
+    def test_admin_migration_preserves_legacy_when_template_has_no_effective_list(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        key = "group_admin_admins"
+        for fields in (
+            {},
+            {key: []},
+            {key: None},
+            {key: [None, " ", "not-a-qq"]},
+            {key: {"qq": "10002"}},
+            {key: [" "], "explicit_override_fields": key},
+            {"explicit_override_fields": key},
+        ):
+            with self.subTest(fields=fields):
+                entries = [_template_entry("100", mute_notice=False, **fields)]
+                config = _MigrationConfig(path, group_admin_admins_by_group={"100": ["10001"]},
+                                          group_overrides_templates=entries)
+                store = self.make_store(config)
+                saved = json.loads(path.read_bytes())
+                self.assertEqual(saved["group_admin_admins_by_group"], {})
+                self.assertEqual(len(saved["group_overrides_templates"]), 1)
+                self.assertEqual(saved["group_overrides_templates"][0][key], ["10001"])
+                self.assertEqual(store.get_group_override_list("100", key), ["10001"])
+                self.assertFalse(store.get_group_setting("100", "mute_notice"))
+
+    def test_admin_migration_uses_final_template_value_not_earlier_row(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        key = "group_admin_admins"
+        config = _MigrationConfig(
+            Path(temp_dir.name) / "framework.json",
+            group_admin_admins_by_group={
+                "100": ["10001"], "200": ["20001"], "300": ["30001"], "400": ["40001"],
+            },
+            group_overrides_templates=[
+                _template_entry("100", group_admin_admins=["10002"]),
+                _template_entry("100", explicit_override_fields=key),
+                _template_entry("200", group_admin_admins=[" 20002 ", None]),
+                _template_entry("200", group_admin_admins=[" "]),
+                _template_entry("300", group_admin_admins=["30002"]),
+                _template_entry("300", group_admin_admins=[], explicit_override_fields=key),
+                _template_entry("400", group_admin_admins='["40002"]'),
+            ],
+        )
+        store = self.make_store(config)
+        self.assertEqual(store.get_group_override_list("100", key), ["10001"])
+        self.assertEqual(store.get_group_override_list("200", key), ["20002"])
+        self.assertEqual(store.get_group_override_list("300", key), [])
+        self.assertEqual(store.get_group_override_list("400", key), ["40002"])
+        self.assertEqual(config["group_admin_admins_by_group"], {})
+
     def test_admin_migration_without_framework_file_does_not_write(self):
-        legacy = {"100": ["10001"]}
-        entries = [_template_entry("100", mute_notice=False)]
+        legacy = {"100": ["10001"], "200": ["20001"]}
+        entries = [
+            _template_entry("100", group_admin_admins=None),
+            _template_entry("200", group_admin_admins=[], explicit_override_fields="group_admin_admins"),
+        ]
         config = _FailingConfig(group_admin_admins_by_group=legacy, group_overrides_templates=entries)
         store = self.make_store(config)
         self.assertEqual(config.saves, 0)
         self.assertEqual(config["group_admin_admins_by_group"], legacy)
         self.assertEqual(config["group_overrides_templates"], entries)
         self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001"])
+        self.assertEqual(store.get_group_override_list("200", "group_admin_admins"), [])
 
     def test_admin_migration_does_not_persist_when_input_cannot_be_validated(self):
         temp_dir = tempfile.TemporaryDirectory()
@@ -486,6 +552,30 @@ class GroupOverrideTests(unittest.TestCase):
                 self.assertEqual(entries, before["group_overrides_templates"])
                 self.assertEqual(path.read_bytes(), original)
                 self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001"])
+
+    def test_admin_migration_cleanup_failure_preserves_verified_template_and_legacy(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        key = "group_admin_admins"
+        legacy = {"100": ["10001"]}
+        for failure in ("partial", "silent"):
+            with self.subTest(failure=failure):
+                config = _MigrationConfig(path, group_admin_admins_by_group=legacy,
+                                          group_overrides_templates=[_template_entry("100", blacklisted_users=["10002"])])
+                config.failure = failure
+                config.failure_on_save = 2
+                store = self.make_store(config)
+                self.assertEqual(config.saves, 2)
+                self.assertEqual(config["group_admin_admins_by_group"], legacy)
+                self.assertEqual(config, config.save_snapshots[0])
+                self.assertEqual(json.loads(path.read_bytes()), config)
+                self.assertEqual(store.get_group_override_list("100", key), ["10001"])
+                self.make_store(config)
+                self.assertEqual(config.saves, 3)
+                self.assertEqual(config["group_admin_admins_by_group"], {})
+                self.assertEqual(len(config["group_overrides_templates"]), 1)
+                self.assertEqual(json.loads(path.read_bytes()), config)
 
     def test_admin_migration_stops_loading_if_rollback_cannot_be_verified(self):
         temp_dir = tempfile.TemporaryDirectory()
