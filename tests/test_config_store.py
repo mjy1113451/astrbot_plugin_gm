@@ -1428,6 +1428,80 @@ class GroupOverrideTests(unittest.TestCase):
         self.make_store(config)
         self.assertEqual(config.saves, 1)
 
+    def test_per_setting_migration_keeps_explicit_values_equal_to_legacy_defaults(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        defaults = {
+            "rank_top_n": 10, "dup_face_recall_enabled": False, "mute_kick_threshold": 0,
+            "voice_check_provider_id": "", "whitelist_users": [],
+            "profanity_ban_duration_severity": {"mild": 180, "medium": 600, "severe": 1800},
+        }
+        config = _MigrationConfig(
+            Path(temp_dir.name) / "framework.json",
+            rank_top_n=25, dup_face_recall_enabled=True, mute_kick_threshold=3,
+            voice_check_provider_id="global", whitelist_users=["10001"],
+            profanity_ban_duration_severity={"mild": 999},
+            group_overrides_templates=[
+                _template_entry("100", rank_top_n=30),
+                _template_entry("100", **defaults, explicit_override_fields=",".join(defaults)),
+                _template_entry("100", **defaults),
+            ],
+        )
+        store = self.make_store(config)
+        saved = json.loads(config.config_path.read_bytes())
+        self.assertEqual(saved["group_overrides_templates"], [])
+        reloaded = self.make_store(_Config(saved))
+        for key, value in defaults.items():
+            with self.subTest(key=key):
+                self.assertEqual(saved[f"{key}_group_overrides"][0]["value"], value)
+                self.assertEqual(store.get_group_setting("100", key), value)
+                self.assertEqual(reloaded.get_group_setting("100", key), value)
+                self.assertEqual(reloaded.get_group_setting("200", key), config[key])
+
+    def test_invalid_per_setting_rows_do_not_mask_valid_values_or_defaults(self):
+        def row(value, gid="100"):
+            return {"__template_key": "group", "group_id": gid, "value": value}
+
+        config = _Config(rank_top_n=10, kick_recall_count=10, link_fetch_timeout=5,
+                         whitelist_users=["10001"], ad_keywords=["全局广告词"])
+        cases = {
+            "rank_top_n": (20, [0, -1, True, 1.5]),
+            "kick_recall_count": (50, [0, 51]),
+            "link_fetch_timeout": (15, [0, 16]),
+            "mute_kick_threshold": (0, [-1]),
+            "whitelist_users": (["20001"], [["20001", "bad"], [None], [True], [0]]),
+            "ad_keywords": (["推广"], [[" ", "推广"], [{"text": "推广"}]]),
+            "banned_images": (["a" * 32], [["abc"], [["a" * 32]]]),
+            "link_whitelist": (["*.example.com"], [["https://example.com"], ["bad..com"], ["*."]]),
+            "profanity_ban_duration_severity": ({"mild": 180}, [{"mild": 0}, {"severe": True}, {"other": 3}]),
+            "enabled_groups": ("off", ["other", "", None]),
+        }
+        for key, (valid, invalid) in cases.items():
+            config[f"{key}_group_overrides"] = [row(valid), *(row(value) for value in invalid)]
+        config["rank_top_n_group_overrides"] += [row(77, gid) for gid in (100, "0", "-100", "１００", "01")]
+        store = self.make_store(config)
+        for key, (valid, _) in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(store.get_group_setting("100", key), False if key == "enabled_groups" else valid)
+        for gid in ("0", "-100", "１００", "01", "200"):
+            self.assertEqual(store.get_group_setting(gid, "rank_top_n"), 10)
+        config["whitelist_users_group_overrides"] = [row([None])]
+        self.assertEqual(store.get_group_setting("100", "whitelist_users"), ["10001"])
+
+    def test_per_setting_migration_preserves_old_file_when_a_value_cannot_be_converted(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        config = _MigrationConfig(path, group_overrides_templates=[
+            _template_entry("100", rank_top_n=20, kick_recall_count=51),
+        ])
+        original = path.read_bytes()
+        store = self.make_store(config)
+        self.assertEqual(config.saves, 0)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertNotIn("rank_top_n_group_overrides", config)
+        self.assertEqual(store.get_group_setting("100", "rank_top_n"), 20)
+
     def test_per_setting_migration_restores_original_on_failed_save(self):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)

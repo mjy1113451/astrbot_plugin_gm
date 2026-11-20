@@ -33,6 +33,12 @@ class ConfigStore:
 
     _GROUP_SCOPE_FIELDS = {"enabled_groups", "auto_recall_enabled_groups"}
     _GROUP_SCOPE_STATES = ("inherit", "on", "off")
+    _TEMPLATE_VALUE_TYPES = {"bool": bool, "int": int, "string": str, "text": str, "dict": dict, "list": list}
+    _QQ_LIST_FIELDS = {
+        "blacklisted_users", "whitelist_users", "group_admin_admins", "join_notify_admins", "report_notify_admins",
+    }
+    _DOMAIN_LIST_FIELDS = {"link_whitelist", "link_safety_whitelist"}
+    _OVERRIDE_INT_LIMITS = {"mute_kick_threshold": (0, None), "kick_recall_count": (1, 50), "link_fetch_timeout": (1, 15)}
 
     def __init__(
         self,
@@ -246,10 +252,11 @@ class ConfigStore:
                 return
 
             groups = dict.fromkeys(str(row.get("group_id", "")).strip() for row in entries)
-            if any(gid and (not gid.isascii() or not gid.isdecimal()) for gid in groups):
+            if any(gid and not self._valid_group_id(gid) for gid in groups):
                 logger.warning("[群管插件] 旧按群模板包含无效群号，保留原配置")
                 return
             updates = {}
+            migrated = {}
             for gid in groups:
                 merged = self._template_group_entry(gid, entries=entries) or {}
                 for key, value in merged.items():
@@ -262,11 +269,20 @@ class ConfigStore:
                         return
                     if self._setting_template_entry(gid, key, rows=rows) is not None:
                         continue
-                    row = {"__template_key": "group", "group_id": gid, "value": value}
-                    if self._setting_template_entry(gid, key, rows=[row]) is None:
+                    value = self._validated_setting_value(key, value, legacy=True)
+                    if value is None:
                         logger.warning(f"[群管插件] 群 {gid} 的 {key} 无法迁移，保留旧按群配置")
                         return
-                    updates.setdefault(list_key, list(rows)).append(row)
+                    updates.setdefault(list_key, list(rows)).append({
+                        "__template_key": "group", "group_id": gid, "value": value,
+                    })
+                    migrated[gid, key] = value
+            # 迁移依据旧模板的合并结果，而不是新表单默认值；显式默认值也必须读得回来。
+            for (gid, key), value in migrated.items():
+                row = self._setting_template_entry(gid, key, rows=updates[f"{key}_group_overrides"])
+                if row is None or row["value"] != value:
+                    logger.warning(f"[群管插件] 群 {gid} 的 {key} 迁移后不生效，保留旧按群配置")
+                    return
             updates[legacy_key] = []
             try:
                 expected = json.loads(json.dumps({**before, **updates}, allow_nan=False))
@@ -718,36 +734,78 @@ class ConfigStore:
             logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
             return {}
 
+    @staticmethod
+    def _valid_group_id(group_id: str) -> bool:
+        return re.fullmatch(r"[1-9][0-9]*", group_id) is not None
+
     def _setting_template_entry(self, group_id: str, key: str, *, rows=None) -> dict | None:
-        kind = self._setting_template_types.get(key)
         gid = str(group_id).strip()
-        if kind is None or not gid.isascii() or not gid.isdecimal():
+        if key not in self._setting_template_types or not self._valid_group_id(gid):
             return None
         if rows is None:
             rows = self.config.get(f"{key}_group_overrides")
         if not isinstance(rows, list):
             return None
-        types = {"bool": bool, "int": int, "string": str, "text": str, "dict": dict, "list": list}
         for row in reversed(rows):
             if not isinstance(row, dict) or row.get("__template_key") != "group":
                 continue
-            if str(row.get("group_id", "")).strip() != gid:
+            row_gid = row.get("group_id")
+            if not isinstance(row_gid, str) or row_gid.strip() != gid:
                 continue
-            value = row.get("value")
-            if type(value) is not types.get(kind):
-                continue
-            if key in self._GROUP_SCOPE_FIELDS and value not in self._GROUP_SCOPE_STATES:
-                continue
-            if key == "group_admin_admins" and value and not any(
-                qq.isascii() and qq.isdecimal() for qq in normalize_qq_list(value)
-            ):
-                continue
-            if key == "group_admin_admins":
-                return {**row, "value": [
-                    qq for qq in normalize_qq_list(value) if qq.isascii() and qq.isdecimal()
-                ]}
-            return row
+            value = self._validated_setting_value(key, row.get("value"))
+            if value is not None:
+                return {**row, "value": value}
         return None
+
+    def _validated_setting_value(self, key: str, value, *, legacy=False):
+        """校验单项覆盖；None 表示非法，空容器及 False/0 仍是有效值。"""
+        kind = self._setting_template_types.get(key)
+        if type(value) is not self._TEMPLATE_VALUE_TYPES.get(kind):
+            return None
+        if key in self._GROUP_SCOPE_FIELDS:
+            return value if value in self._GROUP_SCOPE_STATES else None
+        if kind == "int":
+            minimum, maximum = self._OVERRIDE_INT_LIMITS.get(key, (1, None))
+            return value if value >= minimum and (maximum is None or value <= maximum) else None
+        if kind == "dict":
+            table = {}
+            for level, duration in value.items():
+                if legacy and isinstance(duration, str) and re.fullmatch(r"[0-9]+", duration.strip()):
+                    try:
+                        duration = int(duration)
+                    except ValueError:
+                        return None
+                if level not in ("mild", "medium", "severe") or type(duration) is not int or duration < 1:
+                    return None
+                table[level] = duration
+            return table
+        if kind != "list":
+            return value
+        items = []
+        for item in value:
+            if key in self._QQ_LIST_FIELDS and (legacy or key == "group_admin_admins") and type(item) is int:
+                item = str(item)
+            if not isinstance(item, str) or not item.strip():
+                return None
+            if key in self._QQ_LIST_FIELDS:
+                item = item.strip()
+                if not re.fullmatch(r"[1-9][0-9]*", item):
+                    return None
+            elif key == "banned_images":
+                if not re.fullmatch(r"[0-9a-fA-F]{32}", item):
+                    return None
+                item = item.lower()
+            elif key in self._DOMAIN_LIST_FIELDS:
+                item = item.strip()
+                try:
+                    host = item.removeprefix("*.").removesuffix(".").encode("idna").decode("ascii")
+                except UnicodeError:
+                    return None
+                label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})+", host):
+                    return None
+            items.append(item)
+        return items
 
     def _get_template_group_admins(self, group_id: str, *, entries=None) -> list | None:
         """仅返回模板层名单：None 是未配置，显式空名单返回 []。"""
