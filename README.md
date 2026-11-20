@@ -563,7 +563,7 @@ astrbot_plugin_gm/
 - 🐛 发现 Bug？请提交 [Issue](https://github.com/mjy1113451/astrbot_plugin_gm/issues)
 - 💡 有功能建议？请先提交 Issue 讨论，待 AI 审核确认后可提 PR
 - 🔧 修复难度低到中的 PR，会被优先合并
-- 作者的群1075920323
+- [作者的群](https://qun.qq.com/universal-share/share?ac=1&authKey=iyVuhyBOryusmryzaAPvH7ILYUCpS2HVwYxwqiodfj19CHED%2FTN4GZrO2OWx0kFc&busi_data=eyJncm91cENvZGUiOiIxMDc1OTIwMzIzIiwidG9rZW4iOiJTZk1IcThEV0lTcmJMZk1YQkhzTzhmQXpOUjFKOURmb3pPNWtPZzI1OGYvNy9wcWJOZmUwVWsyM0JwSzhXK0hxIiwidWluIjoiMTczMTUzODMzNCJ9&data=pmhTrNkRjTmGsGj1Rf7Zwn1YA341BOKMxrIxqM7W-utEa5O5-kiC3uOFnCwy_LGbHsuKIQ7JVnyMd5SstDtp4g&svctype=4&tempid=h5_group_info)
 
 ---
 
