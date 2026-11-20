@@ -199,18 +199,26 @@ class ConfigStore:
                     if self._get_template_group_admins(gid, entries=saved.get(template_key, [])) != admins:
                         raise ValueError(f"群 {gid} 的专项管理员名单未在新模板生效")
             except Exception as exc:
-                self._rollback_group_admin_migration(before, file_before, touched)
-                logger.warning(f"[群管插件] 专项管理员迁移失败，已恢复旧名单与模板: {exc}")
+                rollback_failure = self._rollback_group_admin_migration(before, file_before, touched)
+                if rollback_failure is not None:
+                    message = f"专项管理员迁移失败且无法确认回滚，已停止加载插件: {rollback_failure}"
+                    logger.error(f"[群管插件] {message}")
+                    raise ConfigRollbackError(message) from exc
+                logger.warning(f"[群管插件] 专项管理员迁移失败，已恢复旧名单与模板并继续加载: {exc}")
                 return
 
-            # 只有确认模板能独立提供名单后，才清理旧键；清理失败保留已验证的模板。
+            # 只有确认模板能独立提供名单后，才清理旧键。
             try:
                 self.config[legacy_key] = {}
                 self.config.save_config()
                 self._read_verified_migration_config(path, {**saved, legacy_key: {}})
             except Exception as exc:
-                self._rollback_group_admin_migration(saved, (path, verified_bytes), touched)
-                logger.warning(f"[群管插件] 清理旧专项管理员名单失败，保留已验证的模板和旧名单: {exc}")
+                rollback_failure = self._rollback_group_admin_migration(saved, (path, verified_bytes), touched)
+                if rollback_failure is not None:
+                    message = f"清理旧专项管理员名单失败且无法确认回滚，已停止加载插件: {rollback_failure}"
+                    logger.error(f"[群管插件] {message}")
+                    raise ConfigRollbackError(message) from exc
+                logger.warning(f"[群管插件] 清理旧专项管理员名单失败，回滚已验证，保留模板和旧名单并继续加载: {exc}")
 
     def _read_verified_migration_config(self, path: Path, expected: dict) -> bytes:
         data = path.read_bytes()
@@ -218,16 +226,37 @@ class ConfigStore:
             raise OSError("保存后读取的专项管理员配置与迁移结果不一致")
         return data
 
-    def _rollback_group_admin_migration(self, before: dict, file_before, touched) -> None:
-        self._restore_framework_config(before, touched)
-        self._restore_framework_file(file_before)
+    def _rollback_group_admin_migration(
+        self, before: dict, file_before: tuple[Path, bytes], touched: tuple[str, ...]
+    ) -> str | None:
+        """尝试恢复内存和磁盘；仅在无法验证快照时返回失败原因。"""
+        path, data = file_before
+        restore_failures = []
+        for restore, args in (
+            (self._restore_framework_config, (before, touched)),
+            (self._restore_framework_file, (file_before,)),
+        ):
+            try:
+                failure = restore(*args)
+            except Exception as exc:
+                failure = exc
+            if failure is not None:
+                restore_failures.append(str(failure))
+
+        verification_failures = []
         try:
-            memory_matches = dict(self.config) == before
-            disk_matches = file_before[0].read_bytes() == file_before[1]
+            if dict(self.config) != before:
+                verification_failures.append("内存配置与快照不一致")
         except Exception as exc:
-            raise ConfigRollbackError("无法确认专项管理员配置已回滚，已停止加载插件") from exc
-        if not (memory_matches and disk_matches):
-            raise ConfigRollbackError("专项管理员迁移回滚不完整，已停止加载插件")
+            verification_failures.append(f"无法核对内存配置: {exc}")
+        try:
+            if path.read_bytes() != data:
+                verification_failures.append("磁盘配置与快照不一致")
+        except Exception as exc:
+            verification_failures.append(f"无法核对磁盘配置: {exc}")
+        if verification_failures:
+            return "；".join(verification_failures + restore_failures)
+        return None
 
     def save_config(self, *, global_updates: dict | None = None) -> None:
         """保存配置（两个存储目标，缺一不可）。

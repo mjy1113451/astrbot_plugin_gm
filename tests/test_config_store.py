@@ -40,7 +40,7 @@ if "astrbot" not in sys.modules:
     sys.modules["astrbot"] = astrbot
     sys.modules["astrbot.api"] = api
 
-from unittest.mock import patch  # noqa: E402
+from unittest.mock import DEFAULT, patch  # noqa: E402
 from collections import UserDict  # noqa: E402
 
 from cop.config_store import ConfigRollbackError, ConfigStore  # noqa: E402
@@ -565,7 +565,10 @@ class GroupOverrideTests(unittest.TestCase):
                                           group_overrides_templates=[_template_entry("100", blacklisted_users=["10002"])])
                 config.failure = failure
                 config.failure_on_save = 2
-                store = self.make_store(config)
+                with patch("cop.config_store.logger.warning") as warning:
+                    store = self.make_store(config)
+                warning.assert_called_once()
+                self.assertIn("回滚已验证，保留模板和旧名单并继续加载", warning.call_args.args[0])
                 self.assertEqual(config.saves, 2)
                 self.assertEqual(config["group_admin_admins_by_group"], legacy)
                 self.assertEqual(config, config.save_snapshots[0])
@@ -576,6 +579,68 @@ class GroupOverrideTests(unittest.TestCase):
                 self.assertEqual(config["group_admin_admins_by_group"], {})
                 self.assertEqual(len(config["group_overrides_templates"]), 1)
                 self.assertEqual(json.loads(path.read_bytes()), config)
+
+    def test_admin_cleanup_continues_if_restore_raises_after_restoring_file(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        config = _MigrationConfig(path, group_admin_admins_by_group={"100": ["10001"]},
+                                  group_overrides_templates=[_template_entry("100", blacklisted_users=["10002"])])
+        config.failure = "partial"
+        config.failure_on_save = 2
+        restore_file = ConfigStore._restore_framework_file
+
+        def restore_then_raise(store, snapshot):
+            restore_file(store, snapshot)
+            raise RuntimeError("恢复文件后抛出异常（模拟）")
+
+        with patch.object(ConfigStore, "_restore_framework_file", restore_then_raise):
+            store = self.make_store(config)
+        self.assertEqual(config, config.save_snapshots[0])
+        self.assertEqual(json.loads(path.read_bytes()), config)
+        self.assertEqual(store.get_group_override_list("100", "group_admin_admins"), ["10001"])
+
+    def test_admin_cleanup_stops_loading_when_either_snapshot_cannot_be_verified(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        path = Path(temp_dir.name) / "framework.json"
+        for target in ("memory", "disk", "readback"):
+            with self.subTest(target=target):
+                config = _MigrationConfig(
+                    path, group_admin_admins_by_group={"100": ["10001"]},
+                    group_overrides_templates=[_template_entry("100", blacklisted_users=["10002"])],
+                )
+                config.failure = "ignore_restore" if target == "memory" else "partial"
+                config.failure_on_save = 2
+                read_bytes = Path.read_bytes
+
+                def fail_verification(file_path):
+                    data = read_bytes(file_path)
+                    if target == "readback" and file_path == path and config.saves == 2 and data != b"{broken":
+                        raise OSError("恢复后无法读回（模拟）")
+                    return data
+
+                def write_file(file_path, data):
+                    if target == "disk" and file_path == path:
+                        raise RuntimeError("恢复写入异常（模拟）")
+                    return DEFAULT
+
+                with (
+                    patch.object(Path, "read_bytes", fail_verification),
+                    patch.object(ConfigStore, "_atomic_write_bytes", wraps=ConfigStore._atomic_write_bytes,
+                                 side_effect=write_file),
+                    patch("cop.config_store.logger.warning") as warning,
+                    patch("cop.config_store.logger.error") as error,
+                    self.assertRaisesRegex(ConfigRollbackError, "清理旧专项管理员名单失败且无法确认回滚"),
+                ):
+                    self.make_store(config)
+                self.assertEqual(config.saves, 2)
+                self.assertIn("已停止加载插件", error.call_args.args[0])
+                warning.assert_not_called()
+                if target != "memory":
+                    self.assertEqual(config, config.save_snapshots[0])
+                if target != "disk":
+                    self.assertEqual(json.loads(path.read_bytes()), config.save_snapshots[0])
 
     def test_admin_migration_stops_loading_if_rollback_cannot_be_verified(self):
         temp_dir = tempfile.TemporaryDirectory()
