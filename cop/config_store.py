@@ -33,6 +33,12 @@ class ConfigStore:
 
     _GROUP_SCOPE_FIELDS = {"enabled_groups", "auto_recall_enabled_groups"}
     _GROUP_SCOPE_STATES = ("inherit", "on", "off")
+    _TEMPLATE_VALUE_TYPES = {"bool": bool, "int": int, "string": str, "text": str, "dict": dict, "list": list}
+    _QQ_LIST_FIELDS = {
+        "blacklisted_users", "whitelist_users", "group_admin_admins", "join_notify_admins", "report_notify_admins",
+    }
+    _DOMAIN_LIST_FIELDS = {"link_whitelist", "link_safety_whitelist"}
+    _OVERRIDE_INT_LIMITS = {"mute_kick_threshold": (0, None), "kick_recall_count": (1, 50), "link_fetch_timeout": (1, 15)}
 
     def __init__(
         self,
@@ -58,8 +64,10 @@ class ConfigStore:
         self._runtime_maps: dict = self.load_runtime_maps()
         # PR #290：WebUI 按群配置模板（template_list）的字段默认值缓存，
         # 用于区分"字段未动（回退全局）"与"显式覆盖"。
+        self._setting_template_types = {}
         self._template_field_defaults = self._load_template_field_defaults()
         self._migrate_group_admin_admins()
+        self._migrate_setting_templates()
 
     # ===================== 通用 IO（委托 JsonStore） =====================
 
@@ -166,6 +174,8 @@ class ConfigStore:
                 ):
                     logger.warning("[群管插件] 旧专项管理员名单包含无效群号或 QQ 号，跳过迁移并保留旧名单")
                     return
+                if self._setting_template_entry(gid, admin_key) is not None:
+                    continue
                 template_admins = self._get_template_group_admins(gid, entries=entries)
                 if template_admins is not None:
                     expected_admins[gid] = template_admins
@@ -199,7 +209,7 @@ class ConfigStore:
                     if self._get_template_group_admins(gid, entries=saved.get(template_key, [])) != admins:
                         raise ValueError(f"群 {gid} 的专项管理员名单未在新模板生效")
             except Exception as exc:
-                rollback_failure = self._rollback_group_admin_migration(before, file_before, touched)
+                rollback_failure = self._rollback_template_migration(before, file_before, touched)
                 if rollback_failure is not None:
                     message = f"专项管理员迁移失败且无法确认回滚，已停止加载插件: {rollback_failure}"
                     logger.error(f"[群管插件] {message}")
@@ -213,12 +223,84 @@ class ConfigStore:
                 self.config.save_config()
                 self._read_verified_migration_config(path, {**saved, legacy_key: {}})
             except Exception as exc:
-                rollback_failure = self._rollback_group_admin_migration(saved, (path, verified_bytes), touched)
+                rollback_failure = self._rollback_template_migration(saved, (path, verified_bytes), touched)
                 if rollback_failure is not None:
                     message = f"清理旧专项管理员名单失败且无法确认回滚，已停止加载插件: {rollback_failure}"
                     logger.error(f"[群管插件] {message}")
                     raise ConfigRollbackError(message) from exc
                 logger.warning(f"[群管插件] 清理旧专项管理员名单失败，回滚已验证，保留模板和旧名单并继续加载: {exc}")
+
+    def _migrate_setting_templates(self) -> None:
+        """拆分旧模板的有效覆盖，并在同一次保存中清空旧列表。"""
+        legacy_key = "group_overrides_templates"
+        if not self._setting_template_types or not isinstance(self.config, Mapping):
+            return
+        with self._lock:
+            if not self.config.get(legacy_key) or self.config.get("group_admin_admins_by_group"):
+                return
+            before = self._config_snapshot()
+            file_before = self._snapshot_framework_file()
+            if before is None or file_before is None:
+                logger.warning("[群管插件] 无法备份按群配置，继续使用旧模板")
+                return
+            entries = before[legacy_key]
+            if not isinstance(entries, list) or any(
+                not isinstance(row, dict) or row.get("__template_key", "group_config") != "group_config"
+                for row in entries
+            ):
+                logger.warning("[群管插件] 旧按群模板格式不正确，保留原配置")
+                return
+
+            groups = dict.fromkeys(str(row.get("group_id", "")).strip() for row in entries)
+            if any(gid and not self._valid_group_id(gid) for gid in groups):
+                logger.warning("[群管插件] 旧按群模板包含无效群号，保留原配置")
+                return
+            updates = {}
+            migrated = {}
+            for gid in groups:
+                merged = self._template_group_entry(gid, entries=entries) or {}
+                for key, value in merged.items():
+                    if key not in self._setting_template_types:
+                        continue
+                    list_key = f"{key}_group_overrides"
+                    rows = before.get(list_key, [])
+                    if not isinstance(rows, list):
+                        logger.warning(f"[群管插件] {list_key} 不是列表，保留旧按群配置")
+                        return
+                    if self._setting_template_entry(gid, key, rows=rows) is not None:
+                        continue
+                    value = self._validated_setting_value(key, value, legacy=True)
+                    if value is None:
+                        logger.warning(f"[群管插件] 群 {gid} 的 {key} 无法迁移，保留旧按群配置")
+                        return
+                    updates.setdefault(list_key, list(rows)).append({
+                        "__template_key": "group", "group_id": gid, "value": value,
+                    })
+                    migrated[gid, key] = value
+            # 迁移依据旧模板的合并结果，而不是新表单默认值；显式默认值也必须读得回来。
+            for (gid, key), value in migrated.items():
+                row = self._setting_template_entry(gid, key, rows=updates[f"{key}_group_overrides"])
+                if row is None or row["value"] != value:
+                    logger.warning(f"[群管插件] 群 {gid} 的 {key} 迁移后不生效，保留旧按群配置")
+                    return
+            updates[legacy_key] = []
+            try:
+                expected = json.loads(json.dumps({**before, **updates}, allow_nan=False))
+            except (TypeError, ValueError) as exc:
+                logger.warning(f"[群管插件] 无法序列化按群配置，保留旧模板: {exc}")
+                return
+            try:
+                for key, value in updates.items():
+                    self.config[key] = value
+                self.config.save_config()
+                self._read_verified_migration_config(file_before[0], expected)
+            except Exception as exc:
+                failure = self._rollback_template_migration(before, file_before, tuple(updates))
+                if failure is not None:
+                    message = f"按群模板迁移失败且无法确认回滚，已停止加载插件: {failure}"
+                    logger.error(f"[群管插件] {message}")
+                    raise ConfigRollbackError(message) from exc
+                logger.warning(f"[群管插件] 按群模板迁移失败，已恢复旧配置: {exc}")
 
     def _read_verified_migration_config(self, path: Path, expected: dict) -> bytes:
         data = path.read_bytes()
@@ -226,7 +308,7 @@ class ConfigStore:
             raise OSError("保存后读取的专项管理员配置与迁移结果不一致")
         return data
 
-    def _rollback_group_admin_migration(
+    def _rollback_template_migration(
         self, before: dict, file_before: tuple[Path, bytes], touched: tuple[str, ...]
     ) -> str | None:
         """尝试恢复内存和磁盘；仅在无法验证快照时返回失败原因。"""
@@ -522,9 +604,8 @@ class ConfigStore:
            列表项若记录了派生基线，会与最新的模板/全局值重新合并，避免"某次
            增删之后 WebUI 模板改动再也不生效"（PR #289 审查：
            config-override-precedence-loss）；
-        2. WebUI 按群配置模板（_conf_schema.json 的 group_overrides_templates，
-           AstrBot template_list）：本群条目里该字段的值 ≠ 模板默认值时视为
-           显式覆盖；群范围例外，on/off/inherit 三态按最后一条有效值生效；
+        2. WebUI 独立按群列表：最后一条有效记录覆盖该项，含默认值与空名单。
+           旧模板仅在迁移完成前按旧规则读取；
         3. 全局配置 / 默认值。
 
         默认值判定拿不到"字段是否被显式填写"的信息，所以模板条目里另有
@@ -562,6 +643,14 @@ class ConfigStore:
         get_group_setting 与列表基线重算共用这一个入口，保证两条路径
         对"模板条目算不算覆盖"的判定完全一致。
         """
+        row = self._setting_template_entry(group_id, key)
+        if row is not None:
+            value = row["value"]
+            if key not in self._GROUP_SCOPE_FIELDS:
+                return value
+            if value == "inherit":
+                return self.config.get(key, default)
+            return value == "on"
         if key == "group_admin_admins":
             template_admins = self._get_template_group_admins(group_id)
             if template_admins is not None:
@@ -601,6 +690,13 @@ class ConfigStore:
             if key in self._template_field_defaults
             and not (key in self._GROUP_SCOPE_FIELDS and value == "inherit")
         }
+        for key in self._setting_template_types:
+            row = self._setting_template_entry(group_id, key)
+            if row is not None:
+                if key in self._GROUP_SCOPE_FIELDS and row["value"] == "inherit":
+                    keys.pop(key, None)
+                else:
+                    keys[key] = None
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if isinstance(overrides, dict):
             keys.update((key, None) for key in overrides if not key.startswith("__"))
@@ -624,6 +720,11 @@ class ConfigStore:
             # explicit_override_fields 是"显式覆盖声明"，都不是群配置项
             # （PR #289 审查：template-default-mismatch）。
             meta = {"group_id", "explicit_override_fields"}
+            self._setting_template_types = {
+                key: schema[f"{key}_group_overrides"]["templates"]["group"]["items"]["value"]["type"]
+                for key in items
+                if key not in meta and f"{key}_group_overrides" in schema
+            }
             return {
                 k: (v.get("default") if isinstance(v, dict) else None)
                 for k, v in items.items()
@@ -632,6 +733,79 @@ class ConfigStore:
         except Exception as e:
             logger.warning(f"[群管插件] 读取按群配置模板默认值失败，模板覆盖不生效: {e}")
             return {}
+
+    @staticmethod
+    def _valid_group_id(group_id: str) -> bool:
+        return re.fullmatch(r"[1-9][0-9]*", group_id) is not None
+
+    def _setting_template_entry(self, group_id: str, key: str, *, rows=None) -> dict | None:
+        gid = str(group_id).strip()
+        if key not in self._setting_template_types or not self._valid_group_id(gid):
+            return None
+        if rows is None:
+            rows = self.config.get(f"{key}_group_overrides")
+        if not isinstance(rows, list):
+            return None
+        for row in reversed(rows):
+            if not isinstance(row, dict) or row.get("__template_key") != "group":
+                continue
+            row_gid = row.get("group_id")
+            if not isinstance(row_gid, str) or row_gid.strip() != gid:
+                continue
+            value = self._validated_setting_value(key, row.get("value"))
+            if value is not None:
+                return {**row, "value": value}
+        return None
+
+    def _validated_setting_value(self, key: str, value, *, legacy=False):
+        """校验单项覆盖；None 表示非法，空容器及 False/0 仍是有效值。"""
+        kind = self._setting_template_types.get(key)
+        if type(value) is not self._TEMPLATE_VALUE_TYPES.get(kind):
+            return None
+        if key in self._GROUP_SCOPE_FIELDS:
+            return value if value in self._GROUP_SCOPE_STATES else None
+        if kind == "int":
+            minimum, maximum = self._OVERRIDE_INT_LIMITS.get(key, (1, None))
+            return value if value >= minimum and (maximum is None or value <= maximum) else None
+        if kind == "dict":
+            table = {}
+            for level, duration in value.items():
+                if legacy and isinstance(duration, str) and re.fullmatch(r"[0-9]+", duration.strip()):
+                    try:
+                        duration = int(duration)
+                    except ValueError:
+                        return None
+                if level not in ("mild", "medium", "severe") or type(duration) is not int or duration < 1:
+                    return None
+                table[level] = duration
+            return table
+        if kind != "list":
+            return value
+        items = []
+        for item in value:
+            if key in self._QQ_LIST_FIELDS and (legacy or key == "group_admin_admins") and type(item) is int:
+                item = str(item)
+            if not isinstance(item, str) or not item.strip():
+                return None
+            if key in self._QQ_LIST_FIELDS:
+                item = item.strip()
+                if not re.fullmatch(r"[1-9][0-9]*", item):
+                    return None
+            elif key == "banned_images":
+                if not re.fullmatch(r"[0-9a-fA-F]{32}", item):
+                    return None
+                item = item.lower()
+            elif key in self._DOMAIN_LIST_FIELDS:
+                item = item.strip()
+                try:
+                    host = item.removeprefix("*.").removesuffix(".").encode("idna").decode("ascii")
+                except UnicodeError:
+                    return None
+                label = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})+", host):
+                    return None
+            items.append(item)
+        return items
 
     def _get_template_group_admins(self, group_id: str, *, entries=None) -> list | None:
         """仅返回模板层名单：None 是未配置，显式空名单返回 []。"""
