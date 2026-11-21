@@ -111,11 +111,17 @@ class BannedImageUploadTests(unittest.IsolatedAsyncioTestCase):
         replacement.replace(path)
         self.assertFalse(await self.matches("123", b"old"))
         self.assertTrue(await self.matches("123", b"new"))
-        self.store.group_files["123"].clear()
+
+        # 覆盖写入不会改变文件路径或 inode；同大小改写也需重新计算。
+        path.write_bytes(b"edi")
+        os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 2_000_000_000))
         self.assertFalse(await self.matches("123", b"new"))
+        self.assertTrue(await self.matches("123", b"edi"))
+        self.store.group_files["123"].clear()
+        self.assertFalse(await self.matches("123", b"edi"))
         self.store.group_files["123"].append(rel)
         path.unlink()
-        self.assertFalse(await self.matches("123", b"new"))
+        self.assertFalse(await self.matches("123", b"edi"))
         self.write_file(rel, b"recreated")
         self.assertTrue(await self.matches("123", b"recreated"))
 
