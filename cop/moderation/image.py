@@ -1,13 +1,13 @@
 """L3b 群违规检测子域：图片检测（MD5 违禁图 + AI 鉴图）。
 
-迁出自 main.py 的以下方法（逐字保留逻辑等价）：
+迁出自 main.py 的以下方法：
     _collect_image_urls / _check_banned_image / _banned_image_file_paths
     _get_banned_file_md5s / _compute_image_md5 / _check_image
     _check_with_openai_vision / _parse_openai_response / _check_with_moderation_api
     _download_image
 
 依赖（构造注入，L3b 只依赖 L0/L1/L2，不 import 同层）：
-- ConfigStore（L1）：config / get_group_setting / data_dir
+- ConfigStore（L1）：config / get_group_setting / get_group_banned_image_files / data_dir
 - OneBotApi（L2）：无直接调用（保留以对齐注入约定）
 - RuntimeState（L2）：_banned_file_md5_cache
 
@@ -16,12 +16,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
-from pathlib import Path
-from typing import TYPE_CHECKING
+import stat
+from pathlib import Path, PureWindowsPath
+from threading import Lock
+from typing import TYPE_CHECKING, Iterator
 
 from astrbot.api import logger
 
@@ -31,6 +35,19 @@ if TYPE_CHECKING:
     from ..config_store import ConfigStore
     from ..onebot_api import OneBotApi
     from ..runtime import RuntimeState
+
+
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_HASH_CHUNK_BYTES = 128 * 1024
+_MD5_CACHE_LIMIT = 512
+# AstrBot 将模板字段键 banned_images_group_overrides.templates.group.files 转为目录；
+# 目录由所有群共享，不能靠扫描目录判断归属，只使用当前群配置引用的文件。
+_GROUP_UPLOAD_DIR = Path("files/banned_images_group_overrides/templates/group/files")
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _file_signature(st: os.stat_result) -> tuple[int, ...]:
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
 class ImageModeration:
@@ -47,6 +64,7 @@ class ImageModeration:
         self.config = config_store.config
         self._api = onebot_api
         self._runtime = runtime
+        self._banned_file_cache_lock = Lock()
 
     # ===================== 图片检测 =====================
 
@@ -77,50 +95,110 @@ class ImageModeration:
         # 新配置统一通过 /添加违禁图片（按群覆盖）与 WebUI 上传维护。
         global_banned = set(self.config.get("banned_images", []) or [])
         group_banned = set(self._store.get_group_setting(group_id, "banned_images", []) or [])
-        banned_md5s = global_banned | group_banned
-        # #184：把 WebUI 上传的图片文件（file 类型）计算 MD5 一并纳入比对
-        banned_md5s |= self._get_banned_file_md5s()
-        return md5 in banned_md5s
+        if md5 in global_banned or md5 in group_banned:
+            return True
+        # #184 / #296：上传文件独立于手动 MD5 配置，不受运行时名单覆盖影响。
+        group_files = self._store.get_group_banned_image_files(group_id)
+        global_files = self.config.get("banned_image_files", []) or []
+        if not (global_files or group_files):
+            return False
+        return await asyncio.to_thread(self._matches_banned_upload, md5, global_files, group_files)
 
-    def _banned_image_file_paths(self) -> list:
-        """返回 WebUI 上传的违禁图片文件的绝对路径（data/plugin_data/<plugin>/files/...）。"""
-        rel_paths = self.config.get("banned_image_files", []) or []
-        # 插件数据根：self.data_dir = <plugin_data>/<plugin>/group_admin，其 parent 即 <plugin_data>/<plugin>
+    def _matches_banned_upload(self, md5: str, global_files: list, group_files: list) -> bool:
+        return md5 in self._iter_banned_md5s(self._resolve_banned_uploads(global_files)) or (
+            md5 in self._iter_banned_md5s(self._resolve_banned_uploads(group_files, upload_dir=_GROUP_UPLOAD_DIR))
+        )
+
+    def _banned_image_file_paths(self, group_id: str | None = None) -> list[Path]:
+        """返回指定群的上传文件路径；不传群号时保留原全局行为。"""
+        if group_id is None:
+            return self._resolve_banned_uploads(self.config.get("banned_image_files", []) or [])
+        return self._resolve_banned_uploads(
+            self._store.get_group_banned_image_files(group_id), upload_dir=_GROUP_UPLOAD_DIR
+        )
+
+    def _resolve_banned_uploads(
+        self, rel_paths: list, *, upload_dir: Path = Path()
+    ) -> list[Path]:
+        if not isinstance(rel_paths, list) or not rel_paths:
+            return []
         try:
-            data_root = Path(self._store.data_dir).resolve().parent
-        except Exception:
-            data_root = None
-        result = []
+            # data_dir = <plugin_data>/<plugin>/group_admin
+            data_root = Path(self._store.data_dir).parent.resolve()
+        except (OSError, ValueError, RuntimeError):
+            return []
+        allowed_root = data_root / upload_dir
+        result = {}
         for rel in rel_paths:
-            rel_str = str(rel).replace("\\", "/").lstrip("/")
-            if not rel_str or ".." in rel_str.split("/"):
+            if not isinstance(rel, str):
                 continue
-            if data_root is None:
+            # 全局保留旧相对路径兼容；本群新字段只接收 AstrBot 上传格式。
+            rel_str = rel.replace("\\", "/")
+            if upload_dir == _GROUP_UPLOAD_DIR and rel_str.startswith("/"):
                 continue
-            p = (data_root / rel_str).resolve()
+            rel_str = rel_str.lstrip("/")
+            if not rel_str or ".." in rel_str.split("/") or ":" in rel_str:
+                continue
+            relative = Path(rel_str)
+            if upload_dir == _GROUP_UPLOAD_DIR and relative.suffix.lower() not in _IMAGE_EXTENSIONS:
+                continue
+            if not relative.is_relative_to(upload_dir) or PureWindowsPath(rel_str).is_reserved():
+                continue
             try:
-                p.relative_to(data_root)
-            except ValueError:
+                p = (data_root / relative).resolve(strict=True)
+                if p.is_relative_to(allowed_root) and p.is_file():
+                    result[p] = None
+            except (OSError, ValueError, RuntimeError):
                 continue
-            if p.is_file():
-                result.append(p)
-        return result
+        return list(result)
 
-    def _get_banned_file_md5s(self) -> set:
-        """计算 WebUI 上传违禁图片的 MD5（懒计算 + 缓存，失败跳过）。"""
-        md5s = set()
-        for p in self._banned_image_file_paths():
-            rel_str = p.as_posix()
-            if rel_str in self._runtime._banned_file_md5_cache:
-                md5s.add(self._runtime._banned_file_md5_cache[rel_str])
-                continue
-            try:
-                digest = hashlib.md5(p.read_bytes()).hexdigest()
-                self._runtime._banned_file_md5_cache[rel_str] = digest
-                md5s.add(digest)
-            except Exception as e:
-                logger.error(f"计算违禁图片文件 MD5 失败 {p}: {e}")
-        return md5s
+    def _get_banned_file_md5s(self, group_id: str | None = None) -> set[str]:
+        """返回指定群上传文件的 MD5；不传群号时只返回全局上传文件的 MD5。"""
+        return set(self._iter_banned_md5s(self._banned_image_file_paths(group_id)))
+
+    def _iter_banned_md5s(self, paths: list[Path]) -> Iterator[str]:
+        cache = self._runtime._banned_file_md5_cache
+        for p in paths:
+            key = p.as_posix()
+            with self._banned_file_cache_lock:
+                cached = cache.pop(key, None)
+                try:
+                    st = p.stat()
+                    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= _MAX_IMAGE_BYTES:
+                        continue
+                    signature = _file_signature(st)
+                    if cached is not None and cached[0] == signature:
+                        digest = cached[1]
+                    else:
+                        digest = self._hash_banned_path(p, signature)
+                        if digest is None:
+                            continue
+                    if len(cache) >= _MD5_CACHE_LIMIT:
+                        cache.pop(next(iter(cache)))
+                    cache[key] = (signature, digest)
+                except (OSError, ValueError) as e:
+                    logger.error(f"计算违禁图片文件 MD5 失败 {p}: {e}")
+                    continue
+            yield digest
+
+    @staticmethod
+    def _hash_banned_path(p: Path, signature: tuple[int, ...]) -> str | None:
+        md5 = hashlib.md5()
+        total = 0
+        with p.open("rb") as file:
+            if _file_signature(os.fstat(file.fileno())) != signature:
+                return None
+            while chunk := file.read(min(_HASH_CHUNK_BYTES, _MAX_IMAGE_BYTES - total + 1)):
+                total += len(chunk)
+                if total > _MAX_IMAGE_BYTES:
+                    return None
+                md5.update(chunk)
+            if _file_signature(os.fstat(file.fileno())) != signature:
+                return None
+        # 检测读取过程中发生的覆盖/替换，避免把旧内容记为当前路径的指纹。
+        if total != signature[2] or _file_signature(p.stat()) != signature:
+            return None
+        return md5.hexdigest()
 
     async def _compute_image_md5(self, image_url: str):
         """下载图片并计算 MD5，供 /添加违禁图片 使用。
@@ -328,7 +406,7 @@ class ImageModeration:
             logger.error(f"[群违规检测] Moderation API 调用失败: {e}")
             return False, ""
 
-    async def _download_image(self, url: str, max_size: int = 10 * 1024 * 1024):
+    async def _download_image(self, url: str, max_size: int = _MAX_IMAGE_BYTES):
         """下载图片。#162 增强：限制最大 10MB，避免慢速/大文件阻塞检测。
 
         返回 (data, truncated) 元组：truncated=True 表示数据被截断到 max_size+1，

@@ -1,8 +1,6 @@
 """L3a 消息/指令公共辅助服务。
 
-本模块承载与「命令层公共辅助 / 去重收敛」相关、且能证明行为逐字等价的逻辑。
-迁出自 main.py 的以下方法：
-    _edit_special_admins（专项管理员增删公共实现）
+本模块承载命令层公共辅助逻辑，包括统一插件管理员名单的增删。
 
 去重收敛取舍说明（高风险，务必保持行为 100% 不变）：
 1. 撤回主循环：recall_cmd（@用户分支 / 仅数量分支）与 recall_self_cmd 两份实现，
@@ -23,17 +21,15 @@
 依赖（构造注入，L3 只依赖 L0/L1/L2，不 import 同层）：
 - MessageParser（L2）：_get_raw_message / _extract_at_qqs
 - ConfigStore（L1）：add_group_override_admins / remove_group_override_admins
-- PermissionService（L2）：_is_authorized
-- L0 text_utils：_parse_qq_list
-
-main.py 门面保留同名薄包装委托本服务。
+- PermissionService（L2）：_is_group_admin_or_owner
 """
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
-from .text_utils import _parse_qq_list
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .config_store import ConfigStore
@@ -42,7 +38,7 @@ if TYPE_CHECKING:
 
 
 class MessagingService:
-    """命令层公共辅助（专项管理员增删等）。"""
+    """命令层公共辅助（统一插件管理员增删）。"""
 
     def __init__(
         self,
@@ -55,28 +51,33 @@ class MessagingService:
         self._store = config_store
         self._perms = permissions
 
-    async def _edit_special_admins(self, event, target: str, key: str, label: str, add: bool):
+    async def _edit_plugin_admins(self, event, target: str, *, add: bool):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
             return
-        group_id = str(raw.get("group_id"))
-        if not self._perms._is_authorized(raw, str(raw.get("user_id"))):
-            yield event.plain_result("只有插件管理员可执行此操作")
+        group_id = str(raw["group_id"])
+        if not self._perms._is_group_admin_or_owner(raw):
+            yield event.plain_result("只有 QQ 群管理员或群主可修改本群插件管理员名单")
             return
-        qq_list = self._mp._extract_at_qqs(raw) or _parse_qq_list(target)
-        qq_list = list({str(x) for x in qq_list if x})
+
+        targets = self._mp._extract_at_qqs(raw) or re.split(r"[\s,，、]+", (target or "").strip())
+        qq_list = list(dict.fromkeys(qq for qq in targets if re.fullmatch(r"[1-9][0-9]*", qq)))
+        action = "添加" if add else "删除"
         if not qq_list:
-            action = "添加" if add else "删除"
-            yield event.plain_result(f"请提供QQ号，例如 /{action}{label}管理 123456")
+            yield event.plain_result(f"请提供有效QQ号或 @成员，例如 /{action}插件管理员 123456")
             return
-        if add:
-            changed = self._store.add_group_override_admins(group_id, key, qq_list)
-            verb = "添加"
-            empty = "所列QQ号均已存在"
-        else:
-            changed = self._store.remove_group_override_admins(group_id, key, qq_list)
-            verb = "移除"
-            empty = "所列QQ号均不存在"
-        detail = ", ".join(changed) if changed else empty
-        yield event.plain_result(f"已为群 {group_id} {verb}{label}专项管理员: {detail}")
+
+        try:
+            if add:
+                changed = self._store.add_group_override_admins(group_id, "plugin_admins", qq_list)
+            else:
+                changed = self._store.remove_group_override_admins(group_id, "plugin_admins", qq_list)
+        except Exception as e:
+            logger.error(f"{action}插件管理员失败（群 {group_id}）: {e}")
+            yield event.plain_result("[错误] 保存失败，本次修改未生效，请稍后重试")
+            return
+        if not changed:
+            yield event.plain_result("所列QQ号均已存在" if add else "所列QQ号均不存在")
+            return
+        yield event.plain_result(f"本群已{action}插件管理员：{', '.join(changed)}")

@@ -101,14 +101,14 @@ def _runtime_prop(name):
     "group_admin",
     "mjy1113451",
     "QQ群群管插件 - 禁言/踢人/头衔/精华/撤回/群公告/关键词撤回/违规检测/排名",
-    "2.8.3",
+    "2.8.4",
     "https://github.com/mjy1113451/astrbot_plugin_gm"
 )
 class GroupAdminPlugin(Star):
     """QQ 群管插件门面（阶段5 收尾后）。
 
     职责边界：
-    - 全部 @filter 入口（93 命令 + 2 事件钩子 + 1 after_message_sent）直接编排
+    - 全部 @filter 入口（命令、事件钩子和 after_message_sent）直接编排
       cop 子包中的 L3 服务实例（self._history/_stats/_api/_moderation/_colloquial/
       self._dup_face/_join_review 等），不再经过同名薄包装转发；
     - 仅保留极少量仍被引用的 glue：RuntimeState 状态 property 转发、
@@ -132,7 +132,7 @@ class GroupAdminPlugin(Star):
 
         # 旧版本地配置路径：仅用于一次性迁移 / 框架未注入 AstrBotConfig 时降级落盘
         self.config_path = self.data_dir / "config.json"
-        # 运行时动态映射（按群覆盖 / 欢迎语 / 待审申请）本地存储，见 _load_runtime_maps
+        # 运行时动态映射（按群覆盖 / 待审申请等）本地存储，由 ConfigStore 加载
         self.runtime_path = self.data_dir / "runtime.json"
         self.stats_path = self.data_dir / "stats.json"
         self.reports_path = self.data_dir / "reports.json"
@@ -337,9 +337,14 @@ class GroupAdminPlugin(Star):
         async for r in self._set_group_int_seconds_body(event, seconds, "profanity_ban_duration", "骂人"):
             yield r
 
-    @filter.command("设涉政禁言时长", "设置涉政禁言时长（分钟，全局配置，#204）")
+    @filter.command("设涉政禁言时长", "设置涉政禁言时长（分钟，全局配置；仅 QQ 群管理员/群主）")
     async def set_political_ban_duration_cmd(self, event: AstrMessageEvent, minutes: int = 0):
-        if not await self._perms._moderation_require_admin_msg(event):
+        raw = self._mp._get_raw_message(event)
+        if not raw or not raw.get("group_id"):
+            yield event.plain_result("此指令只能在群聊中使用")
+            return
+        if not self._perms._is_group_admin_or_owner(raw):
+            yield event.plain_result("只有 QQ 群管理员或群主可设置全局涉政禁言时长")
             return
         if minutes <= 0:
             yield event.plain_result("[错误] 禁言时长必须大于0")
@@ -739,62 +744,38 @@ class GroupAdminPlugin(Star):
 
     # ===================== 群管指令 =====================
 
-    @filter.command("添加插件管理", "按群添加专项权限管理员（兼容旧命令）")
-    async def add_group_admin(self, event: AstrMessageEvent, target: str = ""):
-        """兼容旧命令：按群添加插件管理员已废弃，改为按群添加专项权限管理员。"""
-        raw = self._mp._get_raw_message(event)
-        if not raw or not raw.get("group_id"):
-            yield event.plain_result("此指令只能在群聊中使用")
-            return
-        group_id = str(raw.get("group_id"))
-        if not self._perms._is_authorized(raw, str(raw.get("user_id"))):
-            yield event.plain_result("只有插件管理员可执行此操作")
-            return
-        qq_list = self._mp._extract_at_qqs(raw) or _parse_qq_list(target)
-        qq_list = list({str(x) for x in qq_list if x})
-        if not qq_list:
-            yield event.plain_result(
-                "按群插件管理已改为设管理专项权限配置。\n"
-                "请使用：/添加管理管理 QQ"
-            )
-            return
-        added = self._store.add_group_override_admins(group_id, "group_admin_admins", qq_list)
+    @filter.command(
+        "添加插件管理", "旧版专项管理员和通知名单指令已停用",
+        alias={"删除插件管理", "添加管理管理", "删除管理管理", "添加举报通知QQ",
+               "删除举报通知QQ", "查看举报通知QQ", "添加加群通知QQ", "删除加群通知QQ", "查看加群通知QQ"},
+    )
+    async def legacy_admin_list_cmd(self, event: AstrMessageEvent, target: str = ""):
         yield event.plain_result(
-            "已按群添加专项权限管理员: " + (", ".join(sorted(set(added))) if added else "所列QQ号均已存在")
+            "旧版名单指令已停用，不会修改配置。请使用 /添加插件管理员、/删除插件管理员 或 /查看插件管理员。"
         )
 
-    @filter.command("删除插件管理", "按群移除专项权限管理员（兼容旧命令）")
-    async def remove_group_admin(self, event: AstrMessageEvent, target: str = ""):
-        raw = self._mp._get_raw_message(event)
-        if not raw or not raw.get("group_id"):
-            yield event.plain_result("此指令只能在群聊中使用")
-            return
-        group_id = str(raw.get("group_id"))
-        if not self._perms._is_authorized(raw, str(raw.get("user_id"))):
-            yield event.plain_result("只有插件管理员可执行此操作")
-            return
-        qq_list = self._mp._extract_at_qqs(raw) or _parse_qq_list(target)
-        qq_list = list({str(x) for x in qq_list if x})
-        if not qq_list:
-            yield event.plain_result(
-                "按群插件管理已改为设管理专项权限配置。\n"
-                "请使用：/删除管理管理 QQ"
-            )
-            return
-        removed = self._store.remove_group_override_admins(group_id, "group_admin_admins", qq_list)
-        yield event.plain_result(
-            "已按群移除专项权限管理员: " + (", ".join(sorted(set(removed))) if removed else "所列QQ号均不存在")
-        )
-
-    @filter.command("添加管理管理", "按群添加可设置/取消群管理的专项管理员")
-    async def add_group_admin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._messaging._edit_special_admins(event, target, "group_admin_admins", "群管理", True):
+    @filter.command("添加插件管理员", "添加本群插件管理员（QQ 群管理员/群主；支持 QQ 号或 @成员）")
+    async def add_plugin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._edit_plugin_admins(event, target, add=True):
             yield result
 
-    @filter.command("删除管理管理", "按群移除可设置/取消群管理的专项管理员")
-    async def remove_group_admin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._messaging._edit_special_admins(event, target, "group_admin_admins", "群管理", False):
+    @filter.command("删除插件管理员", "删除本群插件管理员（QQ 群管理员/群主；支持 QQ 号或 @成员）")
+    async def remove_plugin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._edit_plugin_admins(event, target, add=False):
             yield result
+
+    @filter.command("查看插件管理员", "查看本群统一插件管理员名单")
+    async def view_plugin_admins_cmd(self, event: AstrMessageEvent):
+        if not await self._perms._moderation_require_admin_msg(event):
+            return
+        group_id = self._mp._get_group_id_or_none(event)
+        if not group_id:
+            return
+        admins = self._store.get_plugin_admins(group_id)
+        if admins is None:
+            yield event.plain_result("本群未配置统一插件管理员名单，仍使用旧版配置")
+        else:
+            yield event.plain_result(f"本群统一插件管理员：{', '.join(admins) or '空（已配置）'}")
 
     @filter.command("设管理", "设置群管理员（支持批量+@）")
     async def set_group_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
@@ -804,7 +785,7 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         if not self._perms.has_group_admin_rights(str(raw.get("user_id")), group_id, raw):
-            yield event.plain_result("只有插件管理员或群管理员可执行此操作")
+            yield event.plain_result("没有设置 QQ 群管理员的权限")
             return
         qq_list = self._mp._extract_at_qqs(raw) or _parse_qq_list(target)
         if not qq_list:
@@ -835,7 +816,7 @@ class GroupAdminPlugin(Star):
         qq_list = list({str(x) for x in qq_list if x})
         self_cancel = len(qq_list) == 1 and qq_list[0] == sender_id and self._perms._is_sender_group_admin_only(raw)
         if not self._perms.has_group_admin_rights(sender_id, group_id, raw) and not self_cancel:
-            yield event.plain_result("只有插件管理员、群管理员或被取消者本人可执行此操作")
+            yield event.plain_result("没有取消 QQ 群管理员的权限；QQ 群管理员可取消自己的管理身份")
             return
         results = []
         for qq in qq_list:
@@ -857,7 +838,7 @@ class GroupAdminPlugin(Star):
         sender_id = str(raw.get("user_id"))
         group_id = str(raw.get("group_id"))
         if not self._perms._is_group_admin_or_owner(raw):
-            yield event.plain_result("只有插件管理员（群管理员/群主）可执行此操作")
+            yield event.plain_result("只有 QQ 群管理员或群主可执行此操作")
             return
         target_qq = self._mp._extract_at_qq(raw)
         if not target_qq:
@@ -885,8 +866,8 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         group_id = str(raw.get("group_id"))
-        if not self._perms.has_group_admin_rights(sender_id, group_id, raw):
-            yield event.plain_result("只有插件管理员或群管理员可执行此操作")
+        if not self._perms.has_group_nickname_rights(sender_id, group_id, raw):
+            yield event.plain_result("没有设置他人群昵称的权限")
             return
         # 从原始消息提取所有 text 段拼接为 card（避免被 @ 组件挤掉）
         card = self._mp._extract_text(raw).strip()
@@ -1000,8 +981,8 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw.get("group_id"))
-        if not self._perms._is_group_admin_or_owner(raw):
-            yield event.plain_result("只有插件管理员（群管理员/群主）可执行此操作")
+        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         qq_list = self._mp._extract_at_qqs(raw) or _parse_qq_list(target)
         if not qq_list:
@@ -1060,7 +1041,7 @@ class GroupAdminPlugin(Star):
             total += recalled
         yield event.plain_result(f"已尝试撤回 {len(qq_list)} 个用户的最近消息，实际撤回 {total} 条（上限 {count} 条/人）")
 
-    # #225: /清人 — 清理 N 天未发言的普通成员（群管/群主；预览 + 确认两步执行）
+    # #225: /清人 — 清理 N 天未发言的普通成员（预览 + 确认两步执行）
     @filter.command("清人", "清理 N 天未发言成员（/清人 天数 [确认]，1-30）")
     async def purge_inactive_cmd(self, event: AstrMessageEvent):
         """踢出超过 N 天未发言的普通成员。
@@ -1074,8 +1055,8 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw.get("group_id"))
-        if not self._perms._is_group_admin_or_owner(raw):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         tail = self._mp._extract_command_tail(self._mp._extract_text(raw), ("清人",))
         numbers = re.findall(r"\d+", tail or "")
@@ -1160,11 +1141,12 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         reply_id = self._mp._get_reply_id(event)
-        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+        is_plugin_admin = self._perms._is_authorized(raw, str(raw.get("user_id", "")))
+        if not is_plugin_admin:
             # #250：bot 主人（AstrBot admins_id）未任群管时，仅放宽「引用撤回
             # bot 自身消息」这一条路径；其余撤回（@用户 N / N 条）仍需群管权限
             if not (reply_id and await self._perms._owner_may_recall_quoted(event, reply_id)):
-                yield event.plain_result("只有群管理员或群主可执行此操作（bot 主人可引用撤回 bot 自己的消息）")
+                yield event.plain_result("只有插件管理员可执行此操作（bot 主人可引用撤回 bot 自己的消息）")
                 return
         target_qq = self._mp._extract_at_qq(raw)
         self_msg_id = str(raw.get("message_id", "")) if raw.get("message_id") else ""
@@ -1179,6 +1161,10 @@ class GroupAdminPlugin(Star):
 
         # 1) 引用消息优先（保持原有语义）
         if reply_id:
+            if is_plugin_admin and not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+                if not await self._perms._owner_may_recall_quoted(event, reply_id):
+                    yield event.plain_result("无法确认引用消息来自本群")
+                    return
             ok = await self._api._recall_message(event, reply_id)
             if ok and recall_notice:
                 yield event.plain_result("撤回成功")
@@ -1316,7 +1302,7 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
 
         tail = self._mp._extract_command_tail(self._mp._extract_text(raw), ("撤回自身",))
@@ -1360,12 +1346,15 @@ class GroupAdminPlugin(Star):
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
             return
-        if not self._perms._is_group_admin(raw) and not self._perms._is_group_owner(raw):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
             yield event.plain_result("请引用一条消息后使用该指令")
+            return
+        if not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+            yield event.plain_result("无法确认引用消息来自本群")
             return
         ok = await self._api._set_essence(event, reply_id, group_id=str(raw.get("group_id")))
         yield event.plain_result("设精成功" if ok else "设精失败")
@@ -1376,12 +1365,15 @@ class GroupAdminPlugin(Star):
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
             return
-        if not self._perms._is_group_admin(raw) and not self._perms._is_group_owner(raw):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+        if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
             yield event.plain_result("请引用一条精华消息后使用该指令")
+            return
+        if not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+            yield event.plain_result("无法确认引用消息来自本群")
             return
         ok = await self._api._delete_essence(event, reply_id, group_id=str(raw.get("group_id")))
         yield event.plain_result("取消设精成功" if ok else "取消设精失败")
@@ -1402,6 +1394,10 @@ class GroupAdminPlugin(Star):
             return
         image_url = self._mp._extract_image_url(event)
         if not image_url:
+            reply_id = self._mp._get_reply_id(event)
+            if reply_id and not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+                yield event.plain_result("无法确认引用消息来自本群")
+                return
             # #230：图片在被引用的那条消息里，从引用消息中补取
             image_url = await self._mp._extract_reply_image_url(event)
         if not image_url:
@@ -1584,29 +1580,28 @@ class GroupAdminPlugin(Star):
             "time": int(time.time()),
         }
         self.reports.setdefault("pending", []).append(record)
-        self._store.save_reports()
+        self._store.save_reports(self.reports)
         # #140: 按角色分级路由通知
         # 查被举报人角色
         target_role = ""
         info = await self._api._execute_action(event, "get_group_member_info",
                                           group_id=group_id, user_id=target_qq,
                                           return_raw=True, no_cache=True)
-        if isinstance(info, dict):
-            data = info.get("data") or info
+        data = (info.get("data") or info) if isinstance(info, dict) else None
+        if isinstance(data, dict):
             target_role = data.get("role", "")
         report_text = (f"[举报] 群 {group_id}\n"
                        f"举报人: {reporter_id}\n"
                        f"被举报: {target_qq}\n"
                        f"原因: {record['reason']}")
-        # 被举报人是管理员 → 仅通知群主；普通成员 → 通知所有管理员 + 群主
-        if target_role in ("admin", "owner"):
-            # 仅通知群主
+        if target_role == "member":
+            # 仅确认是普通成员时，才使用本群统一名单（未配置时沿用旧版名单）。
+            await self._api._notify_admins(report_text, group_id=group_id, purpose="report")
+        else:
+            # 举报 QQ 群管/群主或无法确认被举报人身份时，只通知 QQ 群主。
             owner_qq = await self._api._find_group_owner(event, group_id)
             if owner_qq:
                 await self._api._send_private_msg(str(owner_qq), report_text)
-        else:
-            # 通知 report_notify_admins 配置的举报通知管理员
-            await self._api._notify_admins(report_text, group_id=group_id, purpose="report")
         yield event.plain_result("已提交举报，管理员会尽快处理")
 
     # ===================== 新增命令（#131 #135 #139 #146 #150 #151）=====================
@@ -1681,12 +1676,15 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
             yield event.plain_result("请引用一条消息后发送此命令")
+            return
+        if not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+            yield event.plain_result("无法确认引用消息来自本群")
             return
         ok, res = await self._api._call_action_fallback(
             event, ("_set_group_todo", "set_group_todo"),
@@ -1706,12 +1704,15 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
             yield event.plain_result("请引用一条群待办消息后发送此命令")
+            return
+        if not await self._perms._may_act_on_quoted_message(event, raw, reply_id):
+            yield event.plain_result("无法确认引用消息来自本群")
             return
         ok, res = await self._api._call_action_fallback(
             event, ("_delete_group_todo", "delete_group_todo"),
@@ -1731,7 +1732,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         # #235：get_group_apply_list 并非 OneBot v11 标准接口，多数协议端返回 unknown action。
@@ -1760,8 +1761,9 @@ class GroupAdminPlugin(Star):
             # 各家字段名不同：go-cqhttp 用 requester_uin/message，其它实现用 user_id/comment
             if a.get("checked"):
                 continue
+            # 接口返回机器人账号下的申请；不显示未明确归属本群的记录。
             item_gid = str(a.get("group_id", "") or "")
-            if item_gid and item_gid != group_id:
+            if item_gid != group_id:
                 continue
             sub_type = a.get("sub_type", "")
             if sub_type not in ("add", ""):
@@ -1827,7 +1829,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         reply_id = self._mp._get_reply_id(event)
         if not reply_id:
@@ -1846,7 +1848,11 @@ class GroupAdminPlugin(Star):
         if not msg:
             yield event.plain_result("无法获取引用消息内容")
             return
-        msg_data = msg.get("data") if isinstance(msg, dict) else msg
+        if not self._perms._is_group_admin_or_owner(raw) and not self._perms._is_message_in_group(
+                msg, str(raw.get("group_id"))):
+            yield event.plain_result("无法确认引用消息来自本群")
+            return
+        msg_data = msg.get("data") if isinstance(msg, dict) and isinstance(msg.get("data"), dict) else msg
         image_url = ""
         segs = msg_data.get("message") if isinstance(msg_data, dict) else None
         if isinstance(segs, str):
@@ -1939,7 +1945,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         text = self._mp._extract_text(raw).strip()
@@ -1967,7 +1973,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         text = self._mp._extract_text(raw).strip()
@@ -2037,7 +2043,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         text = self._mp._extract_text(raw).strip()
@@ -2100,7 +2106,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         reply_id = self._mp._get_reply_id(event)
@@ -2113,7 +2119,11 @@ class GroupAdminPlugin(Star):
         if not msg:
             yield event.plain_result("无法获取引用消息内容")
             return
-        msg_data = msg.get("data") if isinstance(msg, dict) else msg
+        if not self._perms._is_group_admin_or_owner(raw) and not self._perms._is_message_in_group(
+                msg, str(raw.get("group_id"))):
+            yield event.plain_result("无法确认引用消息来自本群")
+            return
+        msg_data = msg.get("data") if isinstance(msg, dict) and isinstance(msg.get("data"), dict) else msg
         image_url = ""
         if isinstance(msg_data, dict):
             for seg in (msg_data.get("message") or []):
@@ -2160,7 +2170,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         # #162 review: 校验 md5_prefix 为 hex 字符（仅 0-9a-f），避免与未来 sha256 等格式冲突
@@ -2203,7 +2213,7 @@ class GroupAdminPlugin(Star):
             return
         sender_id = str(raw.get("user_id"))
         if not self._perms._is_authorized(raw, sender_id):
-            yield event.plain_result("只有群管理员或群主可执行此操作")
+            yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
         global_banned = self._store.config_list("banned_images")
@@ -2218,7 +2228,11 @@ class GroupAdminPlugin(Star):
             lines.append(f"\n全局违禁图（{len(global_banned)} 张）：")
             for m in global_banned:
                 lines.append(f"  - {m}")
-        # #184：展示 WebUI 上传的违禁图片文件
+        group_uploaded = sorted(self._mod_image._get_banned_file_md5s(group_id))
+        if group_uploaded:
+            lines.append(f"\n本群 WebUI 上传违禁图（{len(group_uploaded)} 张；请在 WebUI 管理）：")
+            lines.extend(f"  - {md5}" for md5 in group_uploaded)
+        # #184：展示全局 WebUI 上传的违禁图片文件
         uploaded = self.config.get("banned_image_files", []) or []
         if uploaded:
             lines.append(f"\nWebUI 上传违禁图（{len(uploaded)} 张，自动计算 MD5）：")
@@ -2293,8 +2307,7 @@ class GroupAdminPlugin(Star):
         return msg
 
     async def _edit_group_override_qqs(self, event, target, key, add, ok_tpl, empty_msg):
-        """「@目标增删到本群覆盖列表」命令公共体（generator；行为逐条等价）。
-        覆盖 黑名单 / 举报通知QQ / 加群通知QQ 三组增删命令；仅结果文案与列表 key 不同。"""
+        """黑名单增删命令共用的按群列表操作。"""
         if not await self._perms._moderation_require_admin_msg(event): return
         gid = self._mp._get_group_id_or_none(event)
         if not gid: yield event.plain_result("此指令只能在群聊中使用"); return
@@ -2468,54 +2481,6 @@ class GroupAdminPlugin(Star):
         if isinstance(gl, list) and gl: lines.extend([f"全局（{len(gl)} 个）："] + [f"  {i+1}. {kw}" for i, kw in enumerate(gl)])
         yield event.plain_result("\n".join(lines) if lines else "本群与全局均无自动撤回关键词")
 
-    @filter.command("添加举报通知QQ", "添加接收举报通知的管理员QQ（按群生效）")
-    async def add_report_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for r in self._edit_group_override_qqs(
-            event, target, "report_notify_admins", True,
-            "[成功] 已添加 {n} 人（当前 {total} 人）", "[提示] 所选QQ已在列表中",
-        ):
-            yield r
-
-    @filter.command("删除举报通知QQ", "删除接收举报通知的管理员QQ（按群生效）")
-    async def remove_report_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for r in self._edit_group_override_qqs(
-            event, target, "report_notify_admins", False,
-            "[成功] 已删除 {n} 人", "[提示] 所选QQ不在列表中",
-        ):
-            yield r
-
-    @filter.command("查看举报通知QQ", "查看本群接收举报通知的管理员QQ列表")
-    async def list_report_notify_cmd(self, event: AstrMessageEvent):
-        if not await self._perms._moderation_require_admin_msg(event): return
-        gid = self._mp._get_group_id_or_none(event)
-        if not gid: yield event.plain_result("此指令只能在群聊中使用"); return
-        ql = self._store.get_group_setting(gid, "report_notify_admins", [])
-        yield event.plain_result(f"本群举报通知QQ：{', '.join(ql) if ql else '空'}")
-
-    @filter.command("添加加群通知QQ", "添加加群请求通知管理员QQ（按群生效）")
-    async def add_join_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for r in self._edit_group_override_qqs(
-            event, target, "join_notify_admins", True,
-            "[成功] 已添加 {n} 人（当前 {total} 人）", "[提示] 所选QQ已在列表中",
-        ):
-            yield r
-
-    @filter.command("删除加群通知QQ", "删除加群请求通知管理员QQ（按群生效）")
-    async def remove_join_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for r in self._edit_group_override_qqs(
-            event, target, "join_notify_admins", False,
-            "[成功] 已删除 {n} 人", "[提示] 所选QQ不在列表中",
-        ):
-            yield r
-
-    @filter.command("查看加群通知QQ", "查看本群加群请求通知管理员QQ列表")
-    async def list_join_notify_cmd(self, event: AstrMessageEvent):
-        if not await self._perms._moderation_require_admin_msg(event): return
-        gid = self._mp._get_group_id_or_none(event)
-        if not gid: yield event.plain_result("此指令只能在群聊中使用"); return
-        ql = self._store.get_group_setting(gid, "join_notify_admins", [])
-        yield event.plain_result(f"本群加群通知QQ：{', '.join(ql) if ql else '空'}")
-
     @filter.command("查看群配置", "查看本群生效的配置覆盖（仅插件管理员）")
     async def view_group_config_cmd(self, event: AstrMessageEvent):
         if not await self._perms._moderation_require_admin_msg(event):
@@ -2530,14 +2495,15 @@ class GroupAdminPlugin(Star):
         lines = [f"{key}: {self._store.get_group_setting(group_id, key)}" for key in keys]
         yield event.plain_result("本群覆盖配置：\n" + "\n".join(lines))
 
-    @filter.command("清除群配置", "清除群内指令写入的覆盖（不删除 WebUI 模板）")
+    @filter.command("清除群配置", "清除群内指令写入的覆盖（仅 QQ 群管理员/群主；不删除 WebUI 模板）")
     async def clear_group_config_cmd(self, event: AstrMessageEvent, key: str = ""):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
             return
-        if not self._perms._is_authorized(raw, str(raw.get("user_id"))):
-            yield event.plain_result("只有插件管理员可执行此操作")
+        # 清除统一名单的覆盖可能使旧版权限或通知名单重新生效。
+        if not self._perms._is_group_admin_or_owner(raw):
+            yield event.plain_result("只有 QQ 群管理员或群主可清除本群配置")
             return
         group_id = str(raw.get("group_id"))
         gconf = self._store.runtime_map("group_overrides").get(group_id, {})
@@ -2579,8 +2545,10 @@ class GroupAdminPlugin(Star):
             f"rank_top_n: {c.get('rank_top_n', 10)}",
         ]
         if group_id:
+            admins = self._store.get_plugin_admins(group_id)
+            admins_status = "未配置（沿用旧版配置）" if admins is None else f"已配置（{len(admins)} 人）"
             lines.extend([
-                f"本群 group_admin_admins: {', '.join(self._perms._effective_group_admin_admins(group_id)) or '空'}",
+                f"本群 plugin_admins: {admins_status}",
                 f"本群 mute_kick_threshold: {self._store.get_group_setting(group_id, 'mute_kick_threshold', 0)}",
             ])
         yield event.plain_result("插件配置：\n" + "\n".join(lines))
@@ -2693,7 +2661,7 @@ class GroupAdminPlugin(Star):
                 await self._stats._record_mute_and_maybe_kick(event, group_id, target_id, operator_id)
             return
 
-        # 入群欢迎 —— 阶段4 委托 JoinReviewService（原逻辑迁至 cop/join_review.py）
+        # 入群后清理该成员已完成的待审申请。
         if raw.get("post_type") == "notice" and raw.get("notice_type") == "group_increase":
             await self._join_review._handle_group_increase_notice(event, raw)
             return
@@ -2703,10 +2671,8 @@ class GroupAdminPlugin(Star):
             async for _join_result in self._join_review._handle_group_join_request(event, raw):
                 yield _join_result
 
-    # #229：原 /新人加群申请通知（join_request_notify_enabled，#205 全局开关）已随
-    # 「两项加群通知配置略微重复，删除一项」的清理一并移除。群内提醒开关统一由
-    # /开关加群申请提醒（join_request_notify_in_group，按群生效）负责；如需彻底
-    # 静音，把 join_notify_admins / /查看加群通知QQ 的列表留空即可（无收件人即不发送）。
+    # /开关加群申请提醒仅控制群内提醒。私聊通知使用本群统一插件管理员名单；
+    # 显式空名单不会发送私聊通知，未配置统一名单时才沿用旧版收件人配置。
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):

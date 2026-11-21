@@ -68,6 +68,7 @@ _install_astrbot_stubs()
 
 import cop.join_review as join_review_mod  # noqa: E402
 import cop.onebot_api as onebot_api_mod  # noqa: E402
+from cop.config_store import ConfigStore
 from cop.join_review import JoinReviewService  # noqa: E402
 from cop.onebot_api import OneBotApi  # noqa: E402
 from cop.text_utils import normalize_qq_list  # noqa: E402
@@ -84,6 +85,11 @@ class _Store:
 
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
+
+    def get_plugin_admins(self, group_id):
+        return self.settings.get("plugin_admins")
+
+    get_admin_notification_recipients = ConfigStore.get_admin_notification_recipients
 
     def get_group_scope(self, group_id, key):
         return self.get_group_setting(group_id, key, [])
@@ -145,7 +151,7 @@ class _Api:
     async def _notify_admins(self, text, group_id=None, purpose="join_request"):
         key = "report_notify_admins" if purpose == "report" else "join_notify_admins"
         store = getattr(self, "store", None)
-        if store is not None and not store.get_group_setting(group_id or "", key, []):
+        if store is not None and not store.get_admin_notification_recipients(group_id or "", key)[0]:
             return  # 与真实实现一致：没有收件人 = 没有发出去
         self.admin_texts.append(text)
 
@@ -209,24 +215,37 @@ class AuditSwitchOnlyGatesAutoActionsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("【新人加群】通知", api.group_texts[0])
         self.assertEqual(store.runtime_map("pending_join_requests")["msg-1"]["group_id"], "100")
 
-    async def test_webui_welcome_overrides_legacy_settings_only_in_its_group(self):
+    async def test_group_increase_cleans_matching_pending_without_welcome(self):
         store = make_store(self, _Config(group_overrides_templates=[
             _template_entry("100", welcome_enabled=True, welcome_message="你好 {at}"),
-            _template_entry("200", welcome_enabled=False, explicit_override_fields="welcome_enabled"),
         ]))
-        store.runtime_map("groups").update({
-            "200": {"welcome_enabled": True},
-            "300": {"welcome_enabled": True, "welcome_message": "旧欢迎语 {at}"},
+        store.runtime_map("groups")["200"] = {
+            "welcome_enabled": True, "welcome_message": "旧欢迎语 {at}",
+        }
+        unrelated = {
+            "other-user": {"group_id": "100", "user_id": "888"},
+            "other-group": {"group_id": "200", "user_id": "777"},
+        }
+        pending = store.runtime_map("pending_join_requests")
+        pending.update(unrelated)
+        pending.update({
+            "msg-1": {"group_id": "100", "user_id": "777"},
+            "flag:f-1": {"group_id": 100, "user_id": 777},
         })
         api = _Api()
         api._send = mock.AsyncMock()
         service = _make_service(store, api)
         service._mp = SimpleNamespace(_build_text=str)
-        for gid in ("100", "200", "300"):
-            await service._handle_group_increase_notice(gid, {"group_id": gid, "user_id": "777"})
-        self.assertEqual(api._send.await_args_list, [
-            mock.call("100", "你好 @777"), mock.call("300", "旧欢迎语 @777"),
-        ])
+
+        with mock.patch.object(store, "save_config", wraps=store.save_config) as save:
+            await service._handle_group_increase_notice(_Event(), _add_raw())
+            self.assertEqual(pending, unrelated)
+            await service._handle_group_increase_notice(_Event(), _add_raw(group_id=200, user_id="999"))
+            save.assert_called_once_with()
+
+        api._send.assert_not_called()
+        self.assertEqual(api.group_texts, [])
+        self.assertEqual(pending, unrelated)
 
     async def test_audit_off_still_sends_group_reminder(self):
         store = _Store({
@@ -419,6 +438,22 @@ class RequestLogConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("通知QQ=1人", lines[0])
 
+    async def test_explicit_empty_unified_list_disables_legacy_private_lookup_and_delivery(self):
+        store = _Store({
+            "join_audit_enabled": False,
+            "join_request_notify_in_group": False,
+            "join_notify_admins": ["111"],
+            "plugin_admins": [],
+        })
+        api = _Api()
+        recorder = _RecordingLogger()
+        with mock.patch.object(join_review_mod, "logger", recorder):
+            await _drain(_make_service(store, api)._handle_group_join_request(_Event(), _add_raw()))
+        self.assertEqual(api.nickname_queries, [])
+        self.assertEqual(api.level_queries, [])
+        self.assertEqual(api.admin_texts, [])
+        self.assertTrue(any("通知QQ=0人" in msg for _, msg in recorder.records))
+
     async def test_request_log_flags_both_channels_off(self):
         store = _Store({
             "join_request_notify_in_group": False,
@@ -500,6 +535,22 @@ class NotifyAdminsRecipientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("回退", warnings[0])
         self.assertIn("report_notify_admins", warnings[0])
+
+    async def test_unified_recipients_replace_both_legacy_lists_even_when_empty(self):
+        for admins in (["999"], []):
+            with self.subTest(admins=admins):
+                sent = []
+                api = self._api({
+                    "plugin_admins": admins, "join_notify_admins": ["111"],
+                    "report_notify_admins": ["333"],
+                }, sent)
+                recorder = _RecordingLogger()
+                with mock.patch.object(onebot_api_mod, "logger", recorder):
+                    await api._notify_admins("加群", group_id="100", purpose="join_request")
+                    await api._notify_admins("举报", group_id="100", purpose="report")
+                self.assertEqual(sent, [(qq, text) for text in ("加群", "举报") for qq in admins])
+                if not admins:
+                    self.assertTrue(all("plugin_admins" in msg for _, msg in recorder.records))
 
     async def test_report_purpose_uses_report_notify_admins(self):
         sent = []

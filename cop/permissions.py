@@ -1,7 +1,7 @@
 """L2 权限判定层：插件管理员 / 群主 / 群管理员 / 专项「设管理」名单等权限判定。
 
 迁出自 main.py 的权限相关方法。依赖：
-- L1 ConfigStore（构造注入）：读取本群生效的专项权限名单
+- L1 ConfigStore（构造注入）：读取本群统一名单及旧专项权限名单
 - 同层 MessageParser（构造注入）：仅 _moderation_require_admin(_msg) 需要读 raw
 
 依赖规则：不 import 同层模块，MessageParser 通过构造注入（TYPE_CHECKING + 字符串注解）。
@@ -40,8 +40,14 @@ class PermissionService:
     # ---------- 基础角色判定 ----------
 
     def _is_authorized(self, raw: dict, user_id: str = "") -> bool:
-        """是否具备插件管理权限：仅 QQ 群管理员 + QQ 群主。"""
-        return self._is_group_admin_or_owner(raw)
+        """只有当前群真实发送者可使用该群配置的插件管理权限。"""
+        if self._is_group_admin_or_owner(raw):
+            return True
+        group_id = str(raw.get("group_id") or "")
+        sender_id = str(raw.get("user_id") or "")
+        if not group_id or not sender_id or (user_id and str(user_id) != sender_id):
+            return False
+        return sender_id in (self._store.get_plugin_admins(group_id) or [])
 
     def _is_bot_owner(self, event) -> bool:
         """#250：发送者是否为 AstrBot 主人（WebUI admins_id 配置的管理员）。
@@ -72,6 +78,19 @@ class PermissionService:
             return sender_id in [str(x) for x in (admins or [])]
         except Exception:
             return False
+
+    @staticmethod
+    def _is_message_in_group(result, group_id: str) -> bool:
+        if not group_id or not isinstance(result, dict):
+            return False
+        message = result.get("data") if isinstance(result.get("data"), dict) else result
+        return message.get("message_type", "group") == "group" and str(message.get("group_id") or "") == group_id
+
+    async def _may_act_on_quoted_message(self, event, raw: dict, reply_id: str) -> bool:
+        if self._is_group_admin_or_owner(raw):
+            return True
+        result = await self._api._execute_action(event, "get_msg", message_id=str(reply_id), return_raw=True)
+        return self._is_message_in_group(result, str(raw.get("group_id") or ""))
 
     async def _owner_may_recall_quoted(self, event, reply_id: str) -> bool:
         """#250：bot 主人未任群管时，是否允许撤回被引用消息。
@@ -123,17 +142,21 @@ class PermissionService:
         """本群生效的「设管理」专项名单：群内指令优先于 WebUI 按群名单。"""
         return self._store.get_group_override_list(group_id, "group_admin_admins")
 
-    def has_group_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
-        """设管理/取消管理权限：设管理专项名单或插件管理员（群管理员/群主）。
+    def _has_legacy_specialist_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
+        return (
+            bool(group_id and user_id)
+            and str(raw.get("group_id") or "") == str(group_id)
+            and str(raw.get("user_id") or "") == str(user_id)
+            and self._store.get_plugin_admins(group_id) is None
+            and str(user_id) in self._effective_group_admin_admins(group_id)
+        )
 
-        专项名单来源见 _effective_group_admin_admins（群内指令 > WebUI 按群名单）。
-        """
-        uid = str(user_id)
-        if uid in self._effective_group_admin_admins(group_id):
-            return True
-        if self._is_group_admin_or_owner(raw):
-            return True
-        return False
+    def has_group_admin_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
+        """统一名单不允许改变 QQ 群角色，避免间接授予插件管理权限。"""
+        return self._is_group_admin_or_owner(raw) or self._has_legacy_specialist_rights(user_id, group_id, raw)
+
+    def has_group_nickname_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
+        return self._is_authorized(raw, user_id) or self._has_legacy_specialist_rights(user_id, group_id, raw)
 
     # ---------- 违规检测管理命令前置校验 ----------
 

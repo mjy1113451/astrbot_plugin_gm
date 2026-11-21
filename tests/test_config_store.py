@@ -672,18 +672,80 @@ class GroupOverrideTests(unittest.TestCase):
             _template_entry("200", join_notify_admins=["10001"], group_admin_admins=["10002"]),
         ]))
         perms = PermissionService(config_store=store, message_parse=None, onebot_api=None)
-        raw = {"sender": {"role": "member"}}
+        def raw(gid, uid):
+            return {"group_id": gid, "user_id": uid, "sender": {"role": "member"}}
         store.runtime_map("group_overrides")["100"] = {"group_admin_admins": []}
-        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
-        self.assertFalse(perms.has_group_admin_rights("10001", "200", raw))
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw("100", "10001")))
+        self.assertFalse(perms.has_group_admin_rights("10001", "200", raw("200", "10001")))
         self.assertEqual(store.add_group_override_admins("100", "group_admin_admins", ["10003"]), ["10003"])
-        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw("100", "10001")))
         self.assertEqual(store.remove_group_override_admins("100", "group_admin_admins", ["10001", "10003"]),
                          ["10001", "10003"])
-        self.assertFalse(perms.has_group_admin_rights("10001", "100", raw))
-        self.assertTrue(perms.has_group_admin_rights("10002", "200", raw))
+        self.assertFalse(perms.has_group_admin_rights("10001", "100", raw("100", "10001")))
+        self.assertTrue(perms.has_group_admin_rights("10002", "200", raw("200", "10002")))
         self.assertTrue(store.drop_group_override("100", "group_admin_admins"))
-        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw))
+        self.assertTrue(perms.has_group_admin_rights("10001", "100", raw("100", "10001")))
+
+    def test_unified_admins_are_scoped_and_never_promote_legacy_lists(self):
+        def row(group_id, value):
+            return {"__template_key": "group", "group_id": group_id, "value": value}
+
+        store = self.make_store(_Config(
+            plugin_admins_group_overrides=[row("100", ["111", "111"]), row("100", ["invalid"])],
+            group_admin_admins_group_overrides=[row("100", ["222"]), row("200", ["222"])],
+            join_notify_admins=["333"], report_notify_admins=["444"],
+        ))
+        perms = PermissionService(config_store=store, message_parse=None, onebot_api=None)
+
+        def raw(gid, uid, role="member"):
+            return {"group_id": gid, "user_id": uid, "sender": {"role": role}}
+
+        self.assertEqual(store.get_plugin_admins("100"), ["111"])
+        self.assertIsNone(store.get_plugin_admins("200"))
+        self.assertTrue(perms._is_authorized(raw("100", "111"), "111"))
+        self.assertFalse(perms._is_authorized(raw("200", "111"), "111"))
+        self.assertFalse(perms._is_authorized(raw("100", "999"), "111"))
+        self.assertFalse(perms._is_authorized(raw("", "111")))
+        self.assertFalse(perms._is_authorized(raw("100", "333")))
+        self.assertFalse(perms._is_authorized(raw("200", "444")))
+        self.assertTrue(perms._is_authorized(raw("200", "999", "admin")))
+        self.assertTrue(perms._is_authorized(raw("200", "999", "owner")))
+        self.assertTrue(perms.has_group_admin_rights("222", "200", raw("200", "222")))
+        self.assertFalse(perms.has_group_admin_rights("222", "200", raw("100", "222")))
+        self.assertFalse(perms.has_group_admin_rights("222", "100", raw("100", "222")))
+        self.assertFalse(perms.has_group_admin_rights("111", "100", raw("100", "111")))
+        self.assertTrue(perms.has_group_nickname_rights("111", "100", raw("100", "111")))
+        self.assertFalse(perms.has_group_nickname_rights("222", "100", raw("100", "222")))
+        self.assertEqual(store.get_admin_notification_recipients("100", "report_notify_admins"),
+                         (["111"], "plugin_admins"))
+        self.assertEqual(store.get_admin_notification_recipients("200", "report_notify_admins"),
+                         (["444"], "report_notify_admins"))
+        self.assertEqual(store.remove_group_override_admins("100", "plugin_admins", ["111"]), ["111"])
+        self.assertEqual(store.get_plugin_admins("100"), [])
+        self.assertFalse(perms._is_authorized(raw("100", "111")))
+        self.assertEqual(store.get_admin_notification_recipients("100", "join_notify_admins"),
+                         ([], "plugin_admins"))
+        self.assertTrue(store.drop_group_override("100", "plugin_admins"))
+        self.assertEqual(store.get_plugin_admins("100"), ["111"])
+
+    def test_group_image_file_rows_are_additive_without_replacing_manual_md5s(self):
+        digest = "0" * 32
+        def row(group_id, **fields):
+            return {"__template_key": "group", "group_id": group_id, **fields}
+
+        store = self.make_store(_Config(banned_images_group_overrides=[
+            row("100", value=[digest], files=["one.png"]),
+            row("100", files=["one.png", "two.png", 123]),
+            row("100", value=[], files=["three.png"]),
+            row("200", value=[], files=["other.png"]),
+        ]))
+        self.assertEqual(store.get_group_banned_image_files("100"), ["one.png", "two.png", "three.png"])
+        self.assertEqual(store.get_group_banned_image_files("200"), ["other.png"])
+        self.assertEqual(store.get_group_banned_image_files("300"), [])
+        self.assertEqual(store.get_group_setting("100", "banned_images"), [digest])
+        store.set_group_override("100", "banned_images", [])
+        self.assertEqual(store.get_group_setting("100", "banned_images"), [])
+        self.assertEqual(store.get_group_banned_image_files("100"), ["one.png", "two.png", "three.png"])
 
     def test_runtime_override_wins_over_template(self):
         store = self.make_store(
@@ -1329,8 +1391,7 @@ class GroupOverrideTests(unittest.TestCase):
         dedicated_defaults = {
             "enabled_groups": "", "auto_recall_enabled_groups": "",
             "group_admin_admins": [], "mute_kick_threshold": 0, "violation_keywords": [],
-            "banned_images": [], "profanity_keywords": [], "welcome_enabled": False,
-            "welcome_message": "欢迎 {at} 加入本群！",
+            "banned_images": [], "profanity_keywords": [],
         }
         global_only = {
             "group_admin_admins_by_group", "api_type", "api_endpoint", "api_key",
@@ -1342,7 +1403,15 @@ class GroupOverrideTests(unittest.TestCase):
         suffix = "_group_overrides"
         lists = {key.removesuffix(suffix): spec for key, spec in schema.items() if key.endswith(suffix)}
         self.assertTrue(template_list["invisible"])
-        self.assertEqual(lists.keys(), items.keys() - {"group_id", "explicit_override_fields"})
+        self.assertEqual(lists.keys(), (items.keys() - {"group_id", "explicit_override_fields"}) | {"plugin_admins"})
+        for key in ("welcome_enabled", "welcome_message"):
+            self.assertNotIn(key, lists)
+            self.assertNotIn(key, items)
+        for key in ("join_notify_admins", "report_notify_admins", "group_admin_admins"):
+            self.assertTrue(lists[key]["invisible"])
+            if key in schema:
+                self.assertTrue(schema[key]["invisible"])
+        self.assertFalse(lists["plugin_admins"].get("invisible", False))
         ordered_keys = list(schema)
         for key, spec in lists.items():
             with self.subTest(setting=key):
@@ -1350,9 +1419,13 @@ class GroupOverrideTests(unittest.TestCase):
                 self.assertEqual(spec["default"], [])
                 row = spec["templates"]["group"]
                 self.assertEqual(row["display_item"], "group_id")
-                self.assertEqual(row["items"].keys(), {"group_id", "value"})
+                expected_fields = {"group_id", "value"}
+                if key == "banned_images":
+                    expected_fields.add("files")
+                    self.assertEqual(row["items"]["files"]["type"], "file")
+                self.assertEqual(row["items"].keys(), expected_fields)
                 self.assertEqual(row["items"]["group_id"]["type"], "string")
-                self.assertEqual(row["items"]["value"]["type"], items[key]["type"])
+                self.assertEqual(row["items"]["value"]["type"], "list" if key == "plugin_admins" else items[key]["type"])
                 if key in schema:
                     self.assertEqual(ordered_keys[ordered_keys.index(key) + 1], key + suffix)
         shared = schema.keys() - global_only - dedicated_defaults.keys() - {key + suffix for key in lists}
