@@ -58,7 +58,7 @@
 
 > ⚠️ 违禁图检测基于 MD5 比对，仅能阻止原图二次传播。攻击者对图片做轻微改动（裁剪/压缩/加噪）会绕过。建议作为快速预筛，主防御仍依赖 AI 鉴图。
 >
-> 全局违禁图片仍通过 WebUI 上传（`banned_image_files`）。只想在某个群生效时，在「本群违禁图片 · 按群配置」填写群号并上传图片（每张最多 10 MiB），插件会自动计算 MD5，按文件内容精确比对。也可填写本群 MD5 或在群内引用图片执行 `/添加违禁图片`；群内删除指令只修改手动 MD5 名单。
+> 全局违禁图片仍通过 WebUI 上传（`banned_image_files`）。只想在某个群生效时，在「本群违禁图片 · 按群配置」填写群号并上传图片（每张最多 10 MiB），插件会自动计算 MD5，按文件内容精确比对。WebUI 不再提供手填 MD5 的入口，已有记录仍生效。群内仍可引用图片执行 `/添加违禁图片`；`/删除违禁图片` 只移除 MD5 记录，上传文件请在 WebUI 管理。
 >
 > 按群上传的文件只在引用它的群生效，但 AstrBot 为此配置项的所有条目共用一个上传目录。请给不同图片使用不同文件名：覆盖或删除文件会影响所有引用它的条目；仅移除整个群条目不会删除文件。
 
@@ -259,7 +259,7 @@ pip install astrbot_plugin_group_admin
 | `profanity_severity_enabled` | bool | `true` | AI 判骂人分级禁言开关（#243；关闭后一律按 `profanity_ban_duration` 固定时长；可按群覆盖） |
 | `profanity_ban_duration_severity` | dict | `{"mild":180,"medium":600,"severe":1800}` | AI 判骂人按严重程度分级禁言时长（秒，#243；模型未返回/返回非法时回退 `profanity_ban_duration`；可按群覆盖） |
 | `<字段名>_group_overrides` | template_list | `[]` | 每个可按群设置的项目都有独立列表；统一插件管理员使用 `plugin_admins_group_overrides` |
-| `banned_image_files` | file | `[]` | **全局**违禁图片上传（自动计算 MD5）；单群的 `banned_images` 在模板中填写 |
+| `banned_image_files` | file | `[]` | **全局**违禁图片上传（自动计算 MD5）；单群图片在「本群违禁图片 · 按群配置」上传 |
 | `qr_code_recall_enabled` | bool | `false` | 二维码识别检测（#237：图片审核通路额外用视觉模型识别二维码并分类内容——普通二维码（收款码/好友码/活动码等）仅撤回；拉群广告二维码按广告违规禁言、黄赌毒二维码按违规图片禁言（撤回+禁言+计数）；仅 api_type=openai_vision 时生效；模型/接口异常时按未命中放行（fail-open，误放行优于误撤回），失败会记录 error 日志；推荐按群覆盖 `/开关二维码撤回 on|off`） |
 | `kick_recall_enabled` | bool | `false` | 踢人时自动撤回该成员最近消息（#145，对齐 zcj-ui/astrbot_plugin_group_guardian） |
 | `kick_recall_count` | int | `10` | 踢人撤回消息条数（1-50，#145） |

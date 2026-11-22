@@ -2199,7 +2199,7 @@
     "banned_images_group_overrides": {
         "description": "本群违禁图片 · 按群配置",
         "type": "template_list",
-        "hint": "按群上传图片或填写 MD5。上传文件只在选用它的群生效；同群可添加多个上传条目。群内 MD5 指令与上传图片独立生效。",
+        "hint": "填写群号并上传图片，自动计算 MD5。上传文件只在选用它的群生效；同群可添加多个上传条目。",
         "default": [],
         "templates": {
             "group": {
@@ -2213,9 +2213,9 @@
                         "default": ""
                     },
                     "value": {
-                        "description": "手动填写 MD5 列表",
+                        "description": "旧版图片 MD5（仅兼容已有配置）",
                         "type": "list",
-                        "hint": "群内指令：引用图片执行 /添加违禁图片，或用 /删除违禁图片 <MD5前缀> 移除本群记录。每项填一个 32 位小写十六进制 MD5；全局上传的违禁图片仍生效。",
+                        "invisible": true,
                         "default": []
                     },
                     "files": {

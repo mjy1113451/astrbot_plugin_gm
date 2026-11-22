@@ -216,7 +216,7 @@
 | 73 | `link_fetch_timeout` | int | `5` |
 | 74 | `group_overrides_templates`（隐藏，兼容旧配置） | template_list | `[]` |
 
-WebUI 各项的 `<字段名>_group_overrides` 为独立 `template_list`，默认空列表。每条为 `{"__template_key": "group", "group_id": "123456789", "value": ...}`。`value` 使用对应设置的类型；两个范围项使用 `inherit` / `on` / `off`。同群同设置最后一条有效记录优先，群内指令仍高于 WebUI。`banned_images_group_overrides` 的 `files` 为原生上传字段，同群文件引用取所有条目的并集；只上传文件的条目不会覆盖手动 MD5。`plugin_admins_group_overrides` 为统一名单，空列表明确停用本群旧授权和私聊通知。`group_overrides_templates` 仅为隐藏的升级兼容键，迁移成功后清空。
+WebUI 各项的 `<字段名>_group_overrides` 为独立 `template_list`，默认空列表。每条为 `{"__template_key": "group", "group_id": "123456789", "value": ...}`。`value` 使用对应设置的类型；两个范围项使用 `inherit` / `on` / `off`。同群同设置最后一条有效记录优先，群内指令仍高于 WebUI。`banned_images_group_overrides` 的 `files` 为原生上传字段，同群文件引用取所有条目的并集；`value` 隐藏，仅保留既有 MD5，不再提供填写入口。`plugin_admins_group_overrides` 为统一名单，空列表明确停用本群旧授权和私聊通知。`group_overrides_templates` 仅为隐藏的升级兼容键，迁移成功后清空。
 
 ## 4. 数据文件路径与 data_dir 推导
 

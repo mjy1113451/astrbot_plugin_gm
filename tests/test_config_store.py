@@ -1450,6 +1450,10 @@ class GroupOverrideTests(unittest.TestCase):
                 if key == "banned_images":
                     expected_fields.add("files")
                     self.assertEqual(row["items"]["files"]["type"], "file")
+                    self.assertEqual(
+                        {name for name, field in row["items"].items() if not field.get("invisible")},
+                        {"group_id", "files"},
+                    )
                 self.assertEqual(row["items"].keys(), expected_fields)
                 self.assertEqual(row["items"]["group_id"]["type"], "string")
                 self.assertEqual(row["items"]["value"]["type"], "list" if key == "plugin_admins" else items[key]["type"])
