@@ -126,6 +126,38 @@ class PluginAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已清除", [msg async for msg in p.clear_group_config_cmd(owner)][0])
         self.assertIsNone(p._store.get_plugin_admins("12345"))
 
+    async def test_unified_admin_can_view_only_their_own_group_list(self):
+        p = self.plugin
+        p._store.set_group_override("12345", "plugin_admins", ["67890", "55555"])
+        p._store.set_group_override("12346", "plugin_admins", ["77777"])
+        event = self.event()
+        for role in ("member", "admin", "owner"):
+            with self.subTest(role=role):
+                event.raw_message["sender"]["role"] = role
+                reply = [msg async for msg in p.view_plugin_admins_cmd(event)][0]
+                self.assertIn("67890, 55555", reply)
+
+        event.raw_message["sender"]["role"] = "member"
+        event.raw_message["group_id"] = 12346
+        p._api._send = AsyncMock()
+        with patch.object(p._mp, "_build_text", side_effect=lambda text: text):
+            self.assertEqual([msg async for msg in p.view_plugin_admins_cmd(event)], [])
+        p._api._send.assert_awaited_once_with(event, "只有插件管理员可执行此操作")
+
+    async def test_legacy_notify_view_only_reports_inactive_status_when_unified_is_configured(self):
+        p = self.plugin
+        p._store.config.update(report_notify_admins=["55555"], join_notify_admins=["66666"])
+        owner = self.event("owner")
+        for admins in (["67890"], []):
+            p._store.set_group_override("12345", "plugin_admins", admins)
+            for command in (p.list_report_notify_cmd, p.list_join_notify_cmd):
+                with self.subTest(admins=admins, command=command.__name__):
+                    reply = [msg async for msg in command(owner)][0]
+                    self.assertIn("旧通知名单不生效", reply)
+                    self.assertIn("/查看插件管理员", reply)
+                    self.assertNotIn("55555", reply)
+                    self.assertNotIn("66666", reply)
+
     async def test_legacy_aliases_retire_without_writing_and_delegation_cannot_set_qq_role(self):
         p = self.plugin
         self.assertEqual(p.legacy_admin_list_cmd.command_names, {

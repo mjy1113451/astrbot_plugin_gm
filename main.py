@@ -763,7 +763,7 @@ class GroupAdminPlugin(Star):
         async for result in self._messaging._manage_admin_list(event, target, add=False):
             yield result
 
-    @filter.command("查看插件管理员", "查看本群统一插件管理员名单")
+    @filter.command("查看插件管理员", "查看本群统一插件管理员名单（QQ 群主、原生群管理员或本群统一插件管理员）")
     async def view_plugin_admins_cmd(self, event: AstrMessageEvent):
         if not await self._perms._moderation_require_admin_msg(event):
             return
@@ -2489,7 +2489,7 @@ class GroupAdminPlugin(Star):
         async for result in self._messaging._manage_admin_list(event, target, add=False, legacy_key="report_notify_admins"):
             yield result
 
-    @filter.command("查看举报通知QQ", "查看本群旧版举报私聊通知QQ（仅在未配置统一名单时可用）")
+    @filter.command("查看举报通知QQ", "查看本群旧版举报私聊通知QQ（仅 QQ 群主或原生群管理员；已配置统一名单时只提示旧名单不生效）")
     async def list_report_notify_cmd(self, event: AstrMessageEvent):
         async for result in self._messaging._manage_admin_list(event, "", add=None, legacy_key="report_notify_admins"):
             yield result
@@ -2504,7 +2504,7 @@ class GroupAdminPlugin(Star):
         async for result in self._messaging._manage_admin_list(event, target, add=False, legacy_key="join_notify_admins"):
             yield result
 
-    @filter.command("查看加群通知QQ", "查看本群旧版加群私聊通知QQ（仅在未配置统一名单时可用）")
+    @filter.command("查看加群通知QQ", "查看本群旧版加群私聊通知QQ（仅 QQ 群主或原生群管理员；已配置统一名单时只提示旧名单不生效）")
     async def list_join_notify_cmd(self, event: AstrMessageEvent):
         async for result in self._messaging._manage_admin_list(event, "", add=None, legacy_key="join_notify_admins"):
             yield result
