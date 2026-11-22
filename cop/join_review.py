@@ -1,11 +1,11 @@
 """L3b 加群审核域（#27 合并 group_manager + #57 引用回复审批）。
 
-迁出自 main.py 的以下逻辑（逐字保留逻辑等价）：
-    on_group_event 中的「入群欢迎」「加群请求自动审核」分支
+源自 main.py 的以下逻辑：
+    on_group_event 中的入群待处理申请清理、加群请求自动审核
     加群申请引用回复处理（#57，原 on_group_message 尾部代码块）
 
 对外方法：
-    _handle_group_increase_notice(event, raw)          —— 入群欢迎（notice.group_increase）
+    _handle_group_increase_notice(event, raw)          —— 入群后清理待处理申请（notice.group_increase）
     _handle_group_join_request(event, raw)             —— 加群请求自动审核（request.group）
     _handle_group_request_reply(event, raw, gid, uid, reply_id) —— 引用回复同意/拒绝/拉黑
 
@@ -31,8 +31,6 @@ from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
-from .text_utils import normalize_qq_list
-
 if TYPE_CHECKING:
     from .config_store import ConfigStore
     from .message_parse import MessageParser
@@ -47,7 +45,7 @@ def _sanitize(text, limit: int = 40) -> str:
 
 
 class JoinReviewService:
-    """加群审核与入群欢迎领域服务。"""
+    """加群审核与待处理申请清理服务。"""
 
     def __init__(
         self,
@@ -68,7 +66,7 @@ class JoinReviewService:
         self.context = context
 
     async def _handle_group_increase_notice(self, event, raw: dict):
-        """入群欢迎（原 on_group_event 的 notice.group_increase 分支）。"""
+        """入群后清理对应的待处理申请。"""
         group_id = str(raw.get("group_id"))
         # #271：用户已实际入群，清理其可能残留的待处理申请，
         # 避免「已入群却仍显示新人申请 / 待处理列表残留」
@@ -85,16 +83,6 @@ class JoinReviewService:
                 del pending[k]
             if stale_keys:
                 self._store.save_config()
-        welcome_conf = self._store.runtime_map("groups").get(group_id, {})
-        welcome_enabled = self._store.get_group_setting(
-            group_id, "welcome_enabled", welcome_conf.get("welcome_enabled", False)
-        )
-        if welcome_enabled:
-            welcome = self._store.get_group_setting(
-                group_id, "welcome_message", welcome_conf.get("welcome_message", "欢迎 {at} 加入本群！")
-            )
-            content = welcome.replace("{at}", f"@{raw.get('user_id')}")
-            await self._api._send(event, self._mp._build_text(content))
 
     async def _handle_group_join_request(self, event, raw: dict):
         """加群请求处理（#27 合并 group_manager）。为 async generator（yield 审批结果）。
@@ -135,8 +123,7 @@ class JoinReviewService:
         audit_enabled = bool(self._store.get_group_setting(group_id, "join_audit_enabled", True))
         notify_in_group = bool(
             self._store.get_group_setting(group_id, "join_request_notify_in_group", False))
-        notify_admins = normalize_qq_list(
-            self._store.get_group_setting(group_id, "join_notify_admins", []))
+        notify_admins, _ = self._store.get_admin_notification_recipients(group_id, "join_notify_admins")
         logger.info(
             f"[加群审核] 群 {group_id} 通知配置：自动审核={'开' if audit_enabled else '关'}，"
             f"群内提醒={'开' if notify_in_group else '关'}，通知QQ={len(notify_admins)}人"
@@ -355,7 +342,7 @@ class JoinReviewService:
             if not handled:
                 return
             # #229：原 join_request_notify_enabled（#205）全局开关已随配置去重移除，
-            # 通知改为始终发送；需要彻底静音时把 join_notify_admins 留空即可
+            # 是否发送私聊由本群生效的通知名单决定
             invite_note = f"邀请人QQ: {inviter_id}\n" if third_party_invite else ""
             await self._api._notify_admins(
                 f"[加群请求] 已同意 {applicant_id}（群 {group_id}）\n"
@@ -554,9 +541,10 @@ class JoinReviewService:
         pending = self._store.runtime_map("pending_join_requests")
         # #258：通知消息 ID 没记进待处理表时，按被引用消息内容里的
         # 「用户qq号」兜底定位同群待处理记录
-        info = pending.get(str(reply_id)) or self._api._match_pending_by_quote(
-            event, group_id, str(reply_id), pending)
-        if not info:
+        info = pending.get(str(reply_id))
+        if info is None:
+            info = await self._api._match_pending_by_quote(event, group_id, str(reply_id), pending)
+        if not isinstance(info, dict) or str(info.get("group_id") or "") != str(group_id):
             return
         msg_text = self._mp._extract_text(raw)
         if not msg_text:

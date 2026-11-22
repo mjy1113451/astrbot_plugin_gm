@@ -37,6 +37,7 @@ if "astrbot" not in sys.modules:
     sys.modules["astrbot"] = astrbot
     sys.modules["astrbot.api"] = api
 
+from cop.config_store import ConfigStore
 from cop.join_review import JoinReviewService  # noqa: E402
 
 
@@ -52,6 +53,13 @@ class _Store:
 
     def get_group_setting(self, group_id, key, default=None):
         return self.settings.get(key, default)
+
+    def get_plugin_admins(self, group_id):
+        return self.settings.get("plugin_admins")
+
+    _LIST_SNAPSHOT = ConfigStore._LIST_SNAPSHOT
+    _is_explicit_snapshot = ConfigStore._is_explicit_snapshot
+    get_admin_notification_recipients = ConfigStore.get_admin_notification_recipients
 
     def get_group_scope(self, group_id, key):
         return self.get_group_setting(group_id, key, [])
@@ -329,6 +337,29 @@ class UnknownInviteeReplyTests(unittest.IsolatedAsyncioTestCase):
         svc, api = self._service(record, "拉黑")
         await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
         self.assertEqual(api.handled, [])
+
+    async def test_quoted_request_from_another_group_is_not_processed(self):
+        record = {"flag": "foreign", "group_id": "200", "user_id": "777"}
+        svc, api = self._service(record, "同意")
+        out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-1"))
+        self.assertEqual(out, [])
+        self.assertEqual(api.handled, [])
+        self.assertEqual(svc._store.runtime_map("pending_join_requests")["mid-1"], record)
+
+    async def test_missing_message_id_awaits_same_group_lookup(self):
+        record = {"flag": "f-local", "group_id": "100", "user_id": "777"}
+        svc, api = self._service(record, "同意")
+        lookup_args = []
+
+        async def lookup(event, group_id, reply_id, pending):
+            lookup_args.append((group_id, reply_id))
+            return next(iter(pending.values()))
+
+        api._match_pending_by_quote = lookup
+        out = await _drain(svc._handle_group_request_reply(_Event(), {}, "100", "1", "mid-other"))
+        self.assertEqual(lookup_args, [("100", "mid-other")])
+        self.assertEqual(len(api.handled), 1)
+        self.assertIn("已同意", str(out[0]))
 
     async def test_known_applicant_still_handled(self):
         record = {

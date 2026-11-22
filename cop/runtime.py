@@ -49,6 +49,6 @@ class RuntimeState:
         # #152：发言计数批量持久化计数器
         self._msg_save_counter: int = 0
 
-        # #184：WebUI 上传违禁图片文件的 MD5 缓存
-        # {相对路径: md5}；未命中缓存的路径在运行时懒计算并回填。
-        self._banned_file_md5_cache: dict = {}
+        # #184 / #296：WebUI 上传违禁图片文件的 MD5 缓存。
+        # {解析后的绝对路径: (文件状态签名, md5)}；仅在文件未变化时复用。
+        self._banned_file_md5_cache: dict[str, tuple[tuple[int, ...], str]] = {}

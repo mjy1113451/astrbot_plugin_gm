@@ -354,7 +354,7 @@ class ColloquialService:
 
         if intent == "unadmin":
             if not self._perms.has_group_admin_rights(user_id, group_id, raw):
-                await self._api._send(event, self._mp._build_text("只有插件管理员或群管理员可取消群管理"))
+                await self._api._send(event, self._mp._build_text("只有 QQ 群主或群管理员可取消群管理"))
                 return True
             ok = await self._api._set_group_admin(event, group_id, target, False)
             msg = f"已取消 {target} 的群管理" if ok else \
@@ -364,7 +364,7 @@ class ColloquialService:
 
         # intent == "admin"
         if not self._perms.has_group_admin_rights(user_id, group_id, raw):
-            await self._api._send(event, self._mp._build_text("只有插件管理员或群管理员可授予群管理"))
+            await self._api._send(event, self._mp._build_text("只有 QQ 群主或群管理员可授予群管理"))
             return True
         ok = await self._api._set_group_admin(event, group_id, target, True)
         msg = f"已将 {target} 设为群管理" if ok else \

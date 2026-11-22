@@ -334,19 +334,46 @@
             }
         }
     },
+    "plugin_admins_group_overrides": {
+        "description": "插件管理员 · 按群配置",
+        "type": "template_list",
+        "hint": "名单成员可在本群使用插件管理指令，并接收加群和举报私聊通知。仅添加受信任的 QQ。保留空名单可停用旧名单；未配置统一名单时仅兼容旧名单原有用途。群内增删按 QQ 叠加到 WebUI 名单。",
+        "default": [],
+        "templates": {
+            "group": {
+                "name": "单群插件管理员",
+                "display_item": "group_id",
+                "items": {
+                    "group_id": {
+                        "description": "群号",
+                        "type": "string",
+                        "hint": "要应用本组覆盖配置的群号（必填，只填数字）",
+                        "default": ""
+                    },
+                    "value": {
+                        "description": "插件管理员 QQ 列表",
+                        "type": "list",
+                        "hint": "每项一个 QQ 号。QQ 群主或群管理员可通过 /添加插件管理员、/删除插件管理员 修改，也可用 /清除群配置 plugin_admins 清除群内增删或旧整份覆盖。",
+                        "default": []
+                    }
+                }
+            }
+        }
+    },
     "report_notify_admins": {
-        "description": "接收举报通知的插件管理员QQ号列表（推荐按群覆盖）",
+        "description": "旧版管理员配置（仅用于兼容）",
         "type": "list",
         "items": {
             "type": "string"
         },
-        "hint": "生效名单为空时，兼容旧版并回退到加群通知名单。群内指令：/添加举报通知QQ <QQ号> 或 /删除举报通知QQ <QQ号>。",
-        "default": []
+        "hint": "未配置新名单时，仅保留旧用途。",
+        "default": [],
+        "invisible": true
     },
     "report_notify_admins_group_overrides": {
-        "description": "接收举报通知的插件管理员QQ号列表 · 按群覆盖",
+        "description": "旧版管理员配置（仅用于兼容）",
         "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
+        "hint": "未配置新名单时，仅保留旧用途。",
         "default": [],
         "templates": {
             "group": {
@@ -362,12 +389,12 @@
                     "value": {
                         "description": "覆盖值",
                         "type": "list",
-                        "hint": "群内指令：/添加举报通知QQ <QQ号> 或 /删除举报通知QQ <QQ号>。每项一个 QQ 号；生效名单为空时回退到加群通知名单。",
                         "default": []
                     }
                 }
             }
-        }
+        },
+        "invisible": true
     },
     "rank_top_n": {
         "description": "发言排名榜最多显示人数（推荐按群覆盖）",
@@ -472,18 +499,19 @@
         }
     },
     "join_notify_admins": {
-        "description": "加群请求处理结果通知管理员QQ号列表（推荐按群覆盖）",
+        "description": "旧版管理员配置（仅用于兼容）",
         "type": "list",
         "items": {
             "type": "string"
         },
-        "hint": "群内指令：/添加加群通知QQ <QQ号> 或 /删除加群通知QQ <QQ号>。",
-        "default": []
+        "hint": "未配置新名单时，仅保留旧用途。",
+        "default": [],
+        "invisible": true
     },
     "join_notify_admins_group_overrides": {
-        "description": "加群请求处理结果通知管理员QQ号列表 · 按群覆盖",
+        "description": "旧版管理员配置（仅用于兼容）",
         "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
+        "hint": "未配置新名单时，仅保留旧用途。",
         "default": [],
         "templates": {
             "group": {
@@ -499,12 +527,12 @@
                     "value": {
                         "description": "覆盖值",
                         "type": "list",
-                        "hint": "群内指令：/添加加群通知QQ <QQ号> 或 /删除加群通知QQ <QQ号>。",
                         "default": []
                     }
                 }
             }
-        }
+        },
+        "invisible": true
     },
     "join_request_notify_in_group": {
         "description": "加群申请在对应群内发送提醒（推荐按群覆盖）",
@@ -1840,7 +1868,7 @@
             "webp",
             "bmp"
         ],
-        "hint": "在 WebUI 直接上传违禁图片文件，插件启动时自动计算 MD5 并入违禁列表（#184）。与群内 /添加违禁图片（按群覆盖）同时生效。原「填空式 MD5 列表」配置项已移除（#265），历史手动填写的全局 MD5 不再生效。",
+        "hint": "在 WebUI 直接上传违禁图片文件，自动计算 MD5 并入违禁列表（#184）。与群内 /添加违禁图片（按群覆盖）同时生效。原「填空式 MD5 列表」配置项已移除（#265），历史手动填写的全局 MD5 不再生效。",
         "default": []
     },
     "admin_bypass": {
@@ -2091,9 +2119,9 @@
         "default": 15
     },
     "group_admin_admins_group_overrides": {
-        "description": "可设置/取消群管理的专项管理员 QQ 列表 · 按群覆盖",
+        "description": "旧版管理员配置（仅用于兼容）",
         "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
+        "hint": "未配置新名单时，仅保留旧用途。",
         "default": [],
         "templates": {
             "group": {
@@ -2109,12 +2137,12 @@
                     "value": {
                         "description": "覆盖值",
                         "type": "list",
-                        "hint": "群内指令：/添加管理管理 <QQ号> 或 /删除管理管理 <QQ号>。仅授予设置或取消群管理的权限，每项一个 QQ 号。要明确清空名单，请保留此群条目并删空名单。要恢复模板名单，请用 /清除群配置 group_admin_admins。",
                         "default": []
                     }
                 }
             }
-        }
+        },
+        "invisible": true
     },
     "mute_kick_threshold_group_overrides": {
         "description": "禁言次数达到阈值后自动踢出 · 按群覆盖",
@@ -2137,57 +2165,6 @@
                         "type": "int",
                         "hint": "群内指令：/设置踢人阈值 <次数>（0 表示关闭）。",
                         "default": 0
-                    }
-                }
-            }
-        }
-    },
-    "welcome_enabled_group_overrides": {
-        "description": "在本群发送新人欢迎语 · 按群覆盖",
-        "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
-        "default": [],
-        "templates": {
-            "group": {
-                "name": "单群覆盖",
-                "display_item": "group_id",
-                "items": {
-                    "group_id": {
-                        "description": "群号",
-                        "type": "string",
-                        "hint": "要应用本组覆盖配置的群号（必填，只填数字）",
-                        "default": ""
-                    },
-                    "value": {
-                        "description": "覆盖值",
-                        "type": "bool",
-                        "default": false
-                    }
-                }
-            }
-        }
-    },
-    "welcome_message_group_overrides": {
-        "description": "本群新人欢迎语 · 按群覆盖",
-        "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
-        "default": [],
-        "templates": {
-            "group": {
-                "name": "单群覆盖",
-                "display_item": "group_id",
-                "items": {
-                    "group_id": {
-                        "description": "群号",
-                        "type": "string",
-                        "hint": "要应用本组覆盖配置的群号（必填，只填数字）",
-                        "default": ""
-                    },
-                    "value": {
-                        "description": "覆盖值",
-                        "type": "string",
-                        "hint": "可用 {at} 插入新成员的 QQ 提示。",
-                        "default": "欢迎 {at} 加入本群！"
                     }
                 }
             }
@@ -2220,9 +2197,9 @@
         }
     },
     "banned_images_group_overrides": {
-        "description": "本群违禁图片 MD5 列表 · 按群覆盖",
+        "description": "本群违禁图片 · 按群配置",
         "type": "template_list",
-        "hint": "添加条目后填写群号和覆盖值；删除该群条目后继承全局默认。群内指令优先。",
+        "hint": "填写群号并上传图片，自动计算 MD5。上传文件只在选用它的群生效；同群可添加多个上传条目。",
         "default": [],
         "templates": {
             "group": {
@@ -2236,9 +2213,23 @@
                         "default": ""
                     },
                     "value": {
-                        "description": "覆盖值",
+                        "description": "旧版图片 MD5（仅兼容已有配置）",
                         "type": "list",
-                        "hint": "群内指令：引用图片执行 /添加违禁图片，或用 /删除违禁图片 <MD5前缀> 移除本群记录。每项填一个 32 位小写十六进制 MD5；全局上传的违禁图片仍生效。",
+                        "invisible": true,
+                        "default": []
+                    },
+                    "files": {
+                        "description": "上传违禁图片（自动计算 MD5）",
+                        "type": "file",
+                        "file_types": [
+                            "png",
+                            "jpg",
+                            "jpeg",
+                            "gif",
+                            "webp",
+                            "bmp"
+                        ],
+                        "hint": "每张图片最多 10 MiB。此项上传目录由各群条目共享，请使用不同文件名；覆盖或删除同名文件会影响所有引用它的条目。仅移除整条配置不会删除文件。",
                         "default": []
                     }
                 }
@@ -2288,7 +2279,6 @@
                     "group_admin_admins": {
                         "description": "可设置/取消群管理的专项管理员 QQ 列表",
                         "type": "list",
-                        "hint": "群内指令：/添加管理管理 <QQ号> 或 /删除管理管理 <QQ号>。仅授予设置或取消群管理的权限，每项一个 QQ 号。要明确清空名单，请保留空列表并在「显式覆盖字段」填 group_admin_admins。要恢复模板名单，请用 /清除群配置 group_admin_admins。",
                         "default": []
                     },
                     "show_recall_notice": {
@@ -2323,7 +2313,6 @@
                     "report_notify_admins": {
                         "description": "接收举报通知的插件管理员QQ号列表",
                         "type": "list",
-                        "hint": "群内指令：/添加举报通知QQ <QQ号> 或 /删除举报通知QQ <QQ号>。每项一个 QQ 号；生效名单为空时回退到加群通知名单。",
                         "default": []
                     },
                     "rank_top_n": {
@@ -2368,17 +2357,6 @@
                         "hint": "群内指令：/开关二维码撤回 on|off。仅在 openai_vision 模式下生效。",
                         "default": false
                     },
-                    "welcome_enabled": {
-                        "description": "在本群发送新人欢迎语",
-                        "type": "bool",
-                        "default": false
-                    },
-                    "welcome_message": {
-                        "description": "本群新人欢迎语",
-                        "type": "string",
-                        "hint": "可用 {at} 插入新成员的 QQ 提示。",
-                        "default": "欢迎 {at} 加入本群！"
-                    },
                     "join_request_notify_in_group": {
                         "description": "加群申请在对应群内发送提醒",
                         "type": "bool",
@@ -2388,7 +2366,6 @@
                     "join_notify_admins": {
                         "description": "加群请求处理结果通知管理员QQ号列表",
                         "type": "list",
-                        "hint": "群内指令：/添加加群通知QQ <QQ号> 或 /删除加群通知QQ <QQ号>。",
                         "default": []
                     },
                     "join_approve_keywords": {

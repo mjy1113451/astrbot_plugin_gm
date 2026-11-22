@@ -36,7 +36,9 @@ class ConfigStore:
     _TEMPLATE_VALUE_TYPES = {"bool": bool, "int": int, "string": str, "text": str, "dict": dict, "list": list}
     _QQ_LIST_FIELDS = {
         "blacklisted_users", "whitelist_users", "group_admin_admins", "join_notify_admins", "report_notify_admins",
+        "plugin_admins",
     }
+    _RETIRED_GROUP_SETTINGS = {"welcome_enabled", "welcome_message"}
     _DOMAIN_LIST_FIELDS = {"link_whitelist", "link_safety_whitelist"}
     _OVERRIDE_INT_LIMITS = {"mute_kick_threshold": (0, None), "kick_recall_count": (1, 50), "link_fetch_timeout": (1, 15)}
 
@@ -260,7 +262,7 @@ class ConfigStore:
             for gid in groups:
                 merged = self._template_group_entry(gid, entries=entries) or {}
                 for key, value in merged.items():
-                    if key not in self._setting_template_types:
+                    if key not in self._template_field_defaults or key not in self._setting_template_types:
                         continue
                     list_key = f"{key}_group_overrides"
                     rows = before.get(list_key, [])
@@ -596,6 +598,56 @@ class ConfigStore:
                 "如需限定范围，请配置该列表。"
             )
 
+    def get_plugin_admins(self, group_id: str) -> list | None:
+        """None 表示没有配置统一名单；空列表明确关闭旧名单。"""
+        gid = str(group_id).strip()
+        if not self._valid_group_id(gid):
+            return None
+        overrides = self.runtime_map("group_overrides").get(gid, {})
+        if self._has_list_ops(gid, "plugin_admins"):
+            return [qq for qq in self._merge_list_ops(gid, "plugin_admins") if self._valid_group_id(qq)]
+        if isinstance(overrides, dict) and "plugin_admins" in overrides:
+            value = self._validated_setting_value("plugin_admins", overrides["plugin_admins"])
+            if value is not None:
+                return list(dict.fromkeys(value))
+        row = self._setting_template_entry(gid, "plugin_admins")
+        return list(dict.fromkeys(row["value"])) if row is not None else None
+
+    def get_admin_notification_recipients(self, group_id: str, legacy_key: str) -> tuple[list, str]:
+        admins = self.get_plugin_admins(group_id)
+        if admins is not None:
+            return admins, "plugin_admins"
+        admins = normalize_qq_list(self.get_group_setting(group_id, legacy_key, []))
+        if (not admins and legacy_key == "report_notify_admins"
+                and not self._is_explicit_snapshot(group_id, legacy_key)):
+            join_admins = normalize_qq_list(self.get_group_setting(group_id, "join_notify_admins", []))
+            if join_admins:
+                return join_admins, "join_notify_admins"
+        return admins, legacy_key
+
+    def edit_legacy_notification_recipients(self, group_id: str, key: str, qq_list: list, *, add: bool) -> list | None:
+        """仅修改旧私聊收件人；已设置统一名单时返回 None，不修改旧配置。"""
+        if key not in {"join_notify_admins", "report_notify_admins"}:
+            raise ValueError("不是旧通知名单")
+        with self._lock:
+            if self.get_plugin_admins(group_id) is not None:
+                return None
+            current = normalize_qq_list(self.get_group_setting(group_id, key, []))
+            changed = list(dict.fromkeys(qq for qq in qq_list if (qq not in current) == add))
+            if changed:
+                # 显式清空独立的举报名单后不再回退到加群名单。
+                updated = list(current) + changed if add else [qq for qq in current if qq not in changed]
+                self.set_group_override(group_id, key, updated)
+            return changed
+
+    def get_group_banned_image_files(self, group_id: str) -> list[str]:
+        files = dict.fromkeys(
+            path for row in self._setting_template_rows(group_id, "banned_images")
+            if isinstance(row.get("files"), list)
+            for path in row["files"] if isinstance(path, str) and path.strip()
+        )
+        return list(files)
+
     def get_group_setting(self, group_id: str, key: str, default=None):
         """按群读取配置项。
 
@@ -612,6 +664,11 @@ class ConfigStore:
         explicit_override_fields 用来声明"即使等于默认值也按覆盖处理"的字段
         （例如本群要用空列表清空全局名单），命中时第 2 步直接采用该值。
         """
+        if key == "plugin_admins":
+            admins = self.get_plugin_admins(group_id)
+            return admins if admins is not None else default
+        if key in self._RETIRED_GROUP_SETTINGS:
+            return default
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if isinstance(overrides, dict) and key in overrides:
             value = overrides[key]
@@ -651,6 +708,8 @@ class ConfigStore:
             if value == "inherit":
                 return self.config.get(key, default)
             return value == "on"
+        if key == "plugin_admins":
+            return default
         if key == "group_admin_admins":
             template_admins = self._get_template_group_admins(group_id)
             if template_admins is not None:
@@ -700,7 +759,7 @@ class ConfigStore:
         overrides = self.runtime_map("group_overrides").get(str(group_id), {})
         if isinstance(overrides, dict):
             keys.update((key, None) for key in overrides if not key.startswith("__"))
-        return list(keys)
+        return [key for key in keys if key not in self._RETIRED_GROUP_SETTINGS]
 
     # ===================== WebUI 按群配置模板（PR #290） =====================
 
@@ -721,9 +780,9 @@ class ConfigStore:
             # （PR #289 审查：template-default-mismatch）。
             meta = {"group_id", "explicit_override_fields"}
             self._setting_template_types = {
-                key: schema[f"{key}_group_overrides"]["templates"]["group"]["items"]["value"]["type"]
-                for key in items
-                if key not in meta and f"{key}_group_overrides" in schema
+                key.removesuffix("_group_overrides"): spec["templates"]["group"]["items"]["value"]["type"]
+                for key, spec in schema.items()
+                if key.endswith("_group_overrides")
             }
             return {
                 k: (v.get("default") if isinstance(v, dict) else None)
@@ -738,21 +797,27 @@ class ConfigStore:
     def _valid_group_id(group_id: str) -> bool:
         return re.fullmatch(r"[1-9][0-9]*", group_id) is not None
 
-    def _setting_template_entry(self, group_id: str, key: str, *, rows=None) -> dict | None:
+    def _setting_template_rows(self, group_id: str, key: str, *, rows=None):
         gid = str(group_id).strip()
         if key not in self._setting_template_types or not self._valid_group_id(gid):
-            return None
+            return
         if rows is None:
             rows = self.config.get(f"{key}_group_overrides")
         if not isinstance(rows, list):
-            return None
-        for row in reversed(rows):
+            return
+        for row in rows:
             if not isinstance(row, dict) or row.get("__template_key") != "group":
                 continue
             row_gid = row.get("group_id")
-            if not isinstance(row_gid, str) or row_gid.strip() != gid:
-                continue
+            if isinstance(row_gid, str) and row_gid.strip() == gid:
+                yield row
+
+    def _setting_template_entry(self, group_id: str, key: str, *, rows=None) -> dict | None:
+        for row in reversed(list(self._setting_template_rows(group_id, key, rows=rows))):
             value = self._validated_setting_value(key, row.get("value"))
+            # 上传专用条目的 MD5 默认为空，不应覆盖另一条已填写的 MD5 名单。
+            if key == "banned_images" and value == [] and isinstance(row.get("files"), list) and row["files"]:
+                continue
             if value is not None:
                 return {**row, "value": value}
         return None
@@ -1201,6 +1266,8 @@ class ConfigStore:
         for_update 参数保留以兼容旧调用点，语义上不再需要"可写本体"。
         """
         with self._lock:
+            if key == "plugin_admins":
+                return self.get_plugin_admins(group_id) or []
             if key == "group_admin_admins":
                 return self.normalize_qq_list_value(self.get_group_setting(group_id, key, []))
             overrides = self.runtime_map("group_overrides").get(str(group_id), {})
@@ -1282,6 +1349,11 @@ class ConfigStore:
         保存失败时整群覆盖回滚到写前状态（含本轮新建的本群条目），不会留下
         "内存里改了、磁盘上没改"的残留配置（PR #289 审查：missing-rollback）。
         """
+        if key == "plugin_admins":
+            value = self._validated_setting_value(key, value)
+            if value is None or not self._valid_group_id(str(group_id)):
+                raise ValueError("无效的插件管理员名单或群号")
+
         def apply():
             overrides = self.runtime_map("group_overrides")
             overrides.setdefault(str(group_id), {})[key] = value
@@ -1290,7 +1362,25 @@ class ConfigStore:
 
         self._commit_runtime_change(group_id, apply)
 
+    def _edit_plugin_admins(self, group_id: str, qq_list: list, *, add: bool) -> list:
+        values = self._validated_setting_value("plugin_admins", qq_list)
+        if values is None or not self._valid_group_id(str(group_id)):
+            raise ValueError("无效的插件管理员名单或群号")
+        with self._lock:
+            current = self.get_plugin_admins(group_id) or []
+            changed = list(dict.fromkeys(qq for qq in values if (qq not in current) == add))
+            if changed:
+                if self._is_explicit_snapshot(group_id, "plugin_admins"):
+                    updated = current + changed if add else [qq for qq in current if qq not in changed]
+                    self.set_group_override(group_id, "plugin_admins", updated)
+                else:
+                    self._commit_list_change(
+                        group_id, "plugin_admins", add=changed if add else (), remove=() if add else changed)
+            return changed
+
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        if key == "plugin_admins":
+            return self._edit_plugin_admins(group_id, qq_list, add=True)
         with self._lock:
             # 只读判定先行：没有任何新增时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]
@@ -1305,6 +1395,8 @@ class ConfigStore:
             return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        if key == "plugin_admins":
+            return self._edit_plugin_admins(group_id, qq_list, add=False)
         with self._lock:
             # 只读判定先行：没有任何删除时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]

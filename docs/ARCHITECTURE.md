@@ -150,7 +150,7 @@ graph TD
 
 | 模块 | 主要导出 | 职责 |
 |------|----------|------|
-| [`permissions.py`](../cop/permissions.py) | `PermissionService` | 插件管理员 / 群主 / 群管理员 / 专项「设管理」名单等权限判定 |
+| [`permissions.py`](../cop/permissions.py) | `PermissionService` | 统一插件管理员、QQ 原生群角色与旧专项权限判定 |
 | [`message_parse.py`](../cop/message_parse.py) | `MessageParser`、`TargetResolver` | 从事件 / 原始报文中提取文本、AT、图片、语音、命令等；并从上下文解析指令操作目标（@ / 引用 / QQ / 名字） |
 | [`onebot_api.py`](../cop/onebot_api.py) | `OneBotApi` | 封装 OneBot action：消息收发、撤回、禁言、踢人等 |
 | [`runtime.py`](../cop/runtime.py) | `RuntimeState` | 进程内可变状态容器（内存态 + 持久化数据引用），不含业务方法 |
@@ -173,7 +173,7 @@ graph TD
 | [`moderation/voice.py`](../cop/moderation/voice.py) | `VoiceModeration` | 语音转文字违规检测 |
 | [`conversational.py`](../cop/conversational.py) | `ColloquialService` | 口语化群管指令意图识别与处理（#254） |
 | [`conversational.py`](../cop/conversational.py) | `DupFaceService` | 重复表情包自动撤回（#196） |
-| [`join_review.py`](../cop/join_review.py) | `JoinReviewService` | 入群欢迎、加群请求自动审核、引用回复审批 |
+| [`join_review.py`](../cop/join_review.py) | `JoinReviewService` | 入群后清理待处理申请、加群请求自动审核、引用回复审批 |
 
 ### L4 门面
 
