@@ -630,12 +630,12 @@ class ConfigStore:
         if key not in {"join_notify_admins", "report_notify_admins"}:
             raise ValueError("不是旧通知名单")
         with self._lock:
-            current, source = self.get_admin_notification_recipients(group_id, key)
-            if source == "plugin_admins":
+            if self.get_plugin_admins(group_id) is not None:
                 return None
+            current = normalize_qq_list(self.get_group_setting(group_id, key, []))
             changed = list(dict.fromkeys(qq for qq in qq_list if (qq not in current) == add))
             if changed:
-                # 举报可能正在继承旧加群名单；编辑的是当前收件人，显式清空不再回退。
+                # 显式清空独立的举报名单后不再回退到加群名单。
                 updated = list(current) + changed if add else [qq for qq in current if qq not in changed]
                 self.set_group_override(group_id, key, updated)
             return changed

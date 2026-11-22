@@ -145,23 +145,53 @@ class PluginAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         p = self.plugin
         owner = self.event("owner")
         p._store.config["join_notify_admins"] = ["55555"]
-        p._store.config["report_notify_admins"] = []
         view = [msg async for msg in p.list_report_notify_cmd(owner)][0]
-        self.assertIn("55555", view)
-        self.assertIn("沿用旧加群通知名单", view)
+        self.assertNotIn("55555", view)
+        self.assertIn("独立配置）：空", view)
+        self.assertIn("/查看加群通知QQ", view)
         denied = [msg async for msg in p.remove_report_notify_cmd(self.event(), "55555")][0]
         self.assertIn("只有 QQ 群管理员或群主", denied)
-        self.assertIn("已删除", [msg async for msg in p.remove_report_notify_cmd(owner, "55555")][0])
+        reply = [msg async for msg in p.remove_report_notify_cmd(owner, "55555")][0]
+        self.assertIn("不在本群举报通知QQ名单", reply)
+        self.assertIn("/添加举报通知QQ", reply)
+        self.assertEqual(p._store.runtime_map("group_overrides"), {})
+        self.assertEqual(p._store.get_admin_notification_recipients("12345", "report_notify_admins"),
+                         (["55555"], "join_notify_admins"))
+        self.assertIn("已添加", [msg async for msg in p.add_report_notify_cmd(owner, "66666")][0])
+        self.assertEqual(p._store.get_admin_notification_recipients("12345", "report_notify_admins"),
+                         (["66666"], "report_notify_admins"))
+        self.assertIn("已删除", [msg async for msg in p.remove_report_notify_cmd(owner, "66666")][0])
         self.assertEqual(p._store.get_admin_notification_recipients("12345", "report_notify_admins"),
                          ([], "report_notify_admins"))
-        self.assertEqual(p._store.get_admin_notification_recipients("23456", "report_notify_admins"),
-                         (["55555"], "join_notify_admins"))
         self.assertIn("已添加", [msg async for msg in p.add_join_notify_cmd(owner, "67890")][0])
         self.assertFalse(p._perms._is_authorized(self.event().raw_message))
         self.assertIsNone(p._store.get_plugin_admins("12345"))
         p._store.set_group_override("12345", "plugin_admins", [])
         self.assertIn("旧通知名单不生效", [msg async for msg in p.add_report_notify_cmd(owner, "67890")][0])
         self.assertEqual(p._store.get_group_setting("12345", "report_notify_admins"), [])
+
+    async def test_purge_preview_states_permissions_and_only_authorized_confirmation_kicks(self):
+        p = self.plugin
+        p._store.set_group_override("12345", "plugin_admins", ["67890"])
+        p._stats = SimpleNamespace(get_last_active=lambda group_id: {})
+        p._api._normalize_member_list = lambda response: [{"user_id": "55555", "role": "member"}]
+        p._api._kick_member = AsyncMock(return_value=True)
+        event = self.event()
+        event.raw_message["message"] = [{"type": "text", "data": {"text": "/清人 4"}}]
+        preview = [msg async for msg in p.purge_inactive_cmd(event)][0]
+        self.assertIn("尚未踢人", preview)
+        self.assertIn("仅 QQ 群管理员、群主或本群统一插件管理员可执行", preview)
+        self.assertIn("/清人 4 确认", preview)
+        p._api._kick_member.assert_not_awaited()
+
+        event.raw_message["message"][0]["data"]["text"] = "/清人 4 确认"
+        event.raw_message["group_id"] = 12346
+        denied = [msg async for msg in p.purge_inactive_cmd(event)][0]
+        self.assertIn("本群统一插件管理员", denied)
+        p._api._kick_member.assert_not_awaited()
+        event.raw_message["group_id"] = 12345
+        self.assertIn("踢出 1 人", [msg async for msg in p.purge_inactive_cmd(event)][0])
+        p._api._kick_member.assert_awaited_once_with(event, "12345", "55555")
 
     async def test_delegation_cannot_change_global_political_duration(self):
         p = self.plugin

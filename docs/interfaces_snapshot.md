@@ -95,7 +95,7 @@
 | 83 | `重复表情包撤回` | 按群覆盖重复表情包自动撤回（开/关，#196） | — | `toggle_dup_face_recall_cmd` |
 | 84 | `鞭尸` | 长期禁言被@的人（29天23小时59分） | — | `whip_corpse_cmd` |
 | 85 | `开关公告提示` | 开关发群公告结果回复（on/off，按群生效） | — | `toggle_group_notice_notice_cmd` |
-| 86 | `清人` | 清理 N 天未发言成员（/清人 天数 [确认]，1-30） | — | `purge_inactive_cmd` |
+| 86 | `清人` | 清理 N 天未发言成员（/清人 天数 [确认]，1-30；仅 QQ 群管理员、群主或本群统一插件管理员可执行） | — | `purge_inactive_cmd` |
 | 87 | `邀请通过` | 开关第三方邀请入群自动通过（on/off，按群生效，#241） | — | `toggle_invite_auto_approve_cmd` |
 | 88 | `开关二维码撤回` | 开关二维码识别自动撤回（on/off，按群生效，#237） | — | `toggle_qr_code_recall_cmd` |
 | 89 | `开关不安全网站检测` | 开关不安全网站检测（on/off，按群生效，#272） | — | `toggle_link_safety_cmd` |

@@ -1043,7 +1043,7 @@ class GroupAdminPlugin(Star):
         yield event.plain_result(f"已尝试撤回 {len(qq_list)} 个用户的最近消息，实际撤回 {total} 条（上限 {count} 条/人）")
 
     # #225: /清人 — 清理 N 天未发言的普通成员（预览 + 确认两步执行）
-    @filter.command("清人", "清理 N 天未发言成员（/清人 天数 [确认]，1-30）")
+    @filter.command("清人", "清理 N 天未发言成员（/清人 天数 [确认]，1-30；仅 QQ 群管理员、群主或本群统一插件管理员可执行）")
     async def purge_inactive_cmd(self, event: AstrMessageEvent):
         """踢出超过 N 天未发言的普通成员。
 
@@ -1057,14 +1057,14 @@ class GroupAdminPlugin(Star):
             return
         group_id = str(raw.get("group_id"))
         if not self._perms._is_authorized(raw, str(raw.get("user_id", ""))):
-            yield event.plain_result("只有插件管理员可执行此操作")
+            yield event.plain_result("仅 QQ 群管理员、群主或本群统一插件管理员可执行")
             return
         tail = self._mp._extract_command_tail(self._mp._extract_text(raw), ("清人",))
         numbers = re.findall(r"\d+", tail or "")
         if not numbers:
             yield event.plain_result(
                 "用法：/清人 天数 [确认]（天数 1-30），例如 /清人 4 先预览候选，"
-                "确认后发送 /清人 4 确认 执行")
+                "确认后发送 /清人 4 确认 执行。仅 QQ 群管理员、群主或本群统一插件管理员可执行。")
             return
         days = max(1, min(int(numbers[0]), 30))
         confirm = "确认" in (tail or "")
@@ -1106,10 +1106,10 @@ class GroupAdminPlugin(Star):
         more = f"\n  ...（共 {len(candidates)} 人，仅列出前 50）" if len(candidates) > 50 else ""
         if not confirm:
             yield event.plain_result(
-                f"将清理超过 {days} 天未发言的普通成员 {len(candidates)} 人"
+                f"仅预览，尚未踢人。确认后将清理超过 {days} 天未发言的普通成员 {len(candidates)} 人"
                 f"（不含群主/管理员/白名单；无发言记录的成员按未发言计）：\n"
                 + "\n".join(preview_lines) + more
-                + f"\n确认执行请发送：/清人 {days} 确认")
+                + f"\n仅 QQ 群管理员、群主或本群统一插件管理员可执行。确认批量踢人请发送：/清人 {days} 确认")
             return
         ok_list, bad_list = [], []
         for i, (uid, _name, _ts) in enumerate(candidates):
