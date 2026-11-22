@@ -857,8 +857,10 @@ class GroupAdminPlugin(Star):
         ok = await self._api._set_group_title(event, group_id, target_qq, title)
         yield event.plain_result("设置头衔成功" if ok else "设置头衔失败")
 
-    # #18: 群友昵称 - 设置他人群昵称（owner 09-14：合并为单条命令；普通群管理员即可，不必插件管理员）
-    @filter.command("群友昵称", "设置他人群昵称（@某人 或 QQ号 + 新昵称；群管/群主/插件管理员）", alias={"别人昵称", "群昵称", "设群昵称", "设群友昵称"})
+    @filter.command(
+        "群友昵称", "设置他人群昵称（@某人 或 QQ号 + 新昵称；QQ 群主、群管理员或本群统一插件管理员）",
+        alias={"别人昵称", "群昵称", "设群昵称", "设群友昵称"},
+    )
     async def set_other_card_cmd(self, event: AstrMessageEvent):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
@@ -1948,11 +1950,8 @@ class GroupAdminPlugin(Star):
             yield event.plain_result("只有插件管理员可执行此操作")
             return
         group_id = str(raw.get("group_id"))
-        text = self._mp._extract_text(raw).strip()
-        for prefix in ("/群名称", "/群名", "群名称", "群名"):
-            if text.startswith(prefix):
-                text = text[len(prefix):].lstrip()
-                break
+        text = self._mp._extract_command_tail(
+            self._mp._extract_text(raw), ("群名", "群名称", "改群名", "修改群名"))
         if not text:
             yield event.plain_result("请提供新群名，例如 /群名 我的群")
             return

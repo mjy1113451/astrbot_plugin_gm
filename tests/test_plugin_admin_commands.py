@@ -2,6 +2,7 @@
 
 import importlib.util
 import logging
+import re
 import sys
 import tempfile
 import unittest
@@ -20,9 +21,10 @@ def _load_plugin():
     def passthrough(*args, **kwargs):
         return lambda func: func
 
-    def command(name, *args, alias=(), **kwargs):
+    def command(name, description, *, alias=()):
         def register(func):
             func.command_names = {name, *alias}
+            func.command_metadata = (name, description, set(alias))
             return func
         return register
 
@@ -163,6 +165,60 @@ class PluginAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("current-group", reply)
         self.assertNotIn("other-group", reply)
         self.assertNotIn("unknown-group", reply)
+
+    def test_command_registry_and_snapshot_match_registered_names_and_aliases(self):
+        commands = {
+            method: func.command_metadata
+            for method, func in vars(self.module.GroupAdminPlugin).items()
+            if hasattr(func, "command_metadata")
+        }
+        names = [name for name, _, aliases in commands.values() for name in (name, *aliases)]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertCountEqual(self.module._GM_COMMAND_NAMES, names)
+
+        document = (ROOT / "docs" / "interfaces_snapshot.md").read_text(encoding="utf-8")
+        command_section = document.split("## 1. 命令入口", 1)[1].split("## 2. 事件钩子", 1)[0]
+        self.assertIn(f"**命令总数：{len(commands)}**", command_section)
+        self.assertIn(f"**带别名命令统计**：{sum(bool(aliases) for _, _, aliases in commands.values())} 个", command_section)
+        self.assertIn(f"共 {len(names)} 个名称", document.split("## 5. 校验结论", 1)[1])
+        rows = re.findall(r"^\| \d+ \| `([^`]+)` \| (.+?) \| (.*?) \| `([^`]+)` \|$",
+                          command_section, re.MULTILINE)
+        self.assertCountEqual([method for _, _, _, method in rows], commands.keys())
+        for name, description, aliases, method in rows:
+            with self.subTest(command=name):
+                self.assertEqual(
+                    (name, description.replace(r"\|", "|"), set(re.findall(r"`([^`]+)`", aliases))),
+                    commands[method],
+                )
+
+    async def test_unified_admin_can_change_nickname_only_in_their_group(self):
+        p = self.plugin
+        p._store.set_group_override("12345", "plugin_admins", ["67890"])
+        p._api._set_group_card = AsyncMock(return_value=True)
+        event = self.event(mentions=("55555",))
+        event.raw_message["message"].append({"type": "text", "data": {"text": "/设群昵称 新昵称"}})
+        reply = [msg async for msg in p.set_other_card_cmd(event)][0]
+        self.assertIn("新昵称", reply)
+        p._api._set_group_card.assert_awaited_once_with(event, "12345", "55555", "新昵称")
+
+        p._api._set_group_card.reset_mock()
+        event.raw_message["group_id"] = 12346
+        reply = [msg async for msg in p.set_other_card_cmd(event)][0]
+        self.assertIn("没有设置他人群昵称的权限", reply)
+        p._api._set_group_card.assert_not_awaited()
+
+    async def test_group_name_aliases_pass_only_the_new_name_to_onebot(self):
+        p = self.plugin
+        p._history = SimpleNamespace(_should_notify_group_name=lambda *args: True)
+        p._api._execute_action.return_value = True
+        event = self.event("admin")
+        for name in sorted(p.set_group_name_cmd.command_names):
+            with self.subTest(command=name):
+                event.raw_message["message"] = [{"type": "text", "data": {"text": f"/{name} 新群名"}}]
+                reply = [msg async for msg in p.set_group_name_cmd(event)][0]
+                self.assertIn("已修改群名", reply)
+                p._api._execute_action.assert_awaited_with(
+                    event, "set_group_name", group_id="12345", group_name="新群名")
 
     async def test_delegated_essence_requires_confirmed_current_group(self):
         p = self.plugin

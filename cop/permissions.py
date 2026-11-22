@@ -156,6 +156,7 @@ class PermissionService:
         return self._is_group_admin_or_owner(raw) or self._has_legacy_specialist_rights(user_id, group_id, raw)
 
     def has_group_nickname_rights(self, user_id: str, group_id: str, raw: dict) -> bool:
+        """允许本群统一管理员；未配置统一名单时保留旧专项权限。"""
         return self._is_authorized(raw, user_id) or self._has_legacy_specialist_rights(user_id, group_id, raw)
 
     # ---------- 违规检测管理命令前置校验 ----------
