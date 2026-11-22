@@ -728,6 +728,33 @@ class GroupOverrideTests(unittest.TestCase):
         self.assertTrue(store.drop_group_override("100", "plugin_admins"))
         self.assertEqual(store.get_plugin_admins("100"), ["111"])
 
+    def test_unified_admin_command_deltas_follow_webui_and_survive_reload(self):
+        def row(*value):
+            return {"__template_key": "group", "group_id": "100", "value": list(value)}
+
+        config = _Config(plugin_admins_group_overrides=[row("111", "222")], join_notify_admins=["777"])
+        json_store = _JsonStore()
+        store = self.make_store(config, json_store=json_store)
+        self.assertEqual(store.add_group_override_admins("100", "plugin_admins", ["333"]), ["333"])
+        self.assertEqual(store.remove_group_override_admins("100", "plugin_admins", ["222"]), ["222"])
+        config["plugin_admins_group_overrides"] = [row("222", "444")]
+        self.assertEqual(store.get_plugin_admins("100"), ["444", "333"])
+        store = ConfigStore(config=config, runtime_path=store.runtime_path, data_dir=store.data_dir,
+                            config_path=store.config_path, stats_path=store.stats_path, reports_path=store.reports_path,
+                            lock=threading.RLock(), json_store=json_store)
+        self.assertEqual(store.get_plugin_admins("100"), ["444", "333"])
+        json_store.fail_saves = True
+        with self.assertRaises(OSError):
+            store.remove_group_override_admins("100", "plugin_admins", ["333", "444"])
+        self.assertEqual(store.get_plugin_admins("100"), ["444", "333"])
+        json_store.fail_saves = False
+        store.remove_group_override_admins("100", "plugin_admins", ["333", "444"])
+        config["plugin_admins_group_overrides"] = []
+        self.assertEqual(store.get_admin_notification_recipients("100", "join_notify_admins"), ([], "plugin_admins"))
+        config["plugin_admins_group_overrides"] = [row("333", "555")]
+        self.assertEqual(store.get_plugin_admins("100"), ["333", "555"])
+        self.assertTrue(store.drop_group_override("100", "plugin_admins"))
+
     def test_group_image_file_rows_are_additive_without_replacing_manual_md5s(self):
         digest = "0" * 32
         def row(group_id, **fields):

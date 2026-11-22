@@ -604,6 +604,8 @@ class ConfigStore:
         if not self._valid_group_id(gid):
             return None
         overrides = self.runtime_map("group_overrides").get(gid, {})
+        if self._has_list_ops(gid, "plugin_admins"):
+            return [qq for qq in self._merge_list_ops(gid, "plugin_admins") if self._valid_group_id(qq)]
         if isinstance(overrides, dict) and "plugin_admins" in overrides:
             value = self._validated_setting_value("plugin_admins", overrides["plugin_admins"])
             if value is not None:
@@ -616,11 +618,27 @@ class ConfigStore:
         if admins is not None:
             return admins, "plugin_admins"
         admins = normalize_qq_list(self.get_group_setting(group_id, legacy_key, []))
-        if not admins and legacy_key == "report_notify_admins":
+        if (not admins and legacy_key == "report_notify_admins"
+                and not self._is_explicit_snapshot(group_id, legacy_key)):
             join_admins = normalize_qq_list(self.get_group_setting(group_id, "join_notify_admins", []))
             if join_admins:
                 return join_admins, "join_notify_admins"
         return admins, legacy_key
+
+    def edit_legacy_notification_recipients(self, group_id: str, key: str, qq_list: list, *, add: bool) -> list | None:
+        """仅修改旧私聊收件人；已设置统一名单时返回 None，不修改旧配置。"""
+        if key not in {"join_notify_admins", "report_notify_admins"}:
+            raise ValueError("不是旧通知名单")
+        with self._lock:
+            current, source = self.get_admin_notification_recipients(group_id, key)
+            if source == "plugin_admins":
+                return None
+            changed = list(dict.fromkeys(qq for qq in qq_list if (qq not in current) == add))
+            if changed:
+                # 举报可能正在继承旧加群名单；编辑的是当前收件人，显式清空不再回退。
+                updated = list(current) + changed if add else [qq for qq in current if qq not in changed]
+                self.set_group_override(group_id, key, updated)
+            return changed
 
     def get_group_banned_image_files(self, group_id: str) -> list[str]:
         files = dict.fromkeys(
@@ -690,6 +708,8 @@ class ConfigStore:
             if value == "inherit":
                 return self.config.get(key, default)
             return value == "on"
+        if key == "plugin_admins":
+            return default
         if key == "group_admin_admins":
             template_admins = self._get_template_group_admins(group_id)
             if template_admins is not None:
@@ -1342,7 +1362,25 @@ class ConfigStore:
 
         self._commit_runtime_change(group_id, apply)
 
+    def _edit_plugin_admins(self, group_id: str, qq_list: list, *, add: bool) -> list:
+        values = self._validated_setting_value("plugin_admins", qq_list)
+        if values is None or not self._valid_group_id(str(group_id)):
+            raise ValueError("无效的插件管理员名单或群号")
+        with self._lock:
+            current = self.get_plugin_admins(group_id) or []
+            changed = list(dict.fromkeys(qq for qq in values if (qq not in current) == add))
+            if changed:
+                if self._is_explicit_snapshot(group_id, "plugin_admins"):
+                    updated = current + changed if add else [qq for qq in current if qq not in changed]
+                    self.set_group_override(group_id, "plugin_admins", updated)
+                else:
+                    self._commit_list_change(
+                        group_id, "plugin_admins", add=changed if add else (), remove=() if add else changed)
+            return changed
+
     def add_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        if key == "plugin_admins":
+            return self._edit_plugin_admins(group_id, qq_list, add=True)
         with self._lock:
             # 只读判定先行：没有任何新增时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]
@@ -1357,6 +1395,8 @@ class ConfigStore:
             return pending
 
     def remove_group_override_admins(self, group_id: str, key: str, qq_list: list) -> list:
+        if key == "plugin_admins":
+            return self._edit_plugin_admins(group_id, qq_list, add=False)
         with self._lock:
             # 只读判定先行：没有任何删除时不做任何写入。
             current = [str(x) for x in self.get_group_override_list(group_id, key)]

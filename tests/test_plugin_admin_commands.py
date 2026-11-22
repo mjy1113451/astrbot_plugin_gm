@@ -130,8 +130,6 @@ class PluginAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         p = self.plugin
         self.assertEqual(p.legacy_admin_list_cmd.command_names, {
             "添加插件管理", "删除插件管理", "添加管理管理", "删除管理管理",
-            "添加举报通知QQ", "删除举报通知QQ", "查看举报通知QQ",
-            "添加加群通知QQ", "删除加群通知QQ", "查看加群通知QQ",
         })
         self.assertIn("已停用", [msg async for msg in p.legacy_admin_list_cmd(self.event("owner"), "67890")][0])
         self.assertEqual(p._store.runtime_map("group_overrides"), {})
@@ -142,6 +140,28 @@ class PluginAdminCommandTests(unittest.IsolatedAsyncioTestCase):
         p._store.set_group_override("12345", "plugin_admins", ["67890"])
         self.assertIn("没有设置", [msg async for msg in p.set_group_admin_cmd(self.event(), "55555")][0])
         p._api._set_group_admin.assert_not_awaited()
+
+    async def test_legacy_notification_commands_only_change_recipients_while_unified_is_unset(self):
+        p = self.plugin
+        owner = self.event("owner")
+        p._store.config["join_notify_admins"] = ["55555"]
+        p._store.config["report_notify_admins"] = []
+        view = [msg async for msg in p.list_report_notify_cmd(owner)][0]
+        self.assertIn("55555", view)
+        self.assertIn("沿用旧加群通知名单", view)
+        denied = [msg async for msg in p.remove_report_notify_cmd(self.event(), "55555")][0]
+        self.assertIn("只有 QQ 群管理员或群主", denied)
+        self.assertIn("已删除", [msg async for msg in p.remove_report_notify_cmd(owner, "55555")][0])
+        self.assertEqual(p._store.get_admin_notification_recipients("12345", "report_notify_admins"),
+                         ([], "report_notify_admins"))
+        self.assertEqual(p._store.get_admin_notification_recipients("23456", "report_notify_admins"),
+                         (["55555"], "join_notify_admins"))
+        self.assertIn("已添加", [msg async for msg in p.add_join_notify_cmd(owner, "67890")][0])
+        self.assertFalse(p._perms._is_authorized(self.event().raw_message))
+        self.assertIsNone(p._store.get_plugin_admins("12345"))
+        p._store.set_group_override("12345", "plugin_admins", [])
+        self.assertIn("旧通知名单不生效", [msg async for msg in p.add_report_notify_cmd(owner, "67890")][0])
+        self.assertEqual(p._store.get_group_setting("12345", "report_notify_admins"), [])
 
     async def test_delegation_cannot_change_global_political_duration(self):
         p = self.plugin

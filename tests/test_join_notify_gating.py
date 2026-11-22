@@ -89,6 +89,8 @@ class _Store:
     def get_plugin_admins(self, group_id):
         return self.settings.get("plugin_admins")
 
+    _LIST_SNAPSHOT = ConfigStore._LIST_SNAPSHOT
+    _is_explicit_snapshot = ConfigStore._is_explicit_snapshot
     get_admin_notification_recipients = ConfigStore.get_admin_notification_recipients
 
     def get_group_scope(self, group_id, key):

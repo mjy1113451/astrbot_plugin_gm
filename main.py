@@ -745,9 +745,8 @@ class GroupAdminPlugin(Star):
     # ===================== 群管指令 =====================
 
     @filter.command(
-        "添加插件管理", "旧版专项管理员和通知名单指令已停用",
-        alias={"删除插件管理", "添加管理管理", "删除管理管理", "添加举报通知QQ",
-               "删除举报通知QQ", "查看举报通知QQ", "添加加群通知QQ", "删除加群通知QQ", "查看加群通知QQ"},
+        "添加插件管理", "旧版专项管理员名单指令已停用",
+        alias={"删除插件管理", "添加管理管理", "删除管理管理"},
     )
     async def legacy_admin_list_cmd(self, event: AstrMessageEvent, target: str = ""):
         yield event.plain_result(
@@ -756,12 +755,12 @@ class GroupAdminPlugin(Star):
 
     @filter.command("添加插件管理员", "添加本群插件管理员（QQ 群管理员/群主；支持 QQ 号或 @成员）")
     async def add_plugin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._messaging._edit_plugin_admins(event, target, add=True):
+        async for result in self._messaging._manage_admin_list(event, target, add=True):
             yield result
 
     @filter.command("删除插件管理员", "删除本群插件管理员（QQ 群管理员/群主；支持 QQ 号或 @成员）")
     async def remove_plugin_admin_cmd(self, event: AstrMessageEvent, target: str = ""):
-        async for result in self._messaging._edit_plugin_admins(event, target, add=False):
+        async for result in self._messaging._manage_admin_list(event, target, add=False):
             yield result
 
     @filter.command("查看插件管理员", "查看本群统一插件管理员名单")
@@ -773,7 +772,7 @@ class GroupAdminPlugin(Star):
             return
         admins = self._store.get_plugin_admins(group_id)
         if admins is None:
-            yield event.plain_result("本群未配置统一插件管理员名单，仍使用旧版配置")
+            yield event.plain_result("本群未配置统一插件管理员名单，仍使用旧版配置；可用 /查看加群通知QQ 或 /查看举报通知QQ 查看旧收件人。")
         else:
             yield event.plain_result(f"本群统一插件管理员：{', '.join(admins) or '空（已配置）'}")
 
@@ -2479,6 +2478,36 @@ class GroupAdminPlugin(Star):
         if g: lines.extend([f"本群（{len(g)} 个）："] + [f"  {i+1}. {kw}" for i, kw in enumerate(g)])
         if isinstance(gl, list) and gl: lines.extend([f"全局（{len(gl)} 个）："] + [f"  {i+1}. {kw}" for i, kw in enumerate(gl)])
         yield event.plain_result("\n".join(lines) if lines else "本群与全局均无自动撤回关键词")
+
+    @filter.command("添加举报通知QQ", "添加本群旧版举报私聊通知QQ（仅在未配置统一名单时可用）")
+    async def add_report_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._manage_admin_list(event, target, add=True, legacy_key="report_notify_admins"):
+            yield result
+
+    @filter.command("删除举报通知QQ", "删除本群旧版举报私聊通知QQ（仅在未配置统一名单时可用）")
+    async def remove_report_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._manage_admin_list(event, target, add=False, legacy_key="report_notify_admins"):
+            yield result
+
+    @filter.command("查看举报通知QQ", "查看本群旧版举报私聊通知QQ（仅在未配置统一名单时可用）")
+    async def list_report_notify_cmd(self, event: AstrMessageEvent):
+        async for result in self._messaging._manage_admin_list(event, "", add=None, legacy_key="report_notify_admins"):
+            yield result
+
+    @filter.command("添加加群通知QQ", "添加本群旧版加群私聊通知QQ（仅在未配置统一名单时可用）")
+    async def add_join_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._manage_admin_list(event, target, add=True, legacy_key="join_notify_admins"):
+            yield result
+
+    @filter.command("删除加群通知QQ", "删除本群旧版加群私聊通知QQ（仅在未配置统一名单时可用）")
+    async def remove_join_notify_cmd(self, event: AstrMessageEvent, target: str = ""):
+        async for result in self._messaging._manage_admin_list(event, target, add=False, legacy_key="join_notify_admins"):
+            yield result
+
+    @filter.command("查看加群通知QQ", "查看本群旧版加群私聊通知QQ（仅在未配置统一名单时可用）")
+    async def list_join_notify_cmd(self, event: AstrMessageEvent):
+        async for result in self._messaging._manage_admin_list(event, "", add=None, legacy_key="join_notify_admins"):
+            yield result
 
     @filter.command("查看群配置", "查看本群生效的配置覆盖（仅插件管理员）")
     async def view_group_config_cmd(self, event: AstrMessageEvent):

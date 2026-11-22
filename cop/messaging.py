@@ -1,6 +1,6 @@
 """L3a 消息/指令公共辅助服务。
 
-本模块承载命令层公共辅助逻辑，包括统一插件管理员名单的增删。
+本模块承载命令层公共辅助逻辑，包括统一插件管理员名单和旧通知名单的管理。
 
 去重收敛取舍说明（高风险，务必保持行为 100% 不变）：
 1. 撤回主循环：recall_cmd（@用户分支 / 仅数量分支）与 recall_self_cmd 两份实现，
@@ -20,7 +20,7 @@
 
 依赖（构造注入，L3 只依赖 L0/L1/L2，不 import 同层）：
 - MessageParser（L2）：_get_raw_message / _extract_at_qqs
-- ConfigStore（L1）：add_group_override_admins / remove_group_override_admins
+- ConfigStore（L1）：add_group_override_admins / remove_group_override_admins / edit_legacy_notification_recipients
 - PermissionService（L2）：_is_group_admin_or_owner
 """
 
@@ -51,33 +51,48 @@ class MessagingService:
         self._store = config_store
         self._perms = permissions
 
-    async def _edit_plugin_admins(self, event, target: str, *, add: bool):
+    async def _manage_admin_list(self, event, target: str, *, add: bool | None, legacy_key: str = ""):
         raw = self._mp._get_raw_message(event)
         if not raw or not raw.get("group_id"):
             yield event.plain_result("此指令只能在群聊中使用")
             return
         group_id = str(raw["group_id"])
         if not self._perms._is_group_admin_or_owner(raw):
-            yield event.plain_result("只有 QQ 群管理员或群主可修改本群插件管理员名单")
+            yield event.plain_result("只有 QQ 群管理员或群主可管理本群管理员或旧通知名单")
+            return
+
+        if legacy_key and self._store.get_plugin_admins(group_id) is not None:
+            yield event.plain_result("本群已配置统一插件管理员，旧通知名单不生效。请用 /查看插件管理员 查看。")
+            return
+        if add is None:
+            recipients, source = self._store.get_admin_notification_recipients(group_id, legacy_key)
+            fallback = "（沿用旧加群通知名单）" if source != legacy_key else ""
+            yield event.plain_result(f"本群旧私聊通知QQ{fallback}：{', '.join(recipients) or '空'}（不授予管理权限）")
             return
 
         targets = self._mp._extract_at_qqs(raw) or re.split(r"[\s,，、]+", (target or "").strip())
         qq_list = list(dict.fromkeys(qq for qq in targets if re.fullmatch(r"[1-9][0-9]*", qq)))
         action = "添加" if add else "删除"
+        label = {"report_notify_admins": "举报通知QQ", "join_notify_admins": "加群通知QQ"}.get(legacy_key, "插件管理员")
         if not qq_list:
-            yield event.plain_result(f"请提供有效QQ号或 @成员，例如 /{action}插件管理员 123456")
+            yield event.plain_result(f"请提供有效QQ号或 @成员，例如 /{action}{label} 123456")
             return
 
         try:
-            if add:
+            if legacy_key:
+                changed = self._store.edit_legacy_notification_recipients(group_id, legacy_key, qq_list, add=add)
+                if changed is None:
+                    yield event.plain_result("本群已配置统一插件管理员，旧通知名单不生效。")
+                    return
+            elif add:
                 changed = self._store.add_group_override_admins(group_id, "plugin_admins", qq_list)
             else:
                 changed = self._store.remove_group_override_admins(group_id, "plugin_admins", qq_list)
         except Exception as e:
-            logger.error(f"{action}插件管理员失败（群 {group_id}）: {e}")
+            logger.error(f"{action}{label}失败（群 {group_id}）: {e}")
             yield event.plain_result("[错误] 保存失败，本次修改未生效，请稍后重试")
             return
         if not changed:
             yield event.plain_result("所列QQ号均已存在" if add else "所列QQ号均不存在")
             return
-        yield event.plain_result(f"本群已{action}插件管理员：{', '.join(changed)}")
+        yield event.plain_result(f"本群已{action}{label}：{', '.join(changed)}")
